@@ -42,6 +42,14 @@ struct Bf16Gdn27Geometry {
     static constexpr int kBlockN = 128;
 };
 
+// One tensor-parallel rank's half of the 27B value heads. 24 rows leave the second 16-row tile
+// half empty: its missing weight rows load as zeros and their outputs are not stored.
+struct Bf16Gdn27ShardGeometry {
+    static constexpr int kHeads  = 24;
+    static constexpr int kHidden = 5120;
+    static constexpr int kBlockN = 128;
+};
+
 struct Bf16Gdn35Geometry {
     static constexpr int kHeads  = 32;
     static constexpr int kHidden = 2048;
@@ -50,6 +58,10 @@ struct Bf16Gdn35Geometry {
 
 static_assert(Bf16Gdn27Geometry::kHidden % kBf16GdnBlockK == 0);
 static_assert(Bf16Gdn35Geometry::kHidden % kBf16GdnBlockK == 0);
+static_assert(Bf16Gdn27ShardGeometry::kHidden % kBf16GdnBlockK == 0);
+
+template <class Geometry>
+inline constexpr int kBf16GdnHeadTiles = (Geometry::kHeads + kBf16GdnBlockM - 1) / kBf16GdnBlockM;
 
 __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);
@@ -186,8 +198,18 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
             __nv_bfloat16* dst = (is_b ? bws : aws) + stage * kBf16GdnBlockM * kBf16GdnBlockK +
                                  row * kBf16GdnBlockK + bf16_gdn_swizzle(row, kk);
             const __nv_bfloat16* weight = is_b ? b_weight : a_weight;
-            cp_async<16, Cache::cg>(
-                dst, &weight[static_cast<std::int64_t>(head0 + row) * kBf16GdnHidden + k0 + kk]);
+            if constexpr (kBf16GdnHeads % kBf16GdnBlockM == 0) {
+                cp_async<16, Cache::cg>(
+                    dst,
+                    &weight[static_cast<std::int64_t>(head0 + row) * kBf16GdnHidden + k0 + kk]);
+            } else {
+                const bool valid = head0 + row < kBf16GdnHeads;
+                cp_async_zfill<16, Cache::cg>(
+                    dst,
+                    &weight[static_cast<std::int64_t>(valid ? head0 + row : 0) * kBf16GdnHidden +
+                            k0 + kk],
+                    valid ? 16 : 0);
+            }
         }
     };
 
@@ -262,6 +284,9 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
             const int col0 = token0 + warp * kWarpN + ni * 8 + 2 * lid;
             const int col1 = col0 + 1;
             auto store     = [&](int token, int row, float av, float bv) {
+                if constexpr (kBf16GdnHeads % kBf16GdnBlockM != 0) {
+                    if (row >= kBf16GdnHeads) { return; }
+                }
                 if constexpr (SplitK == 1) {
                     const std::int64_t out_i =
                         static_cast<std::int64_t>(token) * kBf16GdnHeads + row;

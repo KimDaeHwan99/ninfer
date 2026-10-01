@@ -50,6 +50,13 @@ void bf16_gdn_gating_proj_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, 
                                              const Tensor& A_log, const Tensor& dt_bias, Tensor& g,
                                              Tensor& beta, cudaStream_t stream);
 
+// One tensor-parallel rank's 24-head control projection over [5120,T] (split_k 1, 2, 4 or 8;
+// split_k > 1 needs split_k * T * 48 floats of workspace).
+[[nodiscard]] bool bf16_gdn_gating_proj_shard_mma_launch(
+    int split_k, Bf16GdnGatingTokenVariant variant, const Tensor& x, const Weight& a_weight,
+    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, void* workspace, Tensor& g,
+    Tensor& beta, std::int32_t multiprocessor_count, cudaStream_t stream);
+
 void bf16_gdn_gating_proj_35_simt_c4_launch(const Tensor& x, const Weight& a_weight,
                                             const Weight& b_weight, const Tensor& A_log,
                                             const Tensor& dt_bias, Tensor& g, Tensor& beta,

@@ -261,7 +261,8 @@ void require_shape35(const Weight& w, const char* name) {
 template <class Geometry, int SplitK>
 constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
     static_assert(SplitK > 1);
-    if constexpr (std::is_same_v<Geometry, Bf16Gdn27Geometry>) {
+    if constexpr (std::is_same_v<Geometry, Bf16Gdn27Geometry> ||
+                  std::is_same_v<Geometry, Bf16Gdn27ShardGeometry>) {
         static_assert(SplitK == 8 || SplitK == 4 || SplitK == 2);
         // Qualified on the sm_120a build: BN128 split-8 uses 256 threads and split-4/2 use
         // 512 threads; registers and 40-KiB shared memory admit two resident CTAs per SM.
@@ -289,7 +290,7 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                               Tensor* launch_normalized_x, Tensor& launch_g, Tensor& launch_beta) {
         const std::int32_t launch_t = launch_x.ne[1];
         const dim3 grid(static_cast<unsigned>(div_up(launch_t, kBlockN)),
-                        static_cast<unsigned>(Geometry::kHeads / kBf16GdnBlockM),
+                        static_cast<unsigned>(kBf16GdnHeadTiles<Geometry>),
                         static_cast<unsigned>(SplitK));
         auto launch = [&](auto full_tokens) {
             constexpr bool FullTokens     = decltype(full_tokens)::value;
@@ -355,7 +356,7 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
         launch_problem(variant, x, normalized_x, g, beta);
     } else {
         constexpr std::int64_t kCtasPerTokenTile =
-            static_cast<std::int64_t>(Geometry::kHeads / kBf16GdnBlockM) * SplitK;
+            static_cast<std::int64_t>(kBf16GdnHeadTiles<Geometry>) * SplitK;
         constexpr std::int32_t kResidentCtasPerSm =
             cooperative_resident_ctas_per_sm<Geometry, SplitK>();
         const std::int64_t resident_ctas =
@@ -489,6 +490,40 @@ void bf16_gdn_gating_proj_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, 
     (void)launch_bf16_prefill_mma<Bf16Gdn27Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr,
                                                            a_weight, b_weight, A_log, dt_bias,
                                                            nullptr, g, beta, stream);
+}
+
+bool bf16_gdn_gating_proj_shard_mma_launch(int split_k, Bf16GdnGatingTokenVariant variant,
+                                           const Tensor& x, const Weight& a_weight,
+                                           const Weight& b_weight, const Tensor& A_log,
+                                           const Tensor& dt_bias, void* workspace, Tensor& g,
+                                           Tensor& beta, std::int32_t multiprocessor_count,
+                                           cudaStream_t stream) {
+    using Geometry = Bf16Gdn27ShardGeometry;
+    if (a_weight.n != Geometry::kHeads || a_weight.k != Geometry::kHidden ||
+        b_weight.n != Geometry::kHeads || b_weight.k != Geometry::kHidden) {
+        throw std::invalid_argument("gdn_gating_proj: shard MMA requires BF16 [24,5120] weights");
+    }
+    switch (split_k) {
+    case 8:
+        return launch_bf16_prefill_mma<Geometry, 8, 8>(variant, x, nullptr, 0.0F, nullptr,
+                                                       a_weight, b_weight, A_log, dt_bias,
+                                                       workspace, g, beta, stream,
+                                                       multiprocessor_count);
+    case 4:
+        return launch_bf16_prefill_mma<Geometry, 4>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                    b_weight, A_log, dt_bias, workspace, g, beta,
+                                                    stream, multiprocessor_count);
+    case 2:
+        return launch_bf16_prefill_mma<Geometry, 2>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                    b_weight, A_log, dt_bias, workspace, g, beta,
+                                                    stream, multiprocessor_count);
+    case 1:
+        return launch_bf16_prefill_mma<Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr,
+                                                       a_weight, b_weight, A_log, dt_bias, nullptr,
+                                                       g, beta, stream);
+    default:
+        throw std::invalid_argument("gdn_gating_proj: shard MMA split must be 1, 2, 4 or 8");
+    }
 }
 
 template <int ColsPerTile>

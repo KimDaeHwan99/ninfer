@@ -66,10 +66,25 @@ bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
 }
 
-// One tensor-parallel rank's half of the 27B value heads. Only the fused norm/control route
-// registers this geometry.
+// One tensor-parallel rank's half of the 27B value heads. Only the norm/control Op registers this
+// geometry: fused up to 42 columns like the full layer, then RMSNorm and the shard MMA.
 bool is_27_shard(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 24 && problem.input_rows == 5120;
+}
+
+constexpr std::int32_t kShardFusedMaxCols  = 42;
+constexpr std::int32_t kShardSplit8MaxCols = 512;
+constexpr std::int32_t kShardSplit4MaxCols = 1024;
+// Tokens per MMA CTA (Bf16Gdn27ShardGeometry::kBlockN).
+constexpr std::int32_t kShardTokenTile = 128;
+
+int shard_split_k(Bf16GdnGatingScheduleId schedule) {
+    switch (schedule) {
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8: return 8;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4: return 4;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2: return 2;
+    default: throw std::logic_error("BF16 GDN gating: invalid shard split");
+    }
 }
 
 bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
@@ -317,6 +332,8 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
         return "gdn_norm_gating_proj.bf16.composed";
     case Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32:
         return "gdn_norm_gating_proj.bf16.mma.cooperative_split32";
+    case Bf16GdnNormGatingScheduleId::ComposedShard:
+        return "gdn_norm_gating_proj.bf16.composed_shard";
     }
     return "gdn_norm_gating_proj.bf16.unknown";
 }
@@ -377,7 +394,23 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
 
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
     if (is_27_shard(problem) && problem.cols >= 1) {
-        return {Bf16GdnNormGatingScheduleId::FusedSimt27, Bf16GdnGatingPlan{}, 0};
+        if (problem.cols <= kShardFusedMaxCols) {
+            return {Bf16GdnNormGatingScheduleId::FusedSimt27, Bf16GdnGatingPlan{}, 0};
+        }
+        // RTX 5060 Ti, T=2048: 600 us fused -> 106 us; split-8/4/2 by width.
+        const int split = problem.cols <= kShardSplit8MaxCols   ? 8
+                          : problem.cols <= kShardSplit4MaxCols ? 4
+                                                                : 2;
+        const auto schedule = split == 8   ? Bf16GdnGatingScheduleId::MmaCooperativeSplit8
+                              : split == 4 ? Bf16GdnGatingScheduleId::MmaCooperativeSplit4
+                                           : Bf16GdnGatingScheduleId::MmaCooperativeSplit2;
+        const auto variant  = problem.cols % kShardTokenTile == 0
+                                  ? Bf16GdnGatingTokenVariant::Full
+                                  : Bf16GdnGatingTokenVariant::Predicated;
+        const std::size_t partial_bytes = static_cast<std::size_t>(split) * problem.cols * 2 *
+                                          problem.heads * sizeof(float);
+        return {Bf16GdnNormGatingScheduleId::ComposedShard,
+                Bf16GdnGatingPlan{schedule, variant, partial_bytes}, partial_bytes};
     }
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
@@ -403,7 +436,15 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
         if (min_cols <= 0 || max_cols < min_cols) {
             throw std::invalid_argument("BF16 GDN gating: invalid column interval");
         }
-        return 0;
+        std::size_t maximum = 0;
+        for (std::int32_t cols : {min_cols, std::min(max_cols, kShardSplit8MaxCols),
+                                  std::min(max_cols, kShardSplit4MaxCols), max_cols}) {
+            if (cols < min_cols) continue;
+            maximum = std::max(maximum,
+                               bf16_gdn_norm_gating_resolve_plan({heads, input_rows, cols})
+                                   .workspace_bytes);
+        }
+        return maximum;
     }
     std::size_t maximum =
         bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
@@ -458,6 +499,25 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                    Tensor& g, Tensor& beta, DeviceExecutionView execution) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
     const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem);
+    if (plan.schedule == Bf16GdnNormGatingScheduleId::ComposedShard) {
+        rmsnorm(x, norm_weight, eps, true, h, execution.stream);
+        auto scratch_scope = ws.scope();
+        void* partial      = nullptr;
+        if (plan.workspace_bytes != 0) { partial = ws.alloc_bytes(plan.workspace_bytes).data; }
+        if (bf16_gdn_gating_proj_shard_mma_launch(shard_split_k(plan.control.schedule),
+                                                  plan.control.token_variant, h, a_weight,
+                                                  b_weight, A_log, dt_bias, partial, g, beta,
+                                                  execution.multiprocessor_count,
+                                                  execution.stream)) {
+            return;
+        }
+        // No cooperative token tile fits this device; the unsplit kernel needs no residency.
+        (void)bf16_gdn_gating_proj_shard_mma_launch(1, plan.control.token_variant, h, a_weight,
+                                                    b_weight, A_log, dt_bias, nullptr, g, beta,
+                                                    execution.multiprocessor_count,
+                                                    execution.stream);
+        return;
+    }
     if (plan.schedule == Bf16GdnNormGatingScheduleId::FusedSimt27) {
         bf16_gdn_norm_gating_proj_27_launch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                             dt_bias, g, beta, execution.stream);

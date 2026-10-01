@@ -42,6 +42,8 @@ enum class Bf16GdnNormGatingScheduleId {
     FusedSimt27,
     Composed,
     MmaCooperativeSplit32,
+    // RMSNorm, then the 24-head shard control MMA at the split recorded in `control.schedule`.
+    ComposedShard,
 };
 
 struct Bf16GdnNormGatingPlan {

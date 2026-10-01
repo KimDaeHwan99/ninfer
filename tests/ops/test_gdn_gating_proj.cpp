@@ -539,13 +539,27 @@ int main() {
         failures += run_norm_projection_case(kQwen35, tokens, 0x7800u + tokens, norm_execution,
                                              tokens == 15);
 
-    // Tensor-parallel shard: the fused norm/control route at every decode, verify and prefill width.
-    for (int tokens : {1, 2, 3, 4, 8, 9, 14, 15, 16, 28, 29, 32, 42, 43, 64, 128, 1024, 2048})
+    // Tensor-parallel shard: the fused norm/control route through 42 columns, then RMSNorm and the
+    // shard MMA across its split-8/4/2 boundaries.
+    for (int tokens : {1, 2, 3, 4, 8, 9, 14, 15, 16, 28, 29, 32, 42, 43, 64, 128, 512, 513, 1024,
+                       1025, 2048, 2049})
         failures +=
             run_norm_projection_case(kQwen38Shard, tokens, 0x9800u + tokens, norm_execution);
     for (int tokens : {1, 4, 16, 43})
         failures += run_norm_projection_case(kQwen38Shard, tokens, 0xa800u + tokens,
                                              norm_execution, true);
+    for (const auto [first, last] : std::vector<std::pair<int, int>>{
+             {1, 42}, {40, 43}, {40, 600}, {500, 1100}, {1, 2049}}) {
+        std::size_t witness = 0;
+        for (int t = first; t <= last; ++t)
+            witness = std::max(witness, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+                                            kQwen38Shard.heads, kQwen38Shard.hidden, t, t));
+        if (ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+                kQwen38Shard.heads, kQwen38Shard.hidden, first, last) != witness) {
+            std::cerr << kQwen38Shard.label << ": norm/control interval missed an extent\n";
+            ++failures;
+        }
+    }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";
     return failures == 0 ? 0 : 1;

@@ -18,7 +18,7 @@ using namespace ninfer::bench;
 
 namespace {
 struct Options {
-    bool geometry35 = false, parent = true, norm = true, profile = false;
+    bool geometry35 = false, shard = false, parent = true, norm = true, profile = false;
     std::vector<int> tokens{1, 2, 4, 6, 8, 9, 16, 32, 64, 128};
     std::string execution = "graph", cache = "cold", csv;
     int warmup = 10, repeat = 61, graph_calls = 1;
@@ -26,7 +26,7 @@ struct Options {
 
 void help() {
     std::cout
-        << "usage: ninfer_gdn_gating_proj_bench [--geometry 27b|35b] [--weights parent|split] "
+        << "usage: ninfer_gdn_gating_proj_bench [--geometry 27b|27b-tp|35b] [--weights parent|split] "
            "[--op norm|control] [--tokens T,...] [--execution eager|graph|both] [--cache "
            "cold|warm|both] "
            "[--graph-calls N] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n";
@@ -52,8 +52,11 @@ Options parse(int argc, char** argv) {
             std::exit(0);
         } else if (a == "--geometry") {
             auto v = next();
-            if (v != "27b" && v != "35b") throw std::invalid_argument("invalid geometry");
+            if (v != "27b" && v != "35b" && v != "27b-tp")
+                throw std::invalid_argument("invalid geometry");
             o.geometry35 = v == "35b";
+            // One tensor-parallel rank's half of the 27B value heads.
+            o.shard = v == "27b-tp";
         } else if (a == "--weights") {
             auto v = next();
             if (v != "parent" && v != "split") throw std::invalid_argument("invalid weight form");
@@ -141,7 +144,7 @@ Weight weight(const void* data, int rows, int hidden) {
 
 void run(const Options& o, int t, DeviceExecutionView execution, bench::L2FlushBuffer& flush,
          std::ostream* csv) {
-    const int heads = o.geometry35 ? 32 : 48, hidden = o.geometry35 ? 2048 : 5120;
+    const int heads = o.geometry35 ? 32 : (o.shard ? 24 : 48), hidden = o.geometry35 ? 2048 : 5120;
     auto x    = bf16_values(std::size_t(hidden) * t, 13u, 1.0f);
     auto nw   = bf16_values(hidden, 29u, 0.2f);
     auto w    = bf16_values(std::size_t(2 * heads) * hidden, 47u, 0.015f);
@@ -219,13 +222,13 @@ void run(const Options& o, int t, DeviceExecutionView execution, bench::L2FlushB
             time.p95_us /= calls;
             if (ws.used() != 0 || ws.peak_used() != capacity)
                 throw std::runtime_error("workspace query/peak mismatch");
-            std::cout << (o.geometry35 ? "35b" : "27b") << ' ' << (o.norm ? "norm" : "control")
+            std::cout << (o.geometry35 ? "35b" : (o.shard ? "27b-tp" : "27b")) << ' ' << (o.norm ? "norm" : "control")
                       << " T=" << t << ' ' << mode << ' ' << cache << " median=" << time.median_us
                       << " min=" << time.min_us << " p95=" << time.p95_us
                       << " us workspace=" << capacity << " nodes=" << (gr ? graph.nodes() : 0)
                       << " calls=" << calls << '\n';
             if (csv)
-                *csv << (o.geometry35 ? "35b" : "27b") << ',' << (o.norm ? "norm" : "control")
+                *csv << (o.geometry35 ? "35b" : (o.shard ? "27b-tp" : "27b")) << ',' << (o.norm ? "norm" : "control")
                      << ',' << (o.parent ? "parent" : "split") << ',' << t << ',' << mode << ','
                      << cache << ',' << calls << ',' << (gr ? graph.nodes() : 0) << ',' << capacity
                      << ',' << ws.peak_used() << ',' << time.median_us << ',' << time.min_us << ','
