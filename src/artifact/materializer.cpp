@@ -134,7 +134,14 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     const auto& observer = startup_observer ? *startup_observer : no_observer;
     std::uint64_t total  = 0;
     for (const auto& placement : plan.device_objects) {
-        total = checked_add(total, placement.bytes, "device payload bytes");
+        if (!placement.subset) {
+            total = checked_add(total, placement.bytes, "device payload bytes");
+            continue;
+        }
+        for (const auto& window : placement.subset->windows) {
+            total = checked_add(total, checked_mul(window.width, window.height, "window bytes"),
+                                "device payload bytes");
+        }
     }
     StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize, StartupProgressUnit::Bytes,
                             total);
@@ -178,7 +185,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     std::vector<CopyRange> ranges;
     for (const auto& placement : plan.device_objects) {
-        const auto& geometry = reader.geometry(placement.object);
+        const auto& source   = reader.geometry(placement.object);
+        const auto& geometry = placement.subset ? placement.subset->geometry : source;
         auto& object         = out.objects_.at(placement.object.index);
         if (object.device || !out.arena_ || geometry.bytes != placement.bytes) {
             throw ArtifactError("invalid or duplicate device placement");
@@ -192,14 +200,47 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         const auto divisor = object.host
                                  ? object.host->weight_scale_divisor
-                                 : read_divisor(reader, placement.object, geometry, {}, out.stats_);
+                                 : read_divisor(reader, placement.object, source, {}, out.stats_);
         object.device =
             WeightParent{geometry, static_cast<const std::byte*>(storage.data), divisor};
         const auto& descriptor = reader.directory().tensor(placement.object);
-        for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
-            ranges.push_back({segment.file_index, segment.file_offset,
-                              checked_add(segment.file_offset, segment.bytes, "copy range"),
-                              static_cast<std::byte*>(storage.data) + segment.destination_offset});
+        auto* destination      = static_cast<std::byte*>(storage.data);
+        const auto add_range   = [&](std::uint64_t offset, std::uint64_t bytes,
+                                   std::byte* target) {
+            for (const auto& segment :
+                 reader.segments(checked_add(descriptor.offset, offset, "subset offset"), bytes)) {
+                ranges.push_back({segment.file_index, segment.file_offset,
+                                  checked_add(segment.file_offset, segment.bytes, "copy range"),
+                                  target + segment.destination_offset});
+            }
+        };
+        if (!placement.subset) {
+            add_range(0, descriptor.bytes, destination);
+            continue;
+        }
+        // Alignment gaps between planes are not covered by any window.
+        check_cuda(cudaMemsetAsync(destination, 0, static_cast<std::size_t>(geometry.bytes),
+                                   device.transfer_stream),
+                   "clear placement subset");
+        std::uint64_t covered = 0;
+        for (const auto& window : placement.subset->windows) {
+            for (std::uint64_t row = 0; row < window.height; ++row) {
+                const auto from = checked_add(window.source_offset,
+                                              checked_mul(row, window.source_pitch, "window"),
+                                              "window source");
+                const auto to   = checked_add(window.destination_offset,
+                                              checked_mul(row, window.destination_pitch, "window"),
+                                              "window destination");
+                if (checked_add(from, window.width, "window end") > descriptor.bytes ||
+                    checked_add(to, window.width, "window end") > geometry.bytes) {
+                    throw ArtifactError("placement subset window exceeds its object");
+                }
+                add_range(from, window.width, destination + to);
+                covered = checked_add(covered, window.width, "subset coverage");
+            }
+        }
+        if (covered > geometry.bytes) {
+            throw ArtifactError("placement subset windows overlap their placement");
         }
     }
     if (ranges.empty()) {

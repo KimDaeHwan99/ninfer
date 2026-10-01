@@ -138,11 +138,28 @@ struct DraftConfig {
     }
 };
 
+// Tensor-parallel placement of one Model instance. A split rank's TextConfig carries that rank's
+// local attention/GDN head counts and FFN width; hidden size and vocabulary stay global. The
+// output head holds `vocab_size / size` rows starting at `rank * vocab_size / size`.
+struct TensorParallelPlacement {
+    std::uint32_t size = 1;
+    std::uint32_t rank = 0;
+
+    [[nodiscard]] bool split() const noexcept { return size > 1; }
+
+    bool operator==(const TensorParallelPlacement&) const = default;
+};
+
 struct Config {
     TextConfig text;
     std::optional<VisionConfig> vision;
     bool mtp = false;
     std::optional<DraftConfig> draft;
+    TensorParallelPlacement tensor_parallel;
+
+    [[nodiscard]] std::uint32_t output_head_rows() const noexcept {
+        return text.vocab_size / tensor_parallel.size;
+    }
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);

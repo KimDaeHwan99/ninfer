@@ -106,3 +106,11 @@ ninfer_add_test(ninfer_qwen3_5_visual_scatter_test
 set_tests_properties(
   ninfer_qwen3_5_visual_scatter_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_tensor_parallel_shard_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tensor_parallel_shard_real.cpp"
+  LIBRARIES ninfer_model_loading)
+
+set_tests_properties(
+  ninfer_qwen3_5_tensor_parallel_shard_real_test
+  PROPERTIES SKIP_RETURN_CODE 77)

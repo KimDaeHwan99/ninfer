@@ -7,6 +7,7 @@
 #include "ninfer/types.h"
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -14,11 +15,32 @@ namespace ninfer::artifact {
 
 class Reader;
 
+// One strided byte window of an object's stored representation: `height` rows of `width` bytes,
+// read at `source_offset + row * source_pitch` within the object and written at
+// `destination_offset + row * destination_pitch` within the placement.
+struct ByteWindow {
+    std::uint64_t source_offset      = 0;
+    std::uint64_t source_pitch       = 0;
+    std::uint64_t destination_offset = 0;
+    std::uint64_t destination_pitch  = 0;
+    std::uint64_t width              = 0;
+    std::uint64_t height             = 1;
+};
+
+// A placement whose bytes are a selected subset of the object's stored representation, e.g. one
+// tensor-parallel rank's rows or columns. `geometry` describes the placed representation and
+// `windows` cover its bytes exactly once; the object's weight divisor is read from the source.
+struct PlacementSubset {
+    WeightGeometry geometry;
+    std::vector<ByteWindow> windows;
+};
+
 struct DevicePlacement {
     ObjectHandle object;
     std::uint64_t offset    = 0;
     std::uint64_t bytes     = 0;
     std::uint64_t alignment = 256;
+    std::optional<PlacementSubset> subset;
 };
 
 struct HostPlacement {

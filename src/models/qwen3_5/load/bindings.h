@@ -62,6 +62,12 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& 
 [[nodiscard]] ProposalWeights bind_proposal(Bindings& bindings, const artifact::Proposal& proposal,
                                             const TextConfig& target, const LoadOptions& options,
                                             std::uint32_t public_tokens);
+// Rank-local config of a tensor-parallel split: local head counts and FFN width.
+[[nodiscard]] Config shard_config(const Config& full, TensorParallelPlacement placement);
+// Rewrites a plan bound against the full model into one rank's shard placements and parameters.
+void shard_plan(const artifact::Reader& reader, const Config& full,
+                std::vector<PendingWeight>& pending,
+                artifact::MaterializationPlan& materialization, TensorParallelPlacement placement);
 [[nodiscard]] std::vector<BoundWeight>
 resolve_weights(std::vector<PendingWeight>&& pending,
                 const artifact::MaterializedArtifact& materialized);

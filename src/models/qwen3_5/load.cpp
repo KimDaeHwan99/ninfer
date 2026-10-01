@@ -33,6 +33,8 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }
 
+std::size_t LoadPlan::parameter_count() const { return impl_->pending.size(); }
+
 const artifact::ParameterReference& LoadPlan::parameter(WeightId id) const {
     return impl_->pending.at(id.index).reference;
 }
@@ -41,7 +43,8 @@ std::span<const WeightUse> LoadPlan::uses(WeightId id) const {
     return impl_->pending.at(id.index).uses;
 }
 
-LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
+LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
+                   TensorParallelPlacement placement) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
@@ -92,6 +95,11 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     }
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish();
+    if (placement.split()) {
+        const Config full = out->config;
+        out->config       = loading::shard_config(full, placement);
+        loading::shard_plan(reader, full, out->pending, out->materialization, placement);
+    }
     out->info.name       = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
     out->info.metadata_json   = reader.directory().metadata.dump();

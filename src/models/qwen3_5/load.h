@@ -27,6 +27,7 @@ public:
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const FrontendResources& resources() const;
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
+    [[nodiscard]] std::size_t parameter_count() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId id) const;
 
@@ -34,12 +35,15 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     explicit LoadPlan(std::unique_ptr<Impl> impl);
-    friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
+    friend LoadPlan plan_load(const artifact::Reader&, LoadOptions, TensorParallelPlacement);
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
 };
 
-[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {});
+// A split `placement` binds the full model, then keeps only that rank's shard (see
+// load/tensor_parallel.cpp).
+[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {},
+                                 TensorParallelPlacement placement = {});
 [[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                                        const StartupObserver* observer = nullptr);
 [[nodiscard]] std::unique_ptr<Model> load_model(const std::filesystem::path& path,
