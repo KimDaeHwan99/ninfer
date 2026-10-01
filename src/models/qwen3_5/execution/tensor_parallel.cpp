@@ -56,8 +56,12 @@ TensorParallelSlices tensor_parallel_slices(const TensorParallelDeviceView* tp,
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
     if (capture != cudaStreamCaptureStatusNone) { return slices; }
     const std::int32_t count = std::clamp(columns / kMinColumns, 2, kTensorParallelMaxSlices);
-    slices.width = (columns / count + kAlign - 1) / kAlign * kAlign;
+    // Round the ceiling share up: a floored share can leave a remainder for an extra slice.
+    slices.width = ((columns + count - 1) / count + kAlign - 1) / kAlign * kAlign;
     slices.count = (columns + slices.width - 1) / slices.width;
+    if (slices.count < 1 || slices.count > kTensorParallelMaxSlices) {
+        throw std::logic_error("tensor-parallel slicing produced an invalid slice count");
+    }
     return slices;
 }
 
