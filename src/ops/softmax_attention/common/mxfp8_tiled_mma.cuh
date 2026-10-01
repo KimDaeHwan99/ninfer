@@ -364,38 +364,46 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             acc[n][3] *= alpha1;
         }
 
-        // O += P V, contracting over the Bc keys. The (k, n) iteration space is
-        // flattened and software-pipelined: the transposed ldmatrix for the next
-        // V fragment is issued while the current MMA runs.
-        // Each x4.trans load covers 2 output n-tiles (16 dims); pipeline the next
-        // load against the current pair of MMAs.
+        // O += P V, contracting over the Bc keys. Each output n-tile pair accumulates the tile's
+        // keys in FP16 (twice the FP32-accumulating MMA rate on consumer Blackwell; P <= 1 over at
+        // most 64 keys) and folds once into the FP32 state. The (n, k) iteration space is
+        // flattened and software-pipelined: the transposed ldmatrix for the next V fragment is
+        // issued while the current MMA runs. Each x4.trans load covers 2 output n-tiles.
         constexpr int PVHalf  = PVNtPerWarp / 2; // 16 n-tile pairs
-        constexpr int PVLoads = PVKs * PVHalf;   // 64 x4.trans loads
-        // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
+        constexpr int PVLoads = PVKs * PVHalf;
+        const auto v_address  = [&](int load) {
+            const int k  = load % PVKs;
+            const int n2 = (load / PVKs) * 2;
+            return causal_swizzle_address(v_lane_base + static_cast<unsigned>(k * (16 * D * 2)),
+                                          static_cast<unsigned>(n2 << 4), v_as, v_r);
+        };
         unsigned vf[2][4];
-        {
-            ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
-                          causal_swizzle_address(v_lane_base, 0u, v_as, v_r));
-        }
+        ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3], v_address(0));
+        unsigned h[2][2] = {};
 #pragma unroll
         for (int li = 0; li < PVLoads; ++li) {
-            const int k   = li / PVHalf;
-            const int n2  = (li % PVHalf) * 2;
+            const int k   = li % PVKs;
+            const int n2  = (li / PVKs) * 2;
             const int cur = li & 1;
             const int nxt = cur ^ 1;
-            if (li + 1 < PVLoads) {
-                const int k2       = (li + 1) / PVHalf;
-                const int n2b      = ((li + 1) % PVHalf) * 2;
-                const unsigned ckv = static_cast<unsigned>(n2b << 4);
-                ldmatrix_x4_t(
-                    vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
-                    causal_swizzle_address(v_lane_base + static_cast<unsigned>(k2 * (16 * D * 2)),
-                                           ckv, v_as, v_r));
+            if (li + 1 < PVLoads)
+                ldmatrix_x4_t(vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3], v_address(li + 1));
+            mma_f16_acc16(h[0][0], h[0][1], p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3],
+                          vf[cur][0], vf[cur][1]);
+            mma_f16_acc16(h[1][0], h[1][1], p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3],
+                          vf[cur][2], vf[cur][3]);
+            if (k + 1 == PVKs) {
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const float2 top    = __half22float2(*reinterpret_cast<const __half2*>(&h[j][0]));
+                    const float2 bottom = __half22float2(*reinterpret_cast<const __half2*>(&h[j][1]));
+                    acc[n2 + j][0] += top.x;
+                    acc[n2 + j][1] += top.y;
+                    acc[n2 + j][2] += bottom.x;
+                    acc[n2 + j][3] += bottom.y;
+                    h[j][0] = h[j][1] = 0U;
+                }
             }
-            mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
-                    p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
-            mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
-                    p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
         }
 
         if (kb + 1 < key_blocks) ninfer::ops::cp_wait<0>();
