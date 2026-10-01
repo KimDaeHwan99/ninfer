@@ -1,5 +1,11 @@
 # NInfer
 
+> **This fork (`tp2-5060ti`)** adds two-GPU tensor parallelism (`--tp 2`). It runs Qwen3.8-27B
+> NVFP4 on two 16 GB RTX 5060 Ti cards without P2P. The branch was developed by **Claude Opus 5.5
+> (medium reasoning effort)** in Claude Code. See
+> [Two-GPU tensor parallelism on RTX 5060 Ti](docs/tensor-parallel-rtx5060ti.md) for usage and
+> results. Everything below is the upstream README.
+
 > Selected checkpoints. Maximum single-GPU inference performance.
 
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
