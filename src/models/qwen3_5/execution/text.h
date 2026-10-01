@@ -172,6 +172,10 @@ private:
     // x += output(input) for a mixer. A tensor-parallel prefill leaves the all-reduces of its
     // column slices in flight for mlp_tail, which waits each slice before reading it.
     void mixer_output(const Tensor& input, const LinearParameters& output, Tensor& x);
+    // FFN all-reduces mlp_tail leaves in flight for the next layer's column-wise prologue.
+    // Takes them, or waits them all when the caller cannot consume them slice by slice.
+    [[nodiscard]] TensorParallelSlices take_pending_ffn(std::int32_t columns, bool sliced);
+    void wait_pending_ffn();
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
@@ -258,6 +262,8 @@ private:
     const MtpParameters* mtp_                   = nullptr;
     const TensorParallelDeviceView* tp_         = nullptr;
     TensorParallelSlices pending_mixer_{};
+    TensorParallelSlices pending_ffn_{};
+    std::int32_t pending_ffn_columns_ = 0;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

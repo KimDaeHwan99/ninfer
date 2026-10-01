@@ -848,7 +848,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 
     const auto projection = workspace::text_attention_projection(work_, config_, T);
     Tensor h              = projection.hidden;
-    ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+    const auto ffn        = take_pending_ffn(T, ph == Phase::Prefill);
+    if (ffn.count == 0) { ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s); }
 
     Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
                                               dimension(config_.attention->num_attention_heads), T});
@@ -862,7 +863,22 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    if (ffn.count == 0) {
+        attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    } else {
+        // Column-wise prologue: slice i starts once the previous FFN all-reduce of slice i lands.
+        for (int i = 0; i < ffn.count; ++i) {
+            const auto first   = ffn.first(i);
+            const auto columns = ffn.columns(i, T);
+            ops::tp_wait(*tp_, ffn.tickets[i], s);
+            Tensor hi = h.slice(1, first, columns);
+            ops::rmsnorm(x.slice(1, first, columns), w.input_norm, config_.rms_norm_eps, true, hi,
+                         s);
+            Tensor qi = q_flat.slice(1, first, columns), gi = gate_flat.slice(1, first, columns);
+            Tensor ki = k_flat.slice(1, first, columns), vi = v_flat.slice(1, first, columns);
+            attention_projection(hi, p, qi, gi, ki, vi, work_, s);
+        }
+    }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
     Tensor qn =
@@ -934,8 +950,11 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
-                     ctx_.execution_view());
+    const auto ffn     = take_pending_ffn(T, ph == Phase::Prefill);
+    if (ffn.count == 0) {
+        gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
+                         ctx_.execution_view());
+    }
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -984,7 +1003,23 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     } else {
         Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
         Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
-        gdn_projection(h, p, qkv, z_flat, work_, s);
+        if (ffn.count == 0) {
+            gdn_projection(h, p, qkv, z_flat, work_, s);
+        } else {
+            // Column-wise prologue: slice i starts once the previous FFN all-reduce of slice i
+            // lands; only the convolution below needs every column.
+            for (int i = 0; i < ffn.count; ++i) {
+                const auto first   = ffn.first(i);
+                const auto columns = ffn.columns(i, T);
+                ops::tp_wait(*tp_, ffn.tickets[i], s);
+                Tensor hi = h.slice(1, first, columns), gi = g.slice(1, first, columns);
+                Tensor bi = beta.slice(1, first, columns);
+                gdn_norm_control(x.slice(1, first, columns), w.input_norm, config_.rms_norm_eps, p,
+                                 hi, gi, bi, work_, ctx_.execution_view());
+                Tensor qkvi = qkv.slice(1, first, columns), zi = z_flat.slice(1, first, columns);
+                gdn_projection(hi, p, qkvi, zi, work_, s);
+            }
+        }
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
@@ -1079,6 +1114,7 @@ void TextContext::mixer_output(const Tensor& input, const LinearParameters& outp
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
                            const ops::SparseMoeHints& hints) {
     cudaStream_t s  = ctx_.stream;
+    wait_pending_ffn();
     const auto mixer = std::exchange(pending_mixer_, TensorParallelSlices{});
     const auto* dense = std::get_if<DenseParameters>(&weights.ffn);
     auto slices       = dense != nullptr ? tensor_parallel_slices(tp_, x.ne[1], s)
@@ -1105,7 +1141,23 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
         dense_ffn_product(hi, *dense, product, work_, s);
         slices.tickets[i] = ops::tp_residual_allreduce_async(product, xi, *tp_, s);
     }
-    for (int i = 0; i < slices.count; ++i) ops::tp_wait(*tp_, slices.tickets[i], s);
+    pending_ffn_         = slices;
+    pending_ffn_columns_ = total;
+}
+
+TensorParallelSlices TextContext::take_pending_ffn(std::int32_t columns, bool sliced) {
+    if (sliced && pending_ffn_.count != 0 && pending_ffn_columns_ == columns) {
+        pending_ffn_columns_ = 0;
+        return std::exchange(pending_ffn_, TensorParallelSlices{});
+    }
+    wait_pending_ffn();
+    return {};
+}
+
+void TextContext::wait_pending_ffn() {
+    for (int i = 0; i < pending_ffn_.count; ++i) ops::tp_wait(*tp_, pending_ffn_.tickets[i], ctx_.stream);
+    pending_ffn_         = TensorParallelSlices{};
+    pending_ffn_columns_ = 0;
 }
 
 template <class Tap>
@@ -1140,6 +1192,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
             }
             if constexpr (Tap::enabled) {
+                wait_pending_ffn();
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
             }
         } catch (const std::exception& error) {
@@ -1148,6 +1201,8 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                      " columns=" + std::to_string(x.ne[1]) + ": " + error.what());
         }
     }
+    // The last layer's FFN all-reduces complete x before the final norm reads it.
+    wait_pending_ffn();
 }
 
 void TextContext::run_layers(Tensor& x, Phase ph) {
