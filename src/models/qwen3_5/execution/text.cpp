@@ -573,7 +573,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                                      static_cast<std::uint64_t>(T));
     if (proposal_head_ != nullptr) {
         Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
-        project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
+        output_head(hidden, *proposal_head_, proposal_logits, tp_, work_, ctx_.stream);
         ops::argmax(proposal_logits, proposal_tokens,
                     proposal_head_ids_
                         ? proposal_head_n_

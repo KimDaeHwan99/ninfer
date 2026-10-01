@@ -6,6 +6,8 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/tensor_parallel.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -72,13 +74,22 @@ void output_head(const Tensor& hidden, const LinearParameters& head, Tensor& log
     if (static_cast<std::int64_t>(head.weight.n) * 2 != logits.ne[0]) {
         throw std::invalid_argument("split output head rows are not half of the logits rows");
     }
+    // Gather in column slices that fit one link slot (scoring tiles exceed it).
+    const auto row_bytes = static_cast<std::uint64_t>(head.weight.n) * sizeof(std::uint16_t);
+    const auto slice     = static_cast<std::int32_t>(
+        std::min<std::uint64_t>(logits.ne[1], std::max<std::uint64_t>(1, tp->slot_bytes / row_bytes)));
     auto scope   = workspace.scope();
     Tensor local = workspace.alloc(DType::BF16, {head.weight.n, logits.ne[1]});
     {
         auto call = workspace.scope();
         ops::linear(hidden, head.weight, local, head.policy, workspace, stream);
     }
-    ops::tp_allgather_rows(local, logits, *tp, stream);
+    for (std::int32_t first = 0; first < logits.ne[1]; first += slice) {
+        const std::int32_t count = std::min(slice, logits.ne[1] - first);
+        Tensor part              = local.slice(1, first, count);
+        Tensor destination       = logits.slice(1, first, count);
+        ops::tp_allgather_rows(part, destination, *tp, stream);
+    }
 }
 
 } // namespace ninfer::models::qwen3_5::execution

@@ -385,7 +385,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
             matrix(layout, DType::BF16, dimension(parameters.proposal->rows), columns);
-            linear_scratch(layout, parameters.proposal->head, columns, columns);
+            head_scratch(layout, parameters.proposal->head, columns, columns);
         } else {
             head_scratch(layout, parameters.mtp->output_head, columns, columns);
         }

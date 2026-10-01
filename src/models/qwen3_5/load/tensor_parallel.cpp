@@ -6,11 +6,12 @@
 // Split map (Megatron-style, per rank r of S):
 //   column-parallel (rows kept):  attention query/gate (query heads), key/value (KV heads),
 //                                 GDN query/key (key heads), value/z, a/b projections, a_log,
-//                                 dt_bias (value heads), MLP gate/up, text output head (vocab).
+//                                 dt_bias (value heads), MLP gate/up, text output and proposal
+//                                 heads (vocabulary rows; logits are gathered).
 //   row-parallel (columns kept):  attention/GDN output, MLP down; the rank's partial products are
 //                                 summed by the residual all-reduce.
 //   channel-split (columns kept): GDN convolution, whose channels are Q | K | V sections.
-//   replicated:                   norms, token embedding, MTP input projection, proposal head.
+//   replicated:                   norms, token embedding, MTP input projection, proposal ids.
 // Head-aligned row ranges keep every split exact; nothing is repacked.
 #include "models/qwen3_5/load/bindings.h"
 
@@ -119,11 +120,11 @@ ParameterSplit split_for(const std::string& name, const Shape& shape, const Conf
     if (ends_with(name, "/mlp/gate") || ends_with(name, "/mlp/up")) {
         return {Axis::Rows, {share(rows_of(shape), tp, name + " rows")}};
     }
-    if (name == "text/output_head") {
+    if (name == "text/output_head" || name == "proposal/head") {
         return {Axis::Rows, {share(rows_of(shape), tp, name + " vocabulary")}};
     }
     if (name == "text/token_embedding" || name == "mtp/input_projection" ||
-        name == "proposal/head" || name == "proposal/token_ids") {
+        name == "proposal/token_ids") {
         return replicated;
     }
     throw ArtifactError("tensor parallel: no split rule for parameter " + name);
