@@ -2,6 +2,7 @@
 #include "evaluation.h"
 
 #include "ninfer/engine.h"
+#include "product/device_placement_options.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
@@ -47,6 +48,7 @@ struct Options {
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     int device                          = 0;
+    std::vector<int> devices{0};
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
@@ -55,7 +57,7 @@ struct Options {
 std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N]\n"
+           "       [--context N] [--stride N] [--device N] [--tp 1|2] [--devices N,N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
@@ -83,6 +85,9 @@ Options parse_options(int argc, char** argv) {
     }
     Options out;
     out.artifact = argv[1];
+    std::optional<int> explicit_device;
+    std::vector<int> rank_devices;
+    std::uint32_t tensor_parallel = 1;
     for (int i = 2; i < argc; ++i) {
         const std::string_view option = argv[i];
         const auto value              = [&](const char* label) -> std::string_view {
@@ -100,7 +105,11 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
         } else if (option == "--device") {
-            out.device = parse_integer<int>(value("--device"), "device");
+            explicit_device = parse_integer<int>(value("--device"), "device");
+        } else if (option == "--tp") {
+            tensor_parallel = ninfer::product::parse_tensor_parallel(value("--tp"));
+        } else if (option == "--devices") {
+            rank_devices = ninfer::product::parse_device_list(value("--devices"));
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -124,6 +133,9 @@ Options parse_options(int argc, char** argv) {
             usage_error("unknown option: " + std::string(option));
         }
     }
+    out.devices = ninfer::product::resolve_rank_devices(tensor_parallel, rank_devices,
+                                                        explicit_device);
+    out.device  = out.devices.front();
     if (out.corpus.has_value() == out.text.has_value()) {
         usage_error("exactly one of --corpus and --text is required");
     }
@@ -213,6 +225,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.artifact_path    = options.artifact;
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
+    engine_options.tensor_parallel  = static_cast<std::uint32_t>(options.devices.size());
+    engine_options.devices          = options.devices;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
     engine_options.startup_observer = startup_log.observer();
@@ -383,6 +397,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         {"execution",
          {{"purpose", "causal_scoring"},
           {"device", options.device},
+          {"devices", options.devices},
           {"context_tokens", options.context},
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", 1024},

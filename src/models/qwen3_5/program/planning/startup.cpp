@@ -472,7 +472,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
-        linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
+        head_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
         out.causal_score = finish(causal_score);
     }
 

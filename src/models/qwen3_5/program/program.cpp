@@ -339,8 +339,14 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
-    if (peer_) { throw std::logic_error("CausalScoring has no tensor-parallel Program"); }
-    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
+    PreparedPromptData data = PreparedPromptAccess::take(std::move(prompt));
+    if (!peer_) { return impl_->causal_score(std::move(data), first_target); }
+    PreparedPromptData peer_data = data;
+    std::vector<float> local, peer;
+    on_ranks([&] { peer = peer_->causal_score(std::move(peer_data), first_target); },
+             [&] { local = impl_->causal_score(std::move(data), first_target); });
+    require_same(local == peer, "causal scores");
+    return local;
 }
 
 std::optional<AdmissionCandidate> Program::inspect_admission(

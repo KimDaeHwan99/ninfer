@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/execution/tensor_parallel.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -391,7 +392,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             Tensor target_ids = work.alloc(DType::I32, {columns});
             Tensor logprobs   = work.alloc(DType::FP32, {columns});
             Tensor hidden     = score_hidden->slice(1, 0, columns);
-            execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+            execution::output_head(hidden, parameters.text.output_head, logits, tensor_parallel,
+                                   work, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
                                                     cudaMemcpyHostToDevice, device.stream));
             ops::target_logprobs(logits, target_ids,

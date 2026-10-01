@@ -67,9 +67,6 @@ void validate_options(const EngineOptions& options) {
             throw std::invalid_argument(
                 "Engine tensor_parallel 2 needs two distinct devices led by the primary device");
         }
-        if (options.purpose != EnginePurpose::Generation) {
-            throw std::invalid_argument("tensor-parallel execution serves Generation only");
-        }
         if (options.enable_vision) {
             throw std::invalid_argument("tensor-parallel execution does not split Vision");
         }
