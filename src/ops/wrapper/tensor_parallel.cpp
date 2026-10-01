@@ -13,7 +13,8 @@ namespace {
 
 void require_link(const TensorParallelDeviceView& tp, const char* op) {
     if (tp.self_mailbox == nullptr || tp.peer_mailbox == nullptr || tp.self_staging == nullptr ||
-        tp.peer_staging == nullptr || tp.counters == nullptr || tp.slot_bytes == 0 ||
+        tp.peer_staging == nullptr || tp.self_packed == nullptr || tp.peer_packed == nullptr ||
+        tp.counters == nullptr || tp.slot_bytes == 0 ||
         tp.max_blocks <= 0 || tp.max_blocks > kTensorParallelMaxBlocks ||
         (tp.rank != 0 && tp.rank != 1)) {
         throw std::invalid_argument(std::string(op) + ": invalid tensor-parallel link view");

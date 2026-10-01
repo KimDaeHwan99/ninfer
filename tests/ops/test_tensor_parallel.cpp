@@ -208,6 +208,83 @@ int graph_case(TensorParallelLink& link, std::array<RankBuffers, 2>& ranks,
     return 0;
 }
 
+// Interleaves packed (small) and staged (large) all-reduces with gathers, without host
+// synchronization, while rank 1 lags behind rank 0: slot reuse across different payload sizes
+// must never expose a payload the peer has not finished reading.
+int mixed_chain_case(TensorParallelLink& link, const std::array<int, 2>& devices) {
+    constexpr int kSteps = 24;
+    const std::array<std::int32_t, 3> columns{1, 64, 4};
+    std::array<std::array<std::vector<std::vector<float>>, 3>, 2> partials;
+    std::array<std::vector<float>, 3> residual0;
+    for (int s = 0; s < 3; ++s) {
+        const std::size_t count = std::size_t(5120) * columns[s];
+        residual0[s].resize(count);
+        fill_uniform(residual0[s], 300 + s, -1.0f, 1.0f);
+        round_to_bf16(residual0[s]);
+        for (int r = 0; r < 2; ++r) {
+            partials[r][s].resize(kSteps);
+            for (int k = 0; k < kSteps; ++k) {
+                partials[r][s][k].resize(count);
+                fill_uniform(partials[r][s][k], 400 + 31 * k + 7 * s + 1000 * r, -0.5f, 0.5f);
+                round_to_bf16(partials[r][s][k]);
+            }
+        }
+    }
+    std::array<std::array<std::vector<std::uint16_t>, 3>, 2> results;
+    on_ranks(devices, [&](int r) {
+        cudaStream_t stream = nullptr;
+        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+        std::array<void*, 3> residual{};
+        std::vector<std::array<void*, 3>> staged(kSteps);
+        for (int s = 0; s < 3; ++s) {
+            const std::size_t bytes = std::size_t(5120) * columns[s] * 2;
+            check(cudaMalloc(&residual[s], bytes), "residual");
+            const auto bits = bf16_bits(residual0[s]);
+            check(cudaMemcpy(residual[s], bits.data(), bytes, cudaMemcpyHostToDevice), "upload");
+            for (int k = 0; k < kSteps; ++k) {
+                check(cudaMalloc(&staged[k][s], bytes), "partial");
+                const auto pbits = bf16_bits(partials[r][s][k]);
+                check(cudaMemcpy(staged[k][s], pbits.data(), bytes, cudaMemcpyHostToDevice),
+                      "upload partial");
+            }
+        }
+        check(cudaDeviceSynchronize(), "uploads");
+        if (r == 1) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); }
+        const auto view = link.view(r);
+        for (int k = 0; k < kSteps; ++k) {
+            const int s = (k * 7 + k / 3) % 3;
+            Tensor p(staged[k][s], DType::BF16, {5120, columns[s]});
+            Tensor x(residual[s], DType::BF16, {5120, columns[s]});
+            ops::tp_residual_allreduce(p, x, view, stream);
+        }
+        check(cudaStreamSynchronize(stream), "chain");
+        for (int s = 0; s < 3; ++s) {
+            results[r][s].resize(std::size_t(5120) * columns[s]);
+            check(cudaMemcpy(results[r][s].data(), residual[s], results[r][s].size() * 2,
+                             cudaMemcpyDeviceToHost),
+                  "download");
+            check(cudaFree(residual[s]), "free");
+            for (int k = 0; k < kSteps; ++k) check(cudaFree(staged[k][s]), "free");
+        }
+        check(cudaStreamDestroy(stream), "stream");
+    });
+    int failures = 0;
+    for (int s = 0; s < 3; ++s) {
+        std::vector<float> stored = residual0[s];
+        for (int k = 0; k < kSteps; ++k) {
+            if ((k * 7 + k / 3) % 3 != s) continue;
+            for (std::size_t i = 0; i < stored.size(); ++i) {
+                const float value = (stored[i] + partials[0][s][k][i]) + partials[1][s][k][i];
+                stored[i]         = bf16_to_f32(f32_to_bf16(value));
+            }
+        }
+        const auto expected = bf16_bits(stored);
+        failures += verify_exact("mixed chain rank0", results[0][s], expected);
+        failures += verify_exact("mixed chain rank1", results[1][s], expected);
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -237,6 +314,7 @@ int main() {
     failures += gather_case(link, ranks, devices, 124160, 4, 22);
     failures += gather_case(link, ranks, devices, 65536, 48, 23);
     failures += graph_case(link, ranks, devices);
+    failures += mixed_chain_case(link, devices);
     failures += residual_case(link, ranks, devices, 5120, 3, 9, 16);
     on_ranks(devices, [&](int r) {
         auto& b = ranks[r];

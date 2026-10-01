@@ -69,12 +69,14 @@ TensorParallelLink::TensorParallelLink(std::array<int, kTensorParallelRanks> dev
 
     const std::size_t mailboxes = align_up(sizeof(TensorParallelMailbox) * kTensorParallelRanks,
                                            kStagingAlignment);
-    host_bytes_ = mailboxes + slot_bytes_ * kTensorParallelSlots * kTensorParallelRanks;
+    host_bytes_ = mailboxes + slot_bytes_ * kTensorParallelSlots * kTensorParallelRanks +
+                  kTensorParallelPackedSlotBytes * kTensorParallelSlots * kTensorParallelRanks;
     {
         DeviceScope scope(devices_[0]);
         CUDA_CHECK(cudaHostAlloc(&host_, host_bytes_, cudaHostAllocPortable | cudaHostAllocMapped));
     }
-    std::memset(host_, 0, mailboxes);
+    // Packed lines must start with a tag no sequence uses.
+    std::memset(host_, 0, host_bytes_);
     for (std::size_t rank = 0; rank < kTensorParallelRanks; ++rank) {
         DeviceScope scope(devices_[rank]);
         void* counters = nullptr;
@@ -112,11 +114,17 @@ TensorParallelDeviceView TensorParallelLink::view(int rank) const {
     const auto ring      = [&](int r) {
         return base + mb + static_cast<std::size_t>(r) * slot_bytes_ * kTensorParallelSlots;
     };
+    const auto packed = [&](int r) {
+        return base + mb + slot_bytes_ * kTensorParallelSlots * kTensorParallelRanks +
+               static_cast<std::size_t>(r) * kTensorParallelPackedSlotBytes * kTensorParallelSlots;
+    };
     const int peer = 1 - rank;
     return TensorParallelDeviceView{.self_mailbox = mailboxes + rank,
                                     .peer_mailbox = mailboxes + peer,
                                     .self_staging = ring(rank),
                                     .peer_staging = ring(peer),
+                                    .self_packed  = packed(rank),
+                                    .peer_packed  = packed(peer),
                                     .slot_bytes   = slot_bytes_,
                                     .counters     = counters_[static_cast<std::size_t>(rank)],
                                     .timeout_ns   = timeout_ns_,

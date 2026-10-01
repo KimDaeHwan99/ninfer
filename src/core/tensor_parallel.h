@@ -15,9 +15,8 @@
 // by the collective kernels themselves. Eager execution and CUDA Graph replays therefore share one
 // numbering, and a captured graph replays correctly without host-side patching.
 //
-// Ownership: rank r writes only its own mailbox and staging ring; it reads the peer's. A slot is
-// reused only after the peer has acknowledged consuming that slot's previous payload, so
-// back-to-back collectives need no host synchronization.
+// Ownership: rank r writes only its own mailbox and staging rings; it reads the peer's. Small
+// payloads use a separate packed-line ring whose lines carry their own sequence tag.
 
 #include <cuda_runtime.h>
 
@@ -28,15 +27,16 @@
 namespace ninfer {
 
 inline constexpr int kTensorParallelRanks = 2;
-// Upper bound on the CTAs of one collective. Collective CTAs wait on their peer counterpart, so a
-// launch never exceeds the device's resident capacity (see TensorParallelLink::blocks()).
+// CTAs of every collective (capped by the device's SM count). Collective CTAs wait on their peer
+// counterpart, so all of them must be resident at once.
 inline constexpr int kTensorParallelMaxBlocks = 32;
 inline constexpr int kTensorParallelSlots     = 2;
+// Bytes of one packed-line slot: 8-byte lines carrying 4 payload bytes and a sequence tag.
+inline constexpr std::size_t kTensorParallelPackedSlotBytes = 256 * 1024;
 
 // Host-mapped, written only by its owning rank.
 struct TensorParallelMailbox {
     std::uint64_t published[kTensorParallelMaxBlocks];
-    std::uint64_t consumed[kTensorParallelMaxBlocks];
 };
 
 // Plain view passed by value to collective kernels. All pointers are valid on the rank's device:
@@ -47,6 +47,8 @@ struct TensorParallelDeviceView {
     const TensorParallelMailbox* peer_mailbox = nullptr;
     std::byte* self_staging                   = nullptr;
     const std::byte* peer_staging             = nullptr;
+    std::byte* self_packed                    = nullptr;
+    const std::byte* peer_packed              = nullptr;
     std::uint64_t slot_bytes                  = 0;
     std::uint64_t* counters                   = nullptr;
     std::uint64_t timeout_ns                  = 0;
