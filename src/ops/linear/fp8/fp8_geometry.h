@@ -29,6 +29,9 @@ using Fp8N5120K17408             = Fp8Geometry<5120, 17408>;
 using Fp8Activation5120Geometry  = Fp8ActivationGeometry<5120>;
 using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
 using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
+// Tensor-parallel rank shards' row-parallel contraction widths.
+using Fp8Activation3072Geometry  = Fp8ActivationGeometry<3072>;
+using Fp8Activation8704Geometry  = Fp8ActivationGeometry<8704>;
 
 enum class Fp8GeometryId : std::uint8_t {
     N14336K5120,

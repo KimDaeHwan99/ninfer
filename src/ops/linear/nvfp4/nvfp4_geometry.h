@@ -35,6 +35,8 @@ using Nvfp4N5120K17408 = Nvfp4Geometry<5120, 17408>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+// A tensor-parallel rank shard's MLP down contraction width.
+using Nvfp4Activation8704Geometry  = Nvfp4ActivationGeometry<8704>;
 
 enum class Nvfp4GeometryId : std::uint8_t {
     N14336K5120,
