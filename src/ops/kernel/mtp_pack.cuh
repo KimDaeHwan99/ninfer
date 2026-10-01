@@ -6,9 +6,6 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kMtpAttnRows = 14336;
-inline constexpr int kMtpQRows    = 6144;
-inline constexpr int kMtpKvRows   = 1024;
 
 __global__ void mtp_pack_fc_input_kernel(const __nv_bfloat16* embedding_norm,
                                          const __nv_bfloat16* hidden_norm, __nv_bfloat16* out,
@@ -23,9 +20,13 @@ __global__ void mtp_pack_fc_input_kernel(const __nv_bfloat16* embedding_norm,
     out[out_base + rows + row]  = hidden_norm[in_idx];
 }
 
+// Q | K | G | V row profile: the full 27B MTP layer (6144/1024) or one tensor-parallel rank's
+// half of its heads (3072/512).
+template <int kMtpQRows, int kMtpKvRows>
 __global__ void mtp_split_attn_in_kernel(const __nv_bfloat16* attn_in, __nv_bfloat16* q,
                                          __nv_bfloat16* k, __nv_bfloat16* gate, __nv_bfloat16* v,
                                          std::int32_t tokens) {
+    constexpr int kMtpAttnRows = 2 * (kMtpQRows + kMtpKvRows);
     const std::int64_t idx = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t n   = static_cast<std::int64_t>(kMtpAttnRows) * tokens;
     if (idx >= n) { return; }

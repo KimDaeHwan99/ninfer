@@ -33,7 +33,9 @@ void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tenso
     const std::int64_t n = static_cast<std::int64_t>(attn_in.ne[0]) * attn_in.ne[1];
     const int grid =
         static_cast<int>(std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock))));
-    mtp_split_attn_in_kernel<<<grid, kBlock, 0, stream>>>(
+    const auto kernel = attn_in.ne[0] == 7168 ? mtp_split_attn_in_kernel<3072, 512>
+                                              : mtp_split_attn_in_kernel<6144, 1024>;
+    kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(attn_in.data), static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data), static_cast<__nv_bfloat16*>(gate.data),
         static_cast<__nv_bfloat16*>(v.data), attn_in.ne[1]);

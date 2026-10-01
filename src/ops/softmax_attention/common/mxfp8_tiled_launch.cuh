@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/kernel_attributes.h"
 #include "core/device.h"
 #include "ops/softmax_attention/common/mxfp8_tiled_mma.cuh"
 #include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
@@ -18,8 +19,8 @@ void launch_mxfp8_kv_tiled_mma(const CausalAttentionOperands& p, View cache,
         throw std::invalid_argument("MXFP8 tiled attention: invalid batch or partial storage");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
         constexpr auto kernel    = mxfp8_kv_tiled_mma_kernel<G, S, Values, Metadata>;
-        static const auto status = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
+        const cudaError_t status =
+            ::ninfer::set_kernel_max_dynamic_shared_memory<kernel>(S::kSharedBytes);
         CUDA_CHECK(status);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads, partition.capacity);
         kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(

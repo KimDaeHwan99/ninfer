@@ -1,4 +1,5 @@
 #pragma once
+#include "core/kernel_attributes.h"
 #include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/linear/bf16/bf16_schedule.cuh"
@@ -10,8 +11,8 @@ template <int Bytes, auto Kernel>
 int bf16_prepare_shared() {
     static_assert(Bytes <= 99 * 1024);
     if constexpr (Bytes > 48 * 1024) {
-        static const auto status =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
+        const cudaError_t status =
+            ::ninfer::set_kernel_max_dynamic_shared_memory<Kernel>(Bytes);
         CUDA_CHECK(status);
     }
     return Bytes;

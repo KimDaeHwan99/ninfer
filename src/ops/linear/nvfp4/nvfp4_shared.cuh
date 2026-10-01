@@ -1,4 +1,5 @@
 #pragma once
+#include "core/kernel_attributes.h"
 #include "core/device.h"
 
 namespace ninfer::ops::detail {
@@ -18,8 +19,8 @@ template <int Bytes, auto Kernel, bool Dynamic = false>
 int nvfp4_prepare_shared() {
     static_assert(Bytes <= 99 * 1024);
     if constexpr (Bytes > 48 * 1024) {
-        static const cudaError_t status =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
+        const cudaError_t status =
+            ::ninfer::set_kernel_max_dynamic_shared_memory<Kernel>(Bytes);
         CUDA_CHECK(status);
         return Bytes;
     } else {

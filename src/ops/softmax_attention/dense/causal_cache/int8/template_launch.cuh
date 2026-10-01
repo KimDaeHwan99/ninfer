@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/kernel_attributes.h"
 #include "core/device.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tiled_mma.cuh"
@@ -28,8 +29,8 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
         int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries>;
     constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
     if constexpr (S::kDynamicArena) {
-        static const auto status =
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        const cudaError_t status =
+            ::ninfer::set_kernel_max_dynamic_shared_memory<kernel>(bytes);
         CUDA_CHECK(status);
     }
     const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
@@ -49,8 +50,8 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
         throw std::invalid_argument("INT8 tiled attention requires a complete single query row");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
         constexpr auto kernel    = int8_kv_tiled_mma_kernel<G, S, Metadata>;
-        static const auto status = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
+        const cudaError_t status =
+            ::ninfer::set_kernel_max_dynamic_shared_memory<kernel>(S::kSharedBytes);
         CUDA_CHECK(status);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads);
         kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(

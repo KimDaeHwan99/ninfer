@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/kernel_attributes.h"
 #include "core/device.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tiled_mma.cuh"
@@ -29,8 +30,8 @@ template <int Bytes, auto Kernel>
 int bf16_kv_dynamic_shared() {
     static_assert(Bytes <= 99 * 1024);
     if constexpr (Bytes > 48 * 1024) {
-        static const auto status =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
+        const cudaError_t status =
+            ::ninfer::set_kernel_max_dynamic_shared_memory<Kernel>(Bytes);
         CUDA_CHECK(status);
     }
     return Bytes;

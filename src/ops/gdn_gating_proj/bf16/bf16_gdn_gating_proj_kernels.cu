@@ -1,3 +1,4 @@
+#include "core/kernel_attributes.h"
 #include "core/weight.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 
@@ -292,10 +293,8 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                         static_cast<unsigned>(SplitK));
         auto launch = [&](auto full_tokens) {
             constexpr bool FullTokens     = decltype(full_tokens)::value;
-            static const cudaError_t attr = cudaFuncSetAttribute(
-                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
-                                                     NormalizeInput, NormTokenCapacity>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+            const cudaError_t attr =
+            ::ninfer::set_kernel_max_dynamic_shared_memory<bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps, NormalizeInput, NormTokenCapacity>>(kSmemBytes);
             CUDA_CHECK(attr);
             if constexpr (SplitK > 1) {
                 cudaLaunchConfig_t config{};
