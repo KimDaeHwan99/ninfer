@@ -16,6 +16,15 @@ namespace ninfer::ops::detail {
                                                                        std::int32_t min_tokens,
                                                                        std::int32_t max_tokens);
 
+// A tensor-parallel rank's [17408,5120] gate/up shard: the TMA fused route only.
+inline constexpr std::int32_t kNvfp4SwiGluShardRows      = 17408;
+inline constexpr std::int32_t kNvfp4SwiGluShardMinTokens = 129;
+[[nodiscard]] std::size_t nvfp4_linear_swiglu_shard_workspace_capacity_bytes(
+    LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
+void nvfp4_linear_swiglu_shard_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
+                                        LinearPolicy policy, WorkspaceArena& workspace,
+                                        cudaStream_t stream);
+
 void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream);
 void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,

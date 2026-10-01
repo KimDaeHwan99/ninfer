@@ -57,6 +57,16 @@ void dense_ffn_product(const Tensor& hidden, const DenseParameters& p, Tensor& d
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
     const auto& gu     = p.gate_up.weight;
+    if (ops::linear_swiglu_admits(gu.qtype, gu.n, gu.k, p.gate_up.policy, columns)) {
+        // A rank shard at prefill width: the fused route never stores the gate/up product.
+        Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
+        {
+            auto call = workspace.scope();
+            ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
+        }
+        ops::linear(activation, p.down.weight, delta, p.down.policy, workspace, stream);
+        return;
+    }
     Tensor gate_up     = workspace.alloc(DType::BF16, {gu.n, columns});
     {
         auto call = workspace.scope();

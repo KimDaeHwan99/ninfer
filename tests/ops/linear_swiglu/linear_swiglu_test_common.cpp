@@ -226,8 +226,9 @@ void validate_profile(const Profile& profile) {
                               profile.output_rows == 6144;
     const bool q8_dflash2 = profile.qtype == QType::Q8_G32_FP16 && profile.gate_up_rows == 34816 &&
                             profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&
-                       profile.input_rows == 5120 && profile.output_rows == 17408;
+    const bool nvfp4 = profile.qtype == QType::NVFP4 &&
+                       (profile.gate_up_rows == 34816 || profile.gate_up_rows == 17408) &&
+                       profile.input_rows == 5120 && 2 * profile.output_rows == profile.gate_up_rows;
     const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && profile.gate_up_rows == 34816 &&
                      profile.input_rows == 5120 && profile.output_rows == 17408;
     if ((!q4 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
@@ -301,8 +302,14 @@ int run_profile(std::string_view label, const Profile& profile,
             ? ops::LinearPolicy::AllowA4
             : (profile.activation_compute == ActivationCompute::A8 ? ops::LinearPolicy::AllowA8
                                                                    : ops::LinearPolicy::A16Only);
+    // A profile registered only from some width (a rank shard) is sized from its first case.
+    const std::int32_t minimum_tokens =
+        ops::linear_swiglu_admits(profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1)
+            ? 1
+            : token_cases.front();
     const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
-        profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
+        profile.qtype, profile.gate_up_rows, profile.input_rows, policy, minimum_tokens,
+        maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     int failures        = 0;

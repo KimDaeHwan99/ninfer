@@ -52,6 +52,11 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    if (qtype == QType::NVFP4 && gate_up_rows == detail::kNvfp4SwiGluShardRows &&
+        input_rows == 5120) {
+        return detail::nvfp4_linear_swiglu_shard_workspace_capacity_bytes(policy, min_tokens,
+                                                                          max_tokens);
+    }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
@@ -65,6 +70,27 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
                                                   LinearPolicy::A16Only, min_tokens, max_tokens);
 }
 
+bool linear_swiglu_admits(QType qtype, std::int32_t gate_up_rows, std::int32_t input_rows,
+                          LinearPolicy policy, std::int32_t tokens) noexcept {
+    if (tokens <= 0 || !valid_linear_policy(policy)) { return false; }
+    if (qtype == QType::NVFP4 && gate_up_rows == detail::kNvfp4SwiGluShardRows &&
+        input_rows == 5120) {
+        return policy == LinearPolicy::AllowA4 && tokens >= detail::kNvfp4SwiGluShardMinTokens;
+    }
+    const bool large = gate_up_rows == 34816 && input_rows == 5120;
+    switch (qtype) {
+    case QType::NVFP4:
+        return large && (policy == LinearPolicy::AllowA4 || tokens <= 16);
+    case QType::FP8_E4M3FN_ROW_BF16:
+    case QType::Q4_G64_FP16:
+        return large;
+    case QType::Q8_G32_FP16:
+        return large || (gate_up_rows == 12288 && input_rows == 2048);
+    default:
+        return false;
+    }
+}
+
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream) {
     validate_policy(policy);
@@ -72,6 +98,22 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }
     const std::int32_t t   = x.ne[1];
+    const bool nvfp4_shard = x.ne[0] == 5120 && out.ne[0] == detail::kNvfp4SwiGluShardRows / 2 &&
+                             gate_up_weight.qtype == QType::NVFP4 &&
+                             gate_up_weight.n == detail::kNvfp4SwiGluShardRows &&
+                             gate_up_weight.k == 5120 &&
+                             gate_up_weight.padded_shape[0] == detail::kNvfp4SwiGluShardRows &&
+                             gate_up_weight.padded_shape[1] == 5120;
+    if (nvfp4_shard) {
+        if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
+            out.ne[3] != 1 || !x.is_contiguous() || !out.is_contiguous() ||
+            !aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
+            throw std::invalid_argument("linear_swiglu: invalid tensor shape");
+        }
+        (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
+        detail::nvfp4_linear_swiglu_shard_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        return;
+    }
     const bool large_shape = x.ne[0] == 5120 && out.ne[0] == 17408 && gate_up_weight.n == 34816 &&
                              gate_up_weight.k == 5120 && gate_up_weight.padded_shape[0] == 34816 &&
                              gate_up_weight.padded_shape[1] == 5120;

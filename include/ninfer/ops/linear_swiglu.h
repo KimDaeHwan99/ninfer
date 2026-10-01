@@ -26,6 +26,15 @@ namespace ninfer::ops {
                                                                  std::int32_t max_tokens);
 
 /**
+ * True when LinearSwiGLU accepts this weight profile, policy and width. Every listed full-layer
+ * profile admits all positive widths; a tensor-parallel rank's NVFP4 gate/up shard
+ * ([17408,5120], 8704 outputs) is registered only for AllowA4 above 128 tokens.
+ */
+[[nodiscard]] bool linear_swiglu_admits(QType qtype, std::int32_t gate_up_rows,
+                                        std::int32_t input_rows, LinearPolicy policy,
+                                        std::int32_t tokens) noexcept;
+
+/**
  * Policy-bearing capacity query. Q4/Q8 use A16 under every policy. NVFP4 uses A16 under
  * A16Only/AllowA8 through T=16; AllowA4 accepts every positive T. Row-scaled FP8 accepts all
  * policies, with A8 permitted by AllowA8/AllowA4.

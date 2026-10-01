@@ -66,6 +66,34 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     return fused_workspace_bytes(max_tokens);
 }
 
+std::size_t nvfp4_linear_swiglu_shard_workspace_capacity_bytes(LinearPolicy policy,
+                                                               std::int32_t min_tokens,
+                                                               std::int32_t max_tokens) {
+    if (policy != LinearPolicy::AllowA4 || min_tokens < kNvfp4SwiGluShardMinTokens ||
+        max_tokens < min_tokens) {
+        throw std::invalid_argument(
+            "nvfp4 linear_swiglu shard: registered only for AllowA4 above 128 tokens");
+    }
+    return fused_workspace_bytes(max_tokens);
+}
+
+void nvfp4_linear_swiglu_shard_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
+                                        LinearPolicy policy, WorkspaceArena& workspace,
+                                        cudaStream_t stream) {
+    if (policy != LinearPolicy::AllowA4 || x.ne[1] < kNvfp4SwiGluShardMinTokens) {
+        throw std::invalid_argument(
+            "nvfp4 linear_swiglu shard: registered only for AllowA4 above 128 tokens");
+    }
+    // The fused TMA kernel takes its row count from the weight; the pairing rows/2 splits the
+    // shard's own gate and up halves.
+    auto scope                     = workspace.scope();
+    const Nvfp4A4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
+    launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled256, stream);
+    launch_nvfp4_linear_swiglu_a4_tma(
+        nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled256),
+        static_cast<__nv_bfloat16*>(out.data), stream);
+}
+
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
