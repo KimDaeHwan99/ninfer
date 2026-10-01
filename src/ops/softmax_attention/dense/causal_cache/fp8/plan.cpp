@@ -1,6 +1,7 @@
 #include "ops/softmax_attention/dense/causal_cache/fp8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/fp8/operands.h"
 #include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/fp8/instances.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -21,8 +22,12 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
                                   : width <= kGroupedPrefillMaxWidth ? Fp8KvFamily::ParallelGrouped
                                                                      : Fp8KvFamily::Tiled;
     if (family == Fp8KvFamily::Tiled)
-        return {family, heads,    width,
-                batch,  envelope, mxfp8_tiled_partition(heads, width, envelope.max_visible_keys)};
+        return {family,
+                heads,
+                width,
+                batch,
+                envelope,
+                mxfp8_tiled_partition(heads, width, envelope.max_visible_keys, kFp8TiledQueryRows)};
     const int tiles =
         family == Fp8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
@@ -52,7 +57,7 @@ std::size_t fp8_kv_workspace_bytes(int heads, int batch, int min_width, int max_
     }
     return std::max(maximum, mxfp8_tiled_workspace_bytes(
                                  heads, std::max(min_width, kGroupedPrefillMaxWidth + 1), max_width,
-                                 envelope.max_visible_keys));
+                                 envelope.max_visible_keys, kFp8TiledQueryRows));
 }
 
 } // namespace ninfer::ops::detail

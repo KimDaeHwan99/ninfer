@@ -16,6 +16,8 @@ struct Fp8KvGroupedInstance {
     using Merge                    = Fp8KvMergeSchedule<G::QHeads == 24 ? 256 : 64>;
 };
 
-using Fp8KvTiledInstance = Fp8KvTiledMmaSchedule<kMxfp8TiledQueryRows, 64>;
+// RTX 5060 Ti: 64x32 tiles fit two CTAs per SM (T=2048 at 16K keys 7.01 -> 6.43 ms).
+inline constexpr int kFp8TiledQueryRows = 64;
+using Fp8KvTiledInstance                = Fp8KvTiledMmaSchedule<kFp8TiledQueryRows, 32>;
 
 } // namespace ninfer::ops::detail

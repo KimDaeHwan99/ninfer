@@ -12,9 +12,9 @@ inline constexpr int kMxfp8TiledMaxSplits = 8;
 // Minimize waves per KV partition, retaining fewer partitions on a tie.
 // The bound limits FP32 partial traffic; live rows cap the count at
 // ceil(visible_keys / 512). Count changes work and storage, never kernel topology.
-inline CausalKvPartition mxfp8_tiled_partition(int heads, int width, int visible_capacity) {
-    const std::int64_t tiles =
-        (static_cast<std::int64_t>(width) + kMxfp8TiledQueryRows - 1) / kMxfp8TiledQueryRows;
+inline CausalKvPartition mxfp8_tiled_partition(int heads, int width, int visible_capacity,
+                                               int query_rows = kMxfp8TiledQueryRows) {
+    const std::int64_t tiles = (static_cast<std::int64_t>(width) + query_rows - 1) / query_rows;
     const std::int64_t ctas = heads * tiles;
     const int sms           = causal_attention_sm_count();
     int selected            = 1;
@@ -32,16 +32,16 @@ inline CausalKvPartition mxfp8_tiled_partition(int heads, int width, int visible
 }
 
 inline std::size_t mxfp8_tiled_workspace_bytes(int heads, int min_width, int max_width,
-                                               int visible_capacity) {
+                                               int visible_capacity,
+                                               int query_rows = kMxfp8TiledQueryRows) {
     std::size_t maximum = 0;
     // A query-tile interval has one split target and increasing partial storage.
     // Check each interval's last width; checking max_width alone would miss a
     // larger allocation immediately before the split target decreases.
     for (std::int64_t begin = std::max(min_width, 17); begin <= max_width;) {
-        const auto last =
-            ((begin + kMxfp8TiledQueryRows - 1) / kMxfp8TiledQueryRows) * kMxfp8TiledQueryRows;
+        const auto last      = ((begin + query_rows - 1) / query_rows) * query_rows;
         const int end        = static_cast<int>(std::min<std::int64_t>(max_width, last));
-        const auto partition = mxfp8_tiled_partition(heads, end, visible_capacity);
+        const auto partition = mxfp8_tiled_partition(heads, end, visible_capacity, query_rows);
         WorkspaceLayoutBuilder layout;
         (void)allocate_causal_partials(layout, heads, end, partition.capacity, 1);
         maximum = std::max(maximum, layout.peak_bytes(1));
