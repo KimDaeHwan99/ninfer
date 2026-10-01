@@ -10,12 +10,6 @@ using Gemv =
 using C2      = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::TokenPacked,
                                      Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                                      Nvfp4SimtBlockOrder::RowsContiguous, 1>;
-using C4      = Nvfp4A16SimtSchedule<4, 1, 2, 16, 4, 1, Nvfp4SimtActivationAccess::TokenPacked,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;
-using C5      = Nvfp4A16SimtSchedule<4, 1, 2, 16, 5, 1, Nvfp4SimtActivationAccess::TokenPacked,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
 using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using T64R128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
@@ -25,9 +19,7 @@ using T128R128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
     if (tokens <= 2) return nvfp4_linear_a16_simt<Geometry, 2, C2, true>;
-    if (tokens <= 4) return nvfp4_linear_a16_simt<Geometry, 4, C4, false>;
-    if (tokens == 5) return nvfp4_linear_a16_simt<Geometry, 5, C5, true>;
-    if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 4, 2>>;
+    if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 4, 2>>;
     if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 2>>;
     if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1>>;
