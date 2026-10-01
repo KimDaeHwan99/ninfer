@@ -12,6 +12,7 @@ add_library(ninfer_core STATIC
   tensor.cpp
   weight_view.cpp
   decode_graph.cpp
+  tensor_parallel.cpp
 )
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
