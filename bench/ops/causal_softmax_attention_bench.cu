@@ -39,7 +39,7 @@ constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 
 enum class Entry : std::uint8_t { Append, Cached, Both };
-enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, All };
+enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, H12Kv2, All };
 enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -54,6 +54,8 @@ struct Geometry {
 
 constexpr Geometry kH24Kv4{"d256-h24-kv4", 24, 4};
 constexpr Geometry kH16Kv2{"d256-h16-kv2", 16, 2};
+// One tensor-parallel rank of the 27B attention layer.
+constexpr Geometry kH12Kv2{"d256-h12-kv2", 12, 2};
 
 struct Options {
     Entry entry             = Entry::Both;
@@ -109,7 +111,7 @@ struct Result {
                  "error: %s\n"
                  "usage: ninfer_causal_softmax_attention_bench "
                  "[--entry append|cached|both] "
-                 "[--geometry d256-h24-kv4|d256-h16-kv2|all] "
+                 "[--geometry d256-h24-kv4|d256-h16-kv2|d256-h12-kv2|all] "
                  "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all] [--batch B,...] [--tokens W,...] "
                  "[--context L,...] [--row-contexts L0,...] [--valid-columns V0,...] "
                  "[--table-rows R0,...] "
@@ -174,10 +176,12 @@ Options parse_options(int argc, char** argv) {
                 options.geometry = GeometryChoice::H24Kv4;
             else if (value == "d256-h16-kv2")
                 options.geometry = GeometryChoice::H16Kv2;
+            else if (value == "d256-h12-kv2")
+                options.geometry = GeometryChoice::H12Kv2;
             else if (value == "all")
                 options.geometry = GeometryChoice::All;
             else
-                usage("--geometry expects d256-h24-kv4, d256-h16-kv2, or all");
+                usage("--geometry expects d256-h24-kv4, d256-h16-kv2, d256-h12-kv2, or all");
         } else if (argument == "--kv-dtype") {
             const std::string_view value(next("--kv-dtype requires a value"));
             if (value == "bf16")
@@ -799,6 +803,7 @@ void profile(Case& data, Entry entry, const Geometry& geometry, KvCacheStorage s
 std::vector<Geometry> selected_geometries(GeometryChoice choice) {
     if (choice == GeometryChoice::H24Kv4) { return {kH24Kv4}; }
     if (choice == GeometryChoice::H16Kv2) { return {kH16Kv2}; }
+    if (choice == GeometryChoice::H12Kv2) { return {kH12Kv2}; }
     return {kH24Kv4, kH16Kv2};
 }
 

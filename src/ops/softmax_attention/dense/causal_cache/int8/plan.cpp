@@ -22,7 +22,7 @@ Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
     const int tiles =
         family == Int8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
-    constexpr int sms           = kCausalAttentionSmCount;
+    const int sms           = causal_attention_sm_count();
     const int wave_ctas         = (sms / independent_tiles) * independent_tiles;
     const int budget = heads != 16 || width <= 4 || wave_ctas < sms * 9 / 10 ? 2 * sms : sms;
     CausalKvPartition partition{

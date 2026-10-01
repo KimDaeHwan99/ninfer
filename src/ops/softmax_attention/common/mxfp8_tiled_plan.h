@@ -16,10 +16,11 @@ inline CausalKvPartition mxfp8_tiled_partition(int heads, int width, int visible
     const std::int64_t tiles =
         (static_cast<std::int64_t>(width) + kMxfp8TiledQueryRows - 1) / kMxfp8TiledQueryRows;
     const std::int64_t ctas = heads * tiles;
+    const int sms           = causal_attention_sm_count();
     int selected            = 1;
-    auto waves              = (ctas + kCausalAttentionSmCount - 1) / kCausalAttentionSmCount;
+    auto waves              = (ctas + sms - 1) / sms;
     for (int splits = 2; splits <= kMxfp8TiledMaxSplits; ++splits) {
-        const auto next = (ctas * splits + kCausalAttentionSmCount - 1) / kCausalAttentionSmCount;
+        const auto next = (ctas * splits + sms - 1) / sms;
         if (next * selected < waves * splits) {
             selected = splits;
             waves    = next;

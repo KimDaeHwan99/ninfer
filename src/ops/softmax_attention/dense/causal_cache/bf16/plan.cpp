@@ -36,12 +36,12 @@ Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
     const bool many_memory_tiles    = description.query_rows == 32 && independent_tiles >= 16;
     const bool multiple_query_tiles = tiles > 1;
     // Small-query partitions may use up to six waves; wider prefill targets two.
+    const int sms       = causal_attention_sm_count();
     const int long_ctas = width <= 128 / group && (many_memory_tiles || multiple_query_tiles)
-                              ? std::clamp(85 * independent_tiles, (2 * kCausalAttentionSmCount),
-                                           (6 * kCausalAttentionSmCount))
-                              : (2 * kCausalAttentionSmCount);
+                              ? std::clamp(sms / 2 * independent_tiles, 2 * sms, 6 * sms)
+                              : 2 * sms;
     Bf16KvPartition partition{
-        1, std::clamp((2 * kCausalAttentionSmCount) / independent_tiles, 1, 256),
+        1, std::clamp((2 * sms) / independent_tiles, 1, 256),
         std::clamp(long_ctas / independent_tiles, 1, 256), description.key_rows};
     // The envelope bounds the largest live row. Other batch rows may be shorter.
     const int low      = batch == 1 ? static_cast<int>(envelope.min_visible_keys) : 1;

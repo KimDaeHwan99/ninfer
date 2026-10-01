@@ -27,8 +27,8 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
         family == Fp8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
     // Decode permits two resident CTAs per SM. Spec uses one; add a wave when
-    // rounding to complete query tiles would leave over 10% of the 170 SMs idle.
-    constexpr int sms   = kCausalAttentionSmCount;
+    // rounding to complete query tiles would leave over 10% of the SMs idle.
+    const int sms       = causal_attention_sm_count();
     const int wave_ctas = (sms / independent_tiles) * independent_tiles;
     const int budget    = width == 1 || wave_ctas < sms * 9 / 10 ? 2 * sms : sms;
     CausalKvPartition partition{
