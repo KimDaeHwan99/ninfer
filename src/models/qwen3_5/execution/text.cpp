@@ -922,8 +922,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    row_parallel_output(a.view({dimension(config_.attention->query_width()), T}), p.output, x, tp_,
-                        work_, s);
+    mixer_output(a.view({dimension(config_.attention->query_width()), T}), p.output, x);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -1058,8 +1057,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
 
-    row_parallel_output(on.view({dimension(config_.gdn->value_width()), T}), p.output, x, tp_,
-                        work_, s);
+    mixer_output(on.view({dimension(config_.gdn->value_width()), T}), p.output, x);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1068,11 +1066,46 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
                                                  : ops::SparseMoeHints{};
 }
 
+void TextContext::mixer_output(const Tensor& input, const LinearParameters& output, Tensor& x) {
+    auto slices = tensor_parallel_slices(tp_, x.ne[1], ctx_.stream);
+    if (slices.count == 0) {
+        row_parallel_output(input, output, x, tp_, work_, ctx_.stream);
+        return;
+    }
+    row_parallel_output_sliced(input, output, x, *tp_, 0, slices, work_, ctx_.stream);
+    pending_mixer_ = slices;
+}
+
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
                            const ops::SparseMoeHints& hints) {
-    Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
-    ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
-    ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, tp_);
+    cudaStream_t s  = ctx_.stream;
+    const auto mixer = std::exchange(pending_mixer_, TensorParallelSlices{});
+    const auto* dense = std::get_if<DenseParameters>(&weights.ffn);
+    auto slices       = dense != nullptr ? tensor_parallel_slices(tp_, x.ne[1], s)
+                                         : TensorParallelSlices{};
+    Tensor h          = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
+    if (slices.count == 0 || (mixer.count != 0 && mixer.width != slices.width)) {
+        for (int i = 0; i < mixer.count; ++i) ops::tp_wait(*tp_, mixer.tickets[i], s);
+        ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, s);
+        ffn(h, weights.ffn, x, hints, work_, s, false, tp_);
+        return;
+    }
+    // Token columns are independent through the norm and FFN: slice i waits only for its own
+    // mixer all-reduce, and its FFN all-reduce overlaps the next slice's FFN.
+    const auto total = static_cast<std::int32_t>(x.ne[1]);
+    Tensor products  = tensor_parallel_partial(*tp_, 1, x.ne[0], total);
+    for (int i = 0; i < slices.count; ++i) {
+        const auto first   = slices.first(i);
+        const auto columns = slices.columns(i, total);
+        if (mixer.count != 0) { ops::tp_wait(*tp_, mixer.tickets[i], s); }
+        Tensor xi      = x.slice(1, first, columns);
+        Tensor hi      = h.slice(1, first, columns);
+        Tensor product = products.slice(1, first, columns);
+        ops::rmsnorm(xi, weights.post_attention_norm, config_.rms_norm_eps, true, hi, s);
+        dense_ffn_product(hi, *dense, product, work_, s);
+        slices.tickets[i] = ops::tp_residual_allreduce_async(product, xi, *tp_, s);
+    }
+    for (int i = 0; i < slices.count; ++i) ops::tp_wait(*tp_, slices.tickets[i], s);
 }
 
 template <class Tap>

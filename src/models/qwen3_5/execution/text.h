@@ -15,6 +15,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/execution/tensor_parallel.h"
 
 #include <array>
 #include <cstddef>
@@ -168,6 +169,9 @@ private:
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);
+    // x += output(input) for a mixer. A tensor-parallel prefill leaves the all-reduces of its
+    // column slices in flight for mlp_tail, which waits each slice before reading it.
+    void mixer_output(const Tensor& input, const LinearParameters& output, Tensor& x);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
@@ -253,6 +257,7 @@ private:
     const ops::SamplingConfig* sampling_config_ = nullptr;
     const MtpParameters* mtp_                   = nullptr;
     const TensorParallelDeviceView* tp_         = nullptr;
+    TensorParallelSlices pending_mixer_{};
 };
 
 } // namespace ninfer::models::qwen3_5::execution

@@ -14,4 +14,9 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream,
          bool mtp = false, const TensorParallelDeviceView* tp = nullptr);
 
+// delta = down(silu(gate(hidden)) * up(hidden)) of a dense FFN, composed from Linear calls: the
+// MTP layer and a tensor-parallel rank's partial product. Fits ffn_workspace_bytes(split=true).
+void dense_ffn_product(const Tensor& hidden, const DenseParameters& parameters, Tensor& delta,
+                       WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace ninfer::models::qwen3_5::execution

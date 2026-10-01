@@ -1,5 +1,6 @@
 #include "models/qwen3_5/execution/tensor_parallel.h"
 
+#include "core/device.h" // CUDA_CHECK
 #include "core/layout.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
@@ -41,6 +42,58 @@ void row_parallel_output(const Tensor& input, const LinearParameters& output, Te
         ops::linear(input, output.weight, delta, output.policy, workspace, stream);
     }
     ops::tp_residual_allreduce(delta, residual, *tp, stream);
+}
+
+TensorParallelSlices tensor_parallel_slices(const TensorParallelDeviceView* tp,
+                                            std::int32_t columns, cudaStream_t stream) {
+    // Below 512 columns a slice's payload nears the copy channel's minimum and its GEMMs lose
+    // efficiency; up to four slices leave one slice's all-reduce exposed.
+    constexpr std::int32_t kMinColumns = 512;
+    constexpr std::int32_t kAlign      = 16;
+    TensorParallelSlices slices;
+    if (tp == nullptr || tp->copy == nullptr || columns < kMinColumns) { return slices; }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) { return slices; }
+    const std::int32_t count = std::clamp(columns / kMinColumns, 2, kTensorParallelMaxSlices);
+    slices.width = (columns / count + kAlign - 1) / kAlign * kAlign;
+    slices.count = (columns + slices.width - 1) / slices.width;
+    return slices;
+}
+
+Tensor tensor_parallel_partial(const TensorParallelDeviceView& tp, int index, std::int32_t rows,
+                               std::int32_t columns) {
+    if (tp.copy == nullptr || index < 0 || index >= kTensorParallelCopyPartials) {
+        throw std::invalid_argument("tensor-parallel partial buffer is unavailable");
+    }
+    if (rows <= 0 || columns <= 0 ||
+        static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(columns) *
+                sizeof(std::uint16_t) >
+            tp.copy->slot_bytes) {
+        throw std::invalid_argument("tensor-parallel partial exceeds the link slot");
+    }
+    return Tensor(tp.copy->partials[static_cast<std::size_t>(index)], DType::BF16,
+                  {rows, columns});
+}
+
+void row_parallel_output_sliced(const Tensor& input, const LinearParameters& output,
+                                Tensor& residual, const TensorParallelDeviceView& tp, int partial,
+                                TensorParallelSlices& slices, WorkspaceArena& workspace,
+                                cudaStream_t stream) {
+    const auto total = static_cast<std::int32_t>(residual.ne[1]);
+    Tensor products  = tensor_parallel_partial(tp, partial, residual.ne[0], total);
+    for (int i = 0; i < slices.count; ++i) {
+        const auto first   = slices.first(i);
+        const auto columns = slices.columns(i, total);
+        Tensor product     = products.slice(1, first, columns);
+        {
+            auto call = workspace.scope();
+            ops::linear(input.slice(1, first, columns), output.weight, product, output.policy,
+                        workspace, stream);
+        }
+        Tensor target     = residual.slice(1, first, columns);
+        slices.tickets[i] = ops::tp_residual_allreduce_async(product, target, tp, stream);
+    }
 }
 
 void row_parallel_residual(const Tensor& partial, Tensor& residual,

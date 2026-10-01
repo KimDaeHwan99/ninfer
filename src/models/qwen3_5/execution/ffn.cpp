@@ -26,6 +26,8 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     // A split rank holds a gate/up shard the fused SwiGLU routes do not register; it composes the
     // projection and activation like the MTP layer.
     if (mtp || split) {
+        // Mirrors ffn(): the delta, then dense_ffn_product's gate/up, activation and scratch.
+        (void)layout.alloc(DType::BF16, {down.n, last});
         (void)layout.alloc(DType::BF16, {gu.n, last});
         {
             auto scope = layout.scope();
@@ -33,7 +35,6 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                 gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last));
         }
         (void)layout.alloc(DType::BF16, {gu.n / 2, last});
-        (void)layout.alloc(DType::BF16, {down.n, last});
         (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(down.qtype, down.n, down.k,
                                                                       p.down.policy, first, last));
     } else {
@@ -49,6 +50,22 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         }
     }
     return layout.peak_bytes(1);
+}
+
+void dense_ffn_product(const Tensor& hidden, const DenseParameters& p, Tensor& delta,
+                       WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope         = workspace.scope();
+    const auto columns = hidden.ne[1];
+    const auto& gu     = p.gate_up.weight;
+    Tensor gate_up     = workspace.alloc(DType::BF16, {gu.n, columns});
+    {
+        auto call = workspace.scope();
+        ops::linear(hidden, gu, gate_up, p.gate_up.policy, workspace, stream);
+    }
+    Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
+    ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2), activation,
+                  stream);
+    ops::linear(activation, p.down.weight, delta, p.down.policy, workspace, stream);
 }
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
@@ -69,16 +86,8 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     if (mtp || tp != nullptr) {
-        Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
-        {
-            auto call = workspace.scope();
-            ops::linear(hidden, gu, gate_up, p.gate_up.policy, workspace, stream);
-        }
-        Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
-        ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2),
-                      activation, stream);
         Tensor delta = workspace.alloc(DType::BF16, {down.n, columns});
-        ops::linear(activation, down, delta, p.down.policy, workspace, stream);
+        dense_ffn_product(hidden, p, delta, workspace, stream);
         row_parallel_residual(delta, residual, tp, stream);
         return;
     }
