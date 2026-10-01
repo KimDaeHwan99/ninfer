@@ -1,10 +1,12 @@
 #include "options.h"
+#include "product/device_placement_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -83,7 +85,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N] [--tp 1|2] [--devices N,N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
            "       [--lm-head-draft]\n"
@@ -106,7 +108,8 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
-           "individual fields.\n";
+           "individual fields.\n"
+           "--tp 2 splits the model across two GPUs and requires --devices A,B.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -118,6 +121,9 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    std::optional<int> explicit_device;
+    std::vector<int> rank_devices;
+    std::uint32_t tensor_parallel = 1;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -142,7 +148,11 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
-            options.device = parse_device(value(arg));
+            explicit_device = parse_device(value(arg));
+        } else if (arg == "--tp") {
+            tensor_parallel = product::parse_tensor_parallel(value(arg));
+        } else if (arg == "--devices") {
+            rank_devices = product::parse_device_list(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
@@ -210,6 +220,8 @@ Options parse_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
+    options.devices = product::resolve_rank_devices(tensor_parallel, rank_devices, explicit_device);
+    options.device  = options.devices.front();
 
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();

@@ -236,6 +236,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.chat_template_path       = options_.chat_template_path;
     engine_options.device                   = options_.device;
+    engine_options.tensor_parallel          = static_cast<std::uint32_t>(options_.devices.size());
+    engine_options.devices                  = options_.devices;
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.max_concurrency          = options_.max_concurrency;

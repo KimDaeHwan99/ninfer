@@ -153,6 +153,10 @@ struct EngineOptions {
     std::filesystem::path chat_template_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    // Tensor-parallel width (1 or 2). Each rank runs on `devices[rank]`; at width 1 an empty list
+    // selects `device`. Width 2 splits one resident model across both devices.
+    std::uint32_t tensor_parallel = 1;
+    std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;

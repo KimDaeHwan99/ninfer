@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/device_placement_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -69,7 +70,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2] [--devices N,N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -113,7 +114,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --tp selects the tensor-parallel width (default 1); --tp 2 splits the model "
+           "across two GPUs and requires --devices A,B (one device per rank); --device, when "
+           "also given, must name the first.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -130,6 +134,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         redact_next = options.startup_argv.back() == "--api-key";
     }
     bool default_max_tokens_explicit = false;
+    std::optional<int> explicit_device;
+    std::vector<int> rank_devices;
+    std::uint32_t tensor_parallel = 1;
     bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
@@ -259,7 +266,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
-            options.device = parse_nonnegative_int(require_value("--device"), "device");
+            explicit_device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--tp") {
+            tensor_parallel = product::parse_tensor_parallel(require_value("--tp"));
+        } else if (arg == "--devices") {
+            rank_devices = product::parse_device_list(require_value("--devices"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -327,6 +338,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
+    options.devices = product::resolve_rank_devices(tensor_parallel, rank_devices, explicit_device);
+    options.device  = options.devices.front();
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {
             throw std::invalid_argument(
