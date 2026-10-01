@@ -6,6 +6,7 @@
 #include "models/qwen3_5/measurement.h"
 
 #include <algorithm>
+#include <optional>
 #include <chrono>
 #include <set>
 #include <stdexcept>
@@ -57,6 +58,49 @@ void validate_options(const EngineOptions& options) {
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
+    if (options.tensor_parallel != 1 && options.tensor_parallel != 2) {
+        throw std::invalid_argument("Engine tensor_parallel must be 1 or 2");
+    }
+    if (options.tensor_parallel == 2) {
+        if (options.devices.size() != 2 || options.devices[0] == options.devices[1] ||
+            options.devices[0] != options.device) {
+            throw std::invalid_argument(
+                "Engine tensor_parallel 2 needs two distinct devices led by the primary device");
+        }
+        if (options.purpose != EnginePurpose::Generation) {
+            throw std::invalid_argument("tensor-parallel execution serves Generation only");
+        }
+        if (options.enable_vision) {
+            throw std::invalid_argument("tensor-parallel execution does not split Vision");
+        }
+        if (options.speculative.backend != SpeculativeBackend::None &&
+            options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument("tensor-parallel execution supports MTP speculation only");
+        }
+    } else if (!options.devices.empty() &&
+               (options.devices.size() != 1 || options.devices[0] != options.device)) {
+        throw std::invalid_argument("Engine devices must name the primary device at width 1");
+    }
+}
+
+// Per-rank planning options of a split. Each rank's Host KV pages are half the bytes, so half the
+// Host budget per rank keeps the token capacity and the total pinned bytes of the unsplit model.
+EngineOptions rank_options(const EngineOptions& options) {
+    EngineOptions out = options;
+    out.context_cache.host_kv_capacity_bytes /= options.tensor_parallel;
+    return out;
+}
+
+// One collective stages at most a prefill chunk of hidden states or a speculative round of
+// vocabulary-half logits.
+std::size_t tensor_parallel_slot_bytes(const EngineOptions& options,
+                                       const models::qwen3_5::Config& config) {
+    const std::size_t hidden  = config.text.hidden_size;
+    const std::size_t columns = std::size_t{options.max_concurrency} *
+                                (std::size_t{options.speculative.draft_tokens} + 1U);
+    return std::max(std::size_t{options.prefill_chunk} * hidden,
+                    std::size_t{config.output_head_rows()} * std::max<std::size_t>(columns, 1)) *
+           sizeof(std::uint16_t);
 }
 
 std::size_t current_free_device_bytes() {
@@ -155,16 +199,33 @@ ModelInstance::~ModelInstance() = default;
 
 ConstructedModel construct_model(const EngineOptions& options, DeviceContext& device) {
     validate_options(options);
-    const auto start = Clock::now();
+    const auto start   = Clock::now();
+    const bool split   = options.tensor_parallel == 2;
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
+    std::unique_ptr<TensorParallelPeer> peer;
+    if (split) {
+        peer = std::make_unique<TensorParallelPeer>(options.devices[1]);
+        device.bind_to_current_thread();
+    }
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
+    auto plan = models::qwen3_5::plan_load(reader, models::load_options(options),
+                                           {.size = options.tensor_parallel, .rank = 0});
     binding.complete();
     auto model =
         models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
+    if (peer) {
+        peer->device.bind_to_current_thread();
+        peer->model = models::qwen3_5::materialize_model(
+            models::qwen3_5::plan_load(reader, models::load_options(options), {.size = 2, .rank = 1}),
+            peer->device, &options.startup_observer);
+        peer->device.synchronize();
+        peer->parameters =
+            std::make_unique<const models::qwen3_5::execution::Parameters>(*peer->model);
+        device.bind_to_current_thread();
+    }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     frontend.complete();
@@ -175,9 +236,19 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
-                                          current_free_device_bytes());
+    const EngineOptions planned = split ? rank_options(options) : options;
+    auto planner = models::qwen3_5::make_sequence_planner(instance->parameters, device, planned);
+    std::size_t free_bytes = current_free_device_bytes();
+    std::optional<models::qwen3_5::SequencePlanner> peer_planner;
+    if (peer) {
+        // Both ranks share one capacity: rank Programs must make identical KV decisions.
+        peer->device.bind_to_current_thread();
+        peer_planner.emplace(
+            models::qwen3_5::make_sequence_planner(*peer->parameters, peer->device, planned));
+        free_bytes = std::min(free_bytes, current_free_device_bytes());
+        device.bind_to_current_thread();
+    }
+    auto resolution = resolve_kv_capacity(planned.kv_capacity, planner.capacity_curve(), free_bytes);
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens) {
@@ -186,8 +257,28 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     instance->kv_capacity_resolution = resolution;
     planning.complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer);
+    if (peer) {
+        peer->device.bind_to_current_thread();
+        auto peer_sequence = std::move(*peer_planner).finalize(resolution.main_page_groups);
+        device.bind_to_current_thread();
+        if (peer_sequence.kv_capacity() != sequence.kv_capacity() ||
+            peer_sequence.device_reservation_bytes() != sequence.device_reservation_bytes()) {
+            throw std::logic_error("tensor-parallel ranks finalized different Program plans");
+        }
+        peer->link = std::make_unique<TensorParallelLink>(
+            std::array<int, 2>{device.device, peer->device.device},
+            tensor_parallel_slot_bytes(options, instance->model->config()));
+        peer->views = {peer->link->view(0), peer->link->view(1)};
+        instance->program = models::qwen3_5::create_tensor_parallel_program(
+            {&instance->parameters, peer->parameters.get()},
+            {std::move(sequence), std::move(peer_sequence)}, {&device, &peer->device},
+            {&peer->views[0], &peer->views[1]}, options.startup_observer);
+        peer->device.synchronize();
+        instance->peer = std::move(peer);
+    } else {
+        instance->program = models::qwen3_5::create_program(
+            instance->parameters, std::move(sequence), device, options.startup_observer);
+    }
     device.synchronize();
     program.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();

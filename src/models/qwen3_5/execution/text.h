@@ -7,6 +7,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
+#include "core/tensor_parallel.h"
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -87,6 +88,9 @@ public:
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+
+    // Rank link of a tensor-parallel split; null for the unsplit model.
+    void set_tensor_parallel(const TensorParallelDeviceView* tp) noexcept { tp_ = tp; }
 
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
@@ -248,6 +252,7 @@ private:
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     const MtpParameters* mtp_                   = nullptr;
+    const TensorParallelDeviceView* tp_         = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

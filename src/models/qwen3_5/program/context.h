@@ -30,6 +30,8 @@ using qwen3_5::PromptModality;
 
 struct ExecutionCore {
     DeviceContext& device;
+    // Rank link of a tensor-parallel split; null for the unsplit model.
+    const TensorParallelDeviceView* tensor_parallel;
     const execution::Parameters& parameters;
     WorkspaceArena& work;
     LinearAttentionStatePool& linear_attention;

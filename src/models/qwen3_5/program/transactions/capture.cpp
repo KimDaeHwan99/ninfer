@@ -1197,7 +1197,7 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
     }
 
     if (pressure_transition.phase == PressureTransitionPhase::CopiesInFlight) {
-        if (!context_completion_.ready()) {
+        if (!context_transfer_ready()) {
             return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
         }
         pressure_transition.phase = PressureTransitionPhase::CopyPublication;
@@ -1275,7 +1275,7 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         }
         return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
     }
-    if (transaction.transfer_submitted && !context_completion_.ready()) {
+    if (transaction.transfer_submitted && !context_transfer_ready()) {
         return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
     }
     if (transaction.transfer_submitted) {

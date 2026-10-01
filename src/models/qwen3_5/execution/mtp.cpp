@@ -2,12 +2,22 @@
 
 #include "core/layout.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/mtp_pack.h"
 
 #include <algorithm>
 
 namespace ninfer::models::qwen3_5::execution {
+namespace {
+
+// The fused K/V pair route registers the full 27B KV width only; a tensor-parallel rank's half
+// projects K and V separately.
+bool paired_kv_rows(const std::array<LinearParameters, 4>& rows) {
+    return rows[1].weight.n == 1024 && rows[3].weight.n == 1024;
+}
+
+} // namespace
 
 std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                            std::int32_t first, std::int32_t last) {
@@ -27,6 +37,14 @@ std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parame
 std::size_t mtp_kv_workspace_bytes(const MtpProjectionParameters& parameters,
                                    const AttentionConfig& config, std::int32_t first,
                                    std::int32_t last) {
+    if (parameters.rows && !paired_kv_rows(*parameters.rows)) {
+        const auto bytes = [&](std::size_t index) {
+            const auto& p = (*parameters.rows)[index];
+            const auto& w = p.weight;
+            return ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first, last);
+        };
+        return std::max(bytes(1), bytes(3));
+    }
     if (parameters.rows) {
         return ops::linear_pair_workspace_capacity_bytes((*parameters.rows)[1].weight,
                                                          (*parameters.rows)[3].weight, first, last);
@@ -83,6 +101,16 @@ void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& paramet
 void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                        const AttentionConfig& config, Tensor& key, Tensor& value,
                        WorkspaceArena& workspace, cudaStream_t stream) {
+    if (parameters.rows && !paired_kv_rows(*parameters.rows)) {
+        const auto& k = (*parameters.rows)[1];
+        const auto& v = (*parameters.rows)[3];
+        {
+            auto scope = workspace.scope();
+            ops::linear(hidden, k.weight, key, k.policy, workspace, stream);
+        }
+        ops::linear(hidden, v.weight, value, v.policy, workspace, stream);
+        return;
+    }
     if (parameters.rows) {
         ops::linear_pair(hidden, (*parameters.rows)[1].weight, (*parameters.rows)[3].weight, key,
                          value, stream);

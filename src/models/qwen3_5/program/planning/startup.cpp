@@ -1,5 +1,6 @@
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/ffn.h"
+#include "models/qwen3_5/execution/tensor_parallel.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
@@ -300,6 +301,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k,
                                                              p.policy, first, last));
     };
+    const bool split       = parameters.model.config().tensor_parallel.split();
+    const auto row_parallel_scratch = [&](WorkspaceLayoutBuilder& layout,
+                                          const execution::LinearParameters& p, int first,
+                                          int last) {
+        scratch(layout, execution::row_parallel_output_workspace_bytes(p, first, last, split));
+    };
+    const auto head_scratch = [&](WorkspaceLayoutBuilder& layout,
+                                  const execution::LinearParameters& p, int first, int last) {
+        scratch(layout, execution::output_head_workspace_bytes(p, first, last, split));
+    };
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last) {
         scratch(layout, ops::linear_add_workspace_capacity_bytes(
@@ -325,7 +336,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  dimension(config.attention->num_attention_heads),
                                  dimension(config.attention->num_key_value_heads)},
                                 plan.kv_storage, envelope, batch_size, min_width, max_width));
-                    add_scratch(layout, attention->output, first, last);
+                    row_parallel_scratch(layout, attention->output, first, last);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
                     (void)workspace::gdn_control(layout, config, last);
@@ -352,27 +363,31 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                     dimension(config.gdn->linear_num_value_heads), first, last));
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);
-                    add_scratch(layout, gdn.output, first, last);
+                    row_parallel_scratch(layout, gdn.output, first, last);
                 }
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
-            scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last));
+            scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last, false, split));
         }
         if (!plan.causal_scoring) {
-            linear_scratch(layout, parameters.text.output_head, first, last);
+            // Prefill projects only the chunk's last column; a split head stages exactly that.
+            const bool one_column = split && phase == qwen3_5::TextPhase::Prefill;
+            head_scratch(layout, parameters.text.output_head, one_column ? 1 : first,
+                         one_column ? 1 : last);
         }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, parameters.mtp->output, first, last);
-        scratch(layout, execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, true));
+        scratch(layout,
+                execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, true, split));
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
             matrix(layout, DType::BF16, dimension(parameters.proposal->rows), columns);
             linear_scratch(layout, parameters.proposal->head, columns, columns);
         } else {
-            linear_scratch(layout, parameters.mtp->output_head, columns, columns);
+            head_scratch(layout, parameters.mtp->output_head, columns, columns);
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,

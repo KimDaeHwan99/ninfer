@@ -457,7 +457,8 @@ public:
     };
 
     ProgramImpl(const execution::Parameters& parameters, const SequencePlanImpl& plan,
-                DeviceContext& device, const StartupObserver& startup_observer);
+                DeviceContext& device, const StartupObserver& startup_observer,
+                const TensorParallelDeviceView* tensor_parallel = nullptr);
     ~ProgramImpl() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -560,6 +561,9 @@ public:
 
     const execution::Parameters& parameters;
     DeviceContext& device;
+    // Rank link of a tensor-parallel split; null for the unsplit model. Both rank Programs receive
+    // the same calls and must reach the same decisions (see Program).
+    const TensorParallelDeviceView* const tensor_parallel;
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
@@ -825,6 +829,17 @@ private:
         bool prepared                       = false;
         bool terminal                       = false;
     };
+
+    // A context transfer's completion as this transaction observes it. Rank Programs of a
+    // tensor-parallel split must observe one outcome, and independent polls of two devices can
+    // differ, so a split waits for completion instead of polling.
+    [[nodiscard]] bool context_transfer_ready() const {
+        if (tensor_parallel != nullptr) {
+            context_completion_.synchronize();
+            return true;
+        }
+        return context_completion_.ready();
+    }
 
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;

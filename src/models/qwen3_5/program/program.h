@@ -3,11 +3,14 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
+#include "core/tensor_parallel.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -120,6 +123,7 @@ struct RequestBasePlanImpl;
 struct PressurePlanningSessionImpl;
 
 class ProgramImpl;
+class PeerExecutor;
 
 struct RuntimeContractAccess;
 } // namespace detail
@@ -941,10 +945,37 @@ public:
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
+    Program(std::unique_ptr<detail::ProgramImpl> impl, std::unique_ptr<detail::ProgramImpl> peer,
+            std::unique_ptr<detail::PeerExecutor> executor) noexcept;
+
+    // Runs the peer rank's call alongside the primary's. Without a peer only `local` runs.
+    void on_ranks(const std::function<void()>& peer, const std::function<void()>& local);
+    void on_ranks_noexcept(const std::function<void()>& peer,
+                           const std::function<void()>& local) noexcept;
+    [[nodiscard]] SequenceHandle peer_sequence(const SequenceHandle& handle) const noexcept;
+    [[nodiscard]] std::vector<SequenceHandle>
+    peer_sequences(std::span<const SequenceHandle> handles) const;
+    [[nodiscard]] CaptureOffer peer_offer(const CaptureOffer& offer) const noexcept;
+    [[nodiscard]] SharedPrefixHandle peer_shared(const SharedPrefixHandle& handle) const noexcept;
+    [[nodiscard]] runtime::CancellationFlagView
+    snapshot_cancellation(runtime::CancellationFlagView cancellation) noexcept;
+
     std::unique_ptr<detail::ProgramImpl> impl_;
+    // Tensor-parallel peer rank: an independent ProgramImpl on the second device that receives
+    // every mutating call the primary receives. Identical inputs and deterministic execution give
+    // both ranks identical decisions; planning queries consult the primary alone.
+    std::unique_ptr<detail::ProgramImpl> peer_;
+    std::unique_ptr<detail::PeerExecutor> executor_;
+    std::optional<PendingBatch> peer_pending_;
+    std::atomic<bool> cancellation_snapshot_{false};
 
     friend std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                    DeviceContext&, const StartupObserver&);
+    friend std::unique_ptr<Program>
+    create_tensor_parallel_program(std::array<const execution::Parameters*, 2>,
+                                   std::array<SequencePlan, 2>&&, std::array<DeviceContext*, 2>,
+                                   std::array<const TensorParallelDeviceView*, 2>,
+                                   const StartupObserver&);
 };
 
 namespace detail {
@@ -1102,5 +1133,14 @@ struct RuntimeContractAccess {
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                                       SequencePlan&& plan, DeviceContext& device,
                                                       const StartupObserver& startup_observer);
+
+// Two-rank tensor-parallel Program. Each rank's ProgramImpl is constructed on its own device
+// concurrently, because startup warmup and graph preparation already execute collectives.
+[[nodiscard]] std::unique_ptr<Program>
+create_tensor_parallel_program(std::array<const execution::Parameters*, 2> parameters,
+                               std::array<SequencePlan, 2>&& plans,
+                               std::array<DeviceContext*, 2> devices,
+                               std::array<const TensorParallelDeviceView*, 2> links,
+                               const StartupObserver& startup_observer);
 
 } // namespace ninfer::models::qwen3_5

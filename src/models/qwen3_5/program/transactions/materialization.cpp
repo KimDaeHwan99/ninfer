@@ -1045,7 +1045,7 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
 
 void ProgramImpl::record_materialization_transfer_observations(
     MaterializationTransaction& transaction) {
-    if (!transaction.transfer_submitted || !context_completion_.ready()) {
+    if (!transaction.transfer_submitted || !context_transfer_ready()) {
         throw std::logic_error("materialization transfer observation is not complete");
     }
     const auto record = [&](runtime::ContextResourceClass resource,
@@ -2035,7 +2035,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     }
 
     if (pressure_transition.phase == PressureTransitionPhase::CopiesInFlight) {
-        if (!context_completion_.ready()) {
+        if (!context_transfer_ready()) {
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }
@@ -2115,7 +2115,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     }
 
     if (transaction.transfer_submitted) {
-        if (!context_completion_.ready()) {
+        if (!context_transfer_ready()) {
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }

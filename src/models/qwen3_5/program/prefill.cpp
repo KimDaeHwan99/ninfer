@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/execution/tensor_parallel.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -53,6 +54,7 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
+    card.set_tensor_parallel(execution.tensor_parallel);
     card.set_sampling(sampling);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
@@ -156,8 +158,9 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     }
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
-    project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
-            state.execution.device.stream);
+    output_head(hidden, state.execution.parameters.text.output_head, logits,
+                state.execution.tensor_parallel, state.execution.work,
+                state.execution.device.stream);
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
@@ -989,7 +992,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
         execution::PrefillContext schedule_state{
-            {device, parameters, work, state_images->linear(),
+            {device, tensor_parallel, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
             text_kv_view(sequence),

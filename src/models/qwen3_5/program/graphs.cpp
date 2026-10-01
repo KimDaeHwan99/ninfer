@@ -291,6 +291,7 @@ void ProgramImpl::prepare_graphs() {
     };
     const auto execution_core = [&] {
         return execution::ExecutionCore{device,
+                                        tensor_parallel,
                                         parameters,
                                         work,
                                         state_images->linear(),

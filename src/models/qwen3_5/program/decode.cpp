@@ -37,6 +37,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
+        card.set_tensor_parallel(state.execution.tensor_parallel);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -243,7 +244,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     ops::prepare_ragged_prefix(dflash->pending_features, active_lane_tensor, device_starts,
                                device_ends, features, positions, device_counts, device.stream);
 
-    execution::DFlashAppendContext state{{device, parameters, work, state_images->linear(),
+    execution::DFlashAppendContext state{{device, tensor_parallel, parameters, work, state_images->linear(),
                                           replay_records ? &*replay_records : nullptr, io,
                                           prefill_hidden, prefill_chunk, proposal_head},
                                          *dflash};
@@ -332,7 +333,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         }
 
         execution::OrdinaryBatchContext schedule_state{
-            {device, parameters, work, state_images->linear(),
+            {device, tensor_parallel, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
             decoder->text_kv,
@@ -491,7 +492,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                       std::min(capacity, frontier + extent + draft_window));
         }
 
-        execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
+        execution::MtpBatchContext schedule_state{{device, tensor_parallel, parameters, work, state_images->linear(),
                                                    replay_records ? &*replay_records : nullptr, io,
                                                    prefill_hidden, prefill_chunk, proposal_head},
                                                   decoder->text_kv,
@@ -686,7 +687,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         }
 
         execution::DFlashBatchContext schedule_state{
-            {device, parameters, work, state_images->linear(),
+            {device, tensor_parallel, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
             decoder->text_kv,

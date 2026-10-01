@@ -2,7 +2,12 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/peer_executor.h"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ninfer::models::qwen3_5 {
@@ -242,9 +247,91 @@ CapturePressurePlanningSession::seal(AssessedPressureTarget&& assessed) {
     return session_.seal_capture(std::move(assessed));
 }
 
+namespace {
+
+using Access = detail::RuntimeContractAccess;
+
+[[noreturn]] void ranks_diverged(const char* what) {
+    throw std::logic_error(std::string("tensor-parallel ranks diverged: ") + what);
+}
+
+void require_same(bool same, const char* what) {
+    if (!same) { ranks_diverged(what); }
+}
+
+bool same_tokens(const PendingBatch& left, const PendingBatch& right) {
+    return left.row_count() == right.row_count() && left.row_stride() == right.row_stride() &&
+           std::equal(left.tokens().begin(), left.tokens().end(), right.tokens().begin(),
+                      right.tokens().end()) &&
+           std::equal(left.row_counts().begin(), left.row_counts().end(),
+                      right.row_counts().begin(), right.row_counts().end());
+}
+
+} // namespace
+
 Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std::move(impl)) {}
 
-Program::~Program() noexcept = default;
+Program::Program(std::unique_ptr<detail::ProgramImpl> impl,
+                 std::unique_ptr<detail::ProgramImpl> peer,
+                 std::unique_ptr<detail::PeerExecutor> executor) noexcept
+    : impl_(std::move(impl)), peer_(std::move(peer)), executor_(std::move(executor)) {}
+
+Program::~Program() noexcept {
+    if (peer_) {
+        // Each rank releases its device state on its own device thread.
+        on_ranks_noexcept([&] { peer_.reset(); }, [&] { impl_.reset(); });
+    }
+}
+
+void Program::on_ranks(const std::function<void()>& peer, const std::function<void()>& local) {
+    if (!peer_) {
+        local();
+        return;
+    }
+    executor_->run(peer, local);
+}
+
+void Program::on_ranks_noexcept(const std::function<void()>& peer,
+                                const std::function<void()>& local) noexcept {
+    try {
+        on_ranks(peer, local);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "tensor-parallel Program failed in a noexcept transition: %s\n",
+                     error.what());
+        std::abort();
+    } catch (...) {
+        std::fprintf(stderr, "tensor-parallel Program failed in a noexcept transition\n");
+        std::abort();
+    }
+}
+
+SequenceHandle Program::peer_sequence(const SequenceHandle& handle) const noexcept {
+    return Access::make_sequence(peer_.get(), Access::lane(handle), Access::epoch(handle));
+}
+
+std::vector<SequenceHandle> Program::peer_sequences(std::span<const SequenceHandle> handles) const {
+    std::vector<SequenceHandle> out;
+    out.reserve(handles.size());
+    for (const auto& handle : handles) { out.push_back(peer_sequence(handle)); }
+    return out;
+}
+
+CaptureOffer Program::peer_offer(const CaptureOffer& offer) const noexcept {
+    return Access::make_capture_offer(peer_.get(), Access::lane(offer), Access::epoch(offer),
+                                      Access::id(offer));
+}
+
+SharedPrefixHandle Program::peer_shared(const SharedPrefixHandle& handle) const noexcept {
+    return Access::make_shared_prefix(peer_.get(), Access::index(handle), Access::epoch(handle));
+}
+
+runtime::CancellationFlagView
+Program::snapshot_cancellation(runtime::CancellationFlagView cancellation) noexcept {
+    // Both ranks must observe one cancellation decision per call.
+    if (!peer_) { return cancellation; }
+    cancellation_snapshot_.store(cancellation.requested(), std::memory_order_release);
+    return runtime::CancellationFlagView{&cancellation_snapshot_};
+}
 
 RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
                                       const runtime::ResolvedExecutionOptions& options) {
@@ -252,6 +339,7 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
+    if (peer_) { throw std::logic_error("CausalScoring has no tensor-parallel Program"); }
     return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
 }
 
@@ -318,8 +406,28 @@ Program::start_resource_transaction(ResourcePlan&& plan, PreparedPrompt&& prompt
     if (plan.revision_.value == 0 || plan.revision_ != impl_->resource_revision()) {
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
-    return impl_->reserve_materialization(
-        std::move(plan.admission_), PreparedPromptAccess::take(std::move(prompt)), cancellation);
+    PreparedPromptData data = PreparedPromptAccess::take(std::move(prompt));
+    if (!peer_) {
+        return impl_->reserve_materialization(std::move(plan.admission_), std::move(data),
+                                              cancellation);
+    }
+    require_same(plan.revision_ == peer_->resource_revision(), "resource revision");
+    AdmissionCandidate peer_admission(
+        std::make_unique<detail::AdmissionCandidateImpl>(*plan.admission_.impl_));
+    PreparedPromptData peer_data = data;
+    const auto fixed             = snapshot_cancellation(cancellation);
+    runtime::ContextTransactionReserveStatus local{}, peer{};
+    on_ranks(
+        [&] {
+            peer = peer_->reserve_materialization(std::move(peer_admission), std::move(peer_data),
+                                                  fixed);
+        },
+        [&] {
+            local = impl_->reserve_materialization(std::move(plan.admission_), std::move(data),
+                                                   fixed);
+        });
+    require_same(local == peer, "materialization reservation");
+    return local;
 }
 
 std::optional<PersistentBackfillProof>
@@ -336,16 +444,51 @@ Program::prove_persistent_backfill(const RequestBasePlan& blocked_head,
 
 ContextTransactionProgress
 Program::progress_context_transaction(runtime::CancellationFlagView cancellation) {
-    return impl_->progress_context_transaction(cancellation);
+    if (!peer_) { return impl_->progress_context_transaction(cancellation); }
+    const auto fixed = snapshot_cancellation(cancellation);
+    std::optional<ContextTransactionProgress> local, peer;
+    on_ranks([&] { peer.emplace(peer_->progress_context_transaction(fixed)); },
+             [&] { local.emplace(impl_->progress_context_transaction(fixed)); });
+    require_same(local->index() == peer->index(), "context transaction progress");
+    if (const auto* result = std::get_if<MaterializationResult>(&*local)) {
+        require_same(result->status == std::get<MaterializationResult>(*peer).status,
+                     "materialization result");
+    } else if (const auto* result = std::get_if<ActiveCaptureResult>(&*local)) {
+        require_same(result->status == std::get<ActiveCaptureResult>(*peer).status,
+                     "active capture result");
+    }
+    return std::move(*local);
 }
 
-void Program::finalize_context_transaction() noexcept { impl_->finalize_context_transaction(); }
+void Program::finalize_context_transaction() noexcept {
+    on_ranks_noexcept([&] { peer_->finalize_context_transaction(); },
+                      [&] { impl_->finalize_context_transaction(); });
+}
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
                                          runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+    if (!peer_) { return impl_->advance_prefill(sequence, failed_timing); }
+    const SequenceHandle peer_handle = peer_sequence(sequence);
+    runtime::ExecutionTiming peer_failed;
+    std::optional<PrefillProgress> local, peer;
+    on_ranks([&] {
+                 peer.emplace(peer_->advance_prefill(peer_handle,
+                                                     failed_timing ? &peer_failed : nullptr));
+             },
+             [&] { local.emplace(impl_->advance_prefill(sequence, failed_timing)); });
+    require_same(local->complete == peer->complete &&
+                     local->processed_prompt_tokens == peer->processed_prompt_tokens &&
+                     local->pending.has_value() == peer->pending.has_value() &&
+                     local->capture.has_value() == peer->capture.has_value(),
+                 "prefill progress");
+    if (local->pending) {
+        require_same(same_tokens(*local->pending, *peer->pending), "prefill tokens");
+        peer_pending_.reset();
+        peer_pending_.emplace(std::move(*peer->pending));
+    }
+    return std::move(*local);
 }
 
 CaptureAssessment
@@ -392,7 +535,15 @@ bool Program::shared_capture_matches(const CaptureOffer& offer,
     return impl_->shared_capture_matches(offer, shared);
 }
 
-void Program::skip_capture(CaptureOffer&& offer) { impl_->skip_capture(std::move(offer)); }
+void Program::skip_capture(CaptureOffer&& offer) {
+    if (!peer_) {
+        impl_->skip_capture(std::move(offer));
+        return;
+    }
+    CaptureOffer peer_copy = peer_offer(offer);
+    on_ranks([&] { peer_->skip_capture(std::move(peer_copy)); },
+             [&] { impl_->skip_capture(std::move(offer)); });
+}
 
 runtime::ContextTransactionReserveStatus
 Program::reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* exact_shared,
@@ -400,9 +551,31 @@ Program::reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* 
                                 std::optional<runtime::CheckpointRef> private_replacement,
                                 bool permit_shared_publication,
                                 runtime::CancellationFlagView cancellation) {
-    return impl_->reserve_active_capture(std::move(offer), exact_shared, replacement,
-                                         private_replacement, permit_shared_publication,
-                                         cancellation);
+    if (!peer_) {
+        return impl_->reserve_active_capture(std::move(offer), exact_shared, replacement,
+                                             private_replacement, permit_shared_publication,
+                                             cancellation);
+    }
+    CaptureOffer peer_copy = peer_offer(offer);
+    std::optional<SharedPrefixHandle> peer_exact, peer_replacement;
+    if (exact_shared) { peer_exact.emplace(peer_shared(*exact_shared)); }
+    if (replacement) { peer_replacement.emplace(peer_shared(*replacement)); }
+    const auto fixed = snapshot_cancellation(cancellation);
+    runtime::ContextTransactionReserveStatus local{}, peer{};
+    on_ranks(
+        [&] {
+            peer = peer_->reserve_active_capture(
+                std::move(peer_copy), peer_exact ? &*peer_exact : nullptr,
+                peer_replacement ? &*peer_replacement : nullptr, private_replacement,
+                permit_shared_publication, fixed);
+        },
+        [&] {
+            local = impl_->reserve_active_capture(std::move(offer), exact_shared, replacement,
+                                                  private_replacement, permit_shared_publication,
+                                                  fixed);
+        });
+    require_same(local == peer, "active capture reservation");
+    return local;
 }
 
 runtime::ContextTransactionReserveStatus Program::reserve_active_capture_with_pressure(
@@ -413,15 +586,52 @@ runtime::ContextTransactionReserveStatus Program::reserve_active_capture_with_pr
     if (pressure.revision_.value == 0 || pressure.revision_ != impl_->resource_revision()) {
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
-    return impl_->reserve_active_capture_with_pressure(
-        std::move(offer), exact_shared, replacement, private_replacement, permit_shared_publication,
-        std::move(pressure.pressure_), cancellation);
+    if (!peer_) {
+        return impl_->reserve_active_capture_with_pressure(
+            std::move(offer), exact_shared, replacement, private_replacement,
+            permit_shared_publication, std::move(pressure.pressure_), cancellation);
+    }
+    require_same(pressure.revision_ == peer_->resource_revision(), "resource revision");
+    CaptureOffer peer_copy = peer_offer(offer);
+    std::optional<SharedPrefixHandle> peer_exact, peer_replacement;
+    if (exact_shared) { peer_exact.emplace(peer_shared(*exact_shared)); }
+    if (replacement) { peer_replacement.emplace(peer_shared(*replacement)); }
+    CapturePressureCandidate peer_pressure(
+        std::make_unique<detail::CapturePressureCandidateImpl>(*pressure.pressure_.impl_));
+    const auto fixed = snapshot_cancellation(cancellation);
+    runtime::ContextTransactionReserveStatus local{}, peer{};
+    on_ranks(
+        [&] {
+            peer = peer_->reserve_active_capture_with_pressure(
+                std::move(peer_copy), peer_exact ? &*peer_exact : nullptr,
+                peer_replacement ? &*peer_replacement : nullptr, private_replacement,
+                permit_shared_publication, std::move(peer_pressure), fixed);
+        },
+        [&] {
+            local = impl_->reserve_active_capture_with_pressure(
+                std::move(offer), exact_shared, replacement, private_replacement,
+                permit_shared_publication, std::move(pressure.pressure_), fixed);
+        });
+    require_same(local == peer, "pressured active capture reservation");
+    return local;
 }
 
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
                              std::span<const runtime::RoundBudget> budgets,
                              runtime::ExecutionTiming* failed_timing) {
-    return impl_->decode(sequences, budgets, failed_timing);
+    if (!peer_) { return impl_->decode(sequences, budgets, failed_timing); }
+    const auto peer_handles = peer_sequences(sequences);
+    runtime::ExecutionTiming peer_failed;
+    std::optional<PendingBatch> local, peer;
+    on_ranks([&] {
+                 peer.emplace(peer_->decode(peer_handles, budgets,
+                                            failed_timing ? &peer_failed : nullptr));
+             },
+             [&] { local.emplace(impl_->decode(sequences, budgets, failed_timing)); });
+    require_same(same_tokens(*local, *peer), "decode tokens");
+    peer_pending_.reset();
+    peer_pending_.emplace(std::move(*peer));
+    return std::move(*local);
 }
 
 runtime::ExecutionTiming
@@ -429,34 +639,112 @@ Program::append_forced_tokens(std::span<const SequenceHandle> sequences,
                               std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
                               std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
                               runtime::ExecutionTiming* failed_timing) {
-    return impl_->append_forced_tokens(sequences, row_major_tokens, row_stride,
-                                       prefix_execution_splits, failed_timing);
+    if (!peer_) {
+        return impl_->append_forced_tokens(sequences, row_major_tokens, row_stride,
+                                           prefix_execution_splits, failed_timing);
+    }
+    const auto peer_handles = peer_sequences(sequences);
+    runtime::ExecutionTiming local{}, peer_failed{};
+    on_ranks(
+        [&] {
+            (void)peer_->append_forced_tokens(peer_handles, row_major_tokens, row_stride,
+                                              prefix_execution_splits,
+                                              failed_timing ? &peer_failed : nullptr);
+        },
+        [&] {
+            local = impl_->append_forced_tokens(sequences, row_major_tokens, row_stride,
+                                                prefix_execution_splits, failed_timing);
+        });
+    return local;
 }
 
 CommitResult Program::commit(PendingBatch&& pending,
                              std::span<const runtime::CommitDecision> decisions,
                              runtime::CommitObservation observation,
                              runtime::ExecutionTiming* failed_timing) {
-    return impl_->commit(std::move(pending), decisions, observation, failed_timing);
+    if (!peer_) { return impl_->commit(std::move(pending), decisions, observation, failed_timing); }
+    if (!peer_pending_) { ranks_diverged("commit without a peer pending batch"); }
+    PendingBatch peer_batch(std::move(*peer_pending_));
+    peer_pending_.reset();
+    runtime::ExecutionTiming peer_failed;
+    std::optional<CommitResult> local, peer;
+    on_ranks(
+        [&] {
+            peer.emplace(peer_->commit(std::move(peer_batch), decisions, observation,
+                                       failed_timing ? &peer_failed : nullptr));
+        },
+        [&] { local.emplace(impl_->commit(std::move(pending), decisions, observation,
+                                          failed_timing)); });
+    bool same = local->row_count == peer->row_count;
+    for (std::size_t row = 0; same && row < local->row_count; ++row) {
+        same = local->rows[row].disposition == peer->rows[row].disposition &&
+               local->captures[row].has_value() == peer->captures[row].has_value();
+    }
+    require_same(same, "commit result");
+    return std::move(*local);
 }
 
 DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
-    return impl_->abort_pending(std::move(pending));
+    if (!peer_) { return impl_->abort_pending(std::move(pending)); }
+    DiscardResult local{};
+    std::optional<PendingBatch> peer_batch;
+    if (peer_pending_) {
+        peer_batch.emplace(std::move(*peer_pending_));
+        peer_pending_.reset();
+    }
+    on_ranks_noexcept(
+        [&] {
+            if (peer_batch) { (void)peer_->abort_pending(std::move(*peer_batch)); }
+        },
+        [&] { local = impl_->abort_pending(std::move(pending)); });
+    return local;
 }
 
-FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->finish(sequence); }
+FinishResult Program::finish(SequenceHandle sequence) noexcept {
+    if (!peer_) { return impl_->finish(sequence); }
+    const SequenceHandle peer_handle = peer_sequence(sequence);
+    std::optional<FinishResult> local;
+    on_ranks_noexcept([&] { (void)peer_->finish(peer_handle); },
+                      [&] { local.emplace(impl_->finish(sequence)); });
+    return std::move(*local);
+}
 
-AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
+AbortResult Program::abort(SequenceHandle sequence) noexcept {
+    if (!peer_) { return impl_->abort(sequence); }
+    const SequenceHandle peer_handle = peer_sequence(sequence);
+    AbortResult local{};
+    on_ranks_noexcept([&] { (void)peer_->abort(peer_handle); },
+                      [&] { local = impl_->abort(sequence); });
+    return local;
+}
 
 ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) noexcept {
-    return impl_->release_continuation(std::move(continuation));
+    if (!peer_) { return impl_->release_continuation(std::move(continuation)); }
+    ContinuationHandle peer_handle = Access::make_continuation(
+        peer_.get(), Access::index(continuation), Access::epoch(continuation));
+    ReleaseResult local{};
+    on_ranks_noexcept([&] { (void)peer_->release_continuation(std::move(peer_handle)); },
+                      [&] { local = impl_->release_continuation(std::move(continuation)); });
+    return local;
 }
 
 ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexcept {
-    return impl_->release_shared_prefix(std::move(shared));
+    if (!peer_) { return impl_->release_shared_prefix(std::move(shared)); }
+    SharedPrefixHandle peer_handle = peer_shared(shared);
+    ReleaseResult local{};
+    on_ranks_noexcept([&] { (void)peer_->release_shared_prefix(std::move(peer_handle)); },
+                      [&] { local = impl_->release_shared_prefix(std::move(shared)); });
+    return local;
 }
 
-void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
+void Program::fail_all_cleanup() noexcept {
+    if (!peer_) {
+        impl_->fail_all_cleanup();
+        return;
+    }
+    peer_pending_.reset();
+    on_ranks_noexcept([&] { peer_->fail_all_cleanup(); }, [&] { impl_->fail_all_cleanup(); });
+}
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     return impl_->isolated_request_feasible(base);
@@ -470,7 +758,13 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->p
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 
-void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
+void Program::reset_memory_peaks() noexcept {
+    if (!peer_) {
+        impl_->reset_memory_peaks();
+        return;
+    }
+    on_ranks_noexcept([&] { peer_->reset_memory_peaks(); }, [&] { impl_->reset_memory_peaks(); });
+}
 
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                       DeviceContext& device, const EngineOptions& options) {
@@ -484,10 +778,56 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
     if (plan.impl_->parameters != &parameters) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
     }
+    if (parameters.model.config().tensor_parallel.split()) {
+        throw std::invalid_argument("a tensor-parallel shard needs create_tensor_parallel_program");
+    }
     auto impl =
         std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
+}
+
+std::unique_ptr<Program>
+create_tensor_parallel_program(std::array<const execution::Parameters*, 2> parameters,
+                               std::array<SequencePlan, 2>&& plans,
+                               std::array<DeviceContext*, 2> devices,
+                               std::array<const TensorParallelDeviceView*, 2> links,
+                               const StartupObserver& startup_observer) {
+    for (std::size_t rank = 0; rank < 2; ++rank) {
+        if (parameters[rank] == nullptr || devices[rank] == nullptr || links[rank] == nullptr) {
+            throw std::invalid_argument("tensor-parallel Program rank is incomplete");
+        }
+        const auto placement = parameters[rank]->model.config().tensor_parallel;
+        if (placement.size != 2 || placement.rank != rank) {
+            throw std::invalid_argument("tensor-parallel Program rank has another placement");
+        }
+        if (plans[rank].impl_ == nullptr || plans[rank].impl_->parameters != parameters[rank]) {
+            throw std::invalid_argument("tensor-parallel sequence plan belongs to another rank");
+        }
+        if (links[rank]->rank != static_cast<std::int32_t>(rank)) {
+            throw std::invalid_argument("tensor-parallel link view belongs to another rank");
+        }
+    }
+    if (plans[0].impl_->kv_capacity != plans[1].impl_->kv_capacity ||
+        plans[0].impl_->capacity != plans[1].impl_->capacity) {
+        throw std::invalid_argument("tensor-parallel ranks were planned with different capacity");
+    }
+    auto executor = std::make_unique<detail::PeerExecutor>(*devices[1]);
+    const StartupObserver quiet;
+    std::unique_ptr<detail::ProgramImpl> local, peer;
+    executor->run(
+        [&] {
+            peer = std::make_unique<detail::ProgramImpl>(*parameters[1], *plans[1].impl_,
+                                                         *devices[1], quiet, links[1]);
+        },
+        [&] {
+            local = std::make_unique<detail::ProgramImpl>(*parameters[0], *plans[0].impl_,
+                                                          *devices[0], startup_observer, links[0]);
+        });
+    plans[0].impl_.reset();
+    plans[1].impl_.reset();
+    return std::unique_ptr<Program>(
+        new Program(std::move(local), std::move(peer), std::move(executor)));
 }
 
 } // namespace ninfer::models::qwen3_5

@@ -36,8 +36,10 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
 } // namespace
 
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
-                         DeviceContext& device_in, const StartupObserver& startup_observer)
-    : parameters(parameters_in), device(device_in), capacity(plan.capacity),
+                         DeviceContext& device_in, const StartupObserver& startup_observer,
+                         const TensorParallelDeviceView* tensor_parallel_in)
+    : parameters(parameters_in), device(device_in), tensor_parallel(tensor_parallel_in),
+      capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
@@ -409,7 +411,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         while (cursor < predictor_count) {
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
-                {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
+                {device, tensor_parallel, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
