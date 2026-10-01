@@ -212,4 +212,36 @@ __global__ __launch_bounds__(kTensorParallelThreads) void tp_allgather_rows_kern
     }
 }
 
+// Copy channel handshakes. The publish runs after this rank's device -> host copy of one piece in
+// stream order; the wait precedes the host -> device copy of the peer's piece.
+__global__ void tp_copy_publish_kernel(std::uint64_t* published, std::uint64_t sequence) {
+    __threadfence_system();
+    tp_store_release(published, sequence);
+}
+
+__global__ void tp_copy_wait_kernel(const std::uint64_t* published, std::uint64_t sequence,
+                                    std::uint64_t timeout_ns) {
+    tp_wait_at_least(published, sequence, timeout_ns, "copy payload");
+}
+
+// residual += partial_rank0 + partial_rank1 over BF16x8 packs, the same expression and rank order
+// as the kernel collectives.
+__global__ __launch_bounds__(kTensorParallelThreads) void tp_copy_combine_kernel(
+    const uint4* own, const uint4* peer, uint4* residual, std::int64_t packs, std::int32_t rank) {
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < packs; i += stride) {
+        const uint4 mine   = own[i];
+        const uint4 other  = peer[i];
+        const uint4 first  = rank == 0 ? mine : other;
+        const uint4 second = rank == 0 ? other : mine;
+        uint4 value        = residual[i];
+        value.x            = tp_sum3(value.x, first.x, second.x);
+        value.y            = tp_sum3(value.y, first.y, second.y);
+        value.z            = tp_sum3(value.z, first.z, second.z);
+        value.w            = tp_sum3(value.w, first.w, second.w);
+        residual[i]        = value;
+    }
+}
+
 } // namespace ninfer::ops

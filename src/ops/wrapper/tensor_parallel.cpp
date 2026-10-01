@@ -2,6 +2,7 @@
 // dispatch. Host-compiled; never includes the kernel header.
 #include "ninfer/ops/tensor_parallel.h"
 
+#include "core/device.h" // CUDA_CHECK
 #include "ops/launcher/tensor_parallel.h"
 
 #include <cstdint>
@@ -38,26 +39,57 @@ bool overlaps(const Tensor& a, const Tensor& b) {
     return a0 < b0 + b.bytes() && b0 < a0 + a.bytes();
 }
 
+void require_operands(const Tensor& partial, const Tensor& residual, const char* op) {
+    require_bf16_packs(partial, op, "partial");
+    require_bf16_packs(residual, op, "residual");
+    for (int d = 0; d < 4; ++d) {
+        if (partial.ne[d] != residual.ne[d]) {
+            throw std::invalid_argument(std::string(op) + ": partial/residual shapes differ");
+        }
+    }
+    if (overlaps(partial, residual)) {
+        throw std::invalid_argument(std::string(op) + ": partial and residual overlap");
+    }
+}
+
 } // namespace
 
 void tp_residual_allreduce(const Tensor& partial, Tensor& residual,
                            const TensorParallelDeviceView& tp, cudaStream_t stream) {
     constexpr const char* op = "tp_residual_allreduce";
     require_link(tp, op);
-    require_bf16_packs(partial, op, "partial");
-    require_bf16_packs(residual, op, "residual");
-    for (int d = 0; d < 4; ++d) {
-        if (partial.ne[d] != residual.ne[d]) {
-            throw std::invalid_argument("tp_residual_allreduce: partial/residual shapes differ");
-        }
-    }
-    if (overlaps(partial, residual)) {
-        throw std::invalid_argument("tp_residual_allreduce: partial and residual overlap");
-    }
+    require_operands(partial, residual, op);
     if (partial.bytes() > tp.slot_bytes) {
         throw std::invalid_argument("tp_residual_allreduce: payload exceeds the link slot");
     }
     detail::tp_residual_allreduce_launch(partial, residual, tp, stream);
+}
+
+TensorParallelTicket tp_residual_allreduce_async(const Tensor& partial, Tensor& residual,
+                                                 const TensorParallelDeviceView& tp,
+                                                 cudaStream_t stream) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (tp.copy == nullptr || capture != cudaStreamCaptureStatusNone ||
+        partial.bytes() <= detail::kTensorParallelCopyMinBytes) {
+        tp_residual_allreduce(partial, residual, tp, stream);
+        return 0;
+    }
+    constexpr const char* op = "tp_residual_allreduce_async";
+    require_link(tp, op);
+    require_operands(partial, residual, op);
+    if (partial.bytes() > tp.copy->slot_bytes) {
+        throw std::invalid_argument("tp_residual_allreduce_async: payload exceeds the link slot");
+    }
+    return detail::tp_residual_allreduce_copy_launch(partial, residual, tp, stream);
+}
+
+void tp_wait(const TensorParallelDeviceView& tp, TensorParallelTicket ticket, cudaStream_t stream) {
+    if (ticket == 0) { return; }
+    if (tp.copy == nullptr || ticket > tp.copy->sequence) {
+        throw std::invalid_argument("tp_wait: ticket was not issued by this rank's channel");
+    }
+    detail::tp_wait_launch(tp, ticket, stream);
 }
 
 void tp_allgather_rows(const Tensor& local, Tensor& destination, const TensorParallelDeviceView& tp,

@@ -48,9 +48,9 @@ private:
 } // namespace
 
 TensorParallelLink::TensorParallelLink(std::array<int, kTensorParallelRanks> devices,
-                                       std::size_t slot_bytes)
+                                       std::size_t slot_bytes, bool copy_channels)
     : devices_(devices), slot_bytes_(align_up(slot_bytes, kStagingAlignment)),
-      timeout_ns_(timeout_from_environment()) {
+      timeout_ns_(timeout_from_environment()), copy_channels_(copy_channels) {
     if (devices_[0] == devices_[1]) {
         throw std::invalid_argument("tensor-parallel ranks must use distinct devices");
     }
@@ -69,8 +69,15 @@ TensorParallelLink::TensorParallelLink(std::array<int, kTensorParallelRanks> dev
 
     const std::size_t mailboxes = align_up(sizeof(TensorParallelMailbox) * kTensorParallelRanks,
                                            kStagingAlignment);
-    host_bytes_ = mailboxes + slot_bytes_ * kTensorParallelSlots * kTensorParallelRanks +
-                  kTensorParallelPackedSlotBytes * kTensorParallelSlots * kTensorParallelRanks;
+    const std::size_t kernel_bytes =
+        mailboxes + slot_bytes_ * kTensorParallelSlots * kTensorParallelRanks +
+        kTensorParallelPackedSlotBytes * kTensorParallelSlots * kTensorParallelRanks;
+    const std::size_t copy_mailboxes =
+        align_up(sizeof(TensorParallelCopyMailbox) * kTensorParallelRanks, kStagingAlignment);
+    host_bytes_ = kernel_bytes;
+    if (copy_channels_) {
+        host_bytes_ += copy_mailboxes + slot_bytes_ * kTensorParallelSlots * kTensorParallelRanks;
+    }
     {
         DeviceScope scope(devices_[0]);
         CUDA_CHECK(cudaHostAlloc(&host_, host_bytes_, cudaHostAllocPortable | cudaHostAllocMapped));
@@ -91,10 +98,61 @@ TensorParallelLink::TensorParallelLink(std::array<int, kTensorParallelRanks> dev
             throw std::runtime_error("tensor-parallel host region is not identity-mapped");
         }
     }
+    if (copy_channels_) {
+        auto* base          = static_cast<std::byte*>(host_) + kernel_bytes;
+        auto* copy_mailbox  = reinterpret_cast<TensorParallelCopyMailbox*>(base);
+        auto* copy_staging  = base + copy_mailboxes;
+        const auto staging  = [&](std::size_t r) {
+            return copy_staging + r * slot_bytes_ * kTensorParallelSlots;
+        };
+        for (std::size_t rank = 0; rank < kTensorParallelRanks; ++rank) {
+            DeviceScope scope(devices_[rank]);
+            auto& channel = channels_[rank];
+            int least     = 0;
+            int greatest  = 0;
+            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+            // Combines and handshakes are short; let them take the next free SM slot.
+            CUDA_CHECK(cudaStreamCreateWithPriority(&channel.send, cudaStreamNonBlocking, greatest));
+            CUDA_CHECK(
+                cudaStreamCreateWithPriority(&channel.receive, cudaStreamNonBlocking, greatest));
+            CUDA_CHECK(cudaEventCreateWithFlags(&channel.fork, cudaEventDisableTiming));
+            for (std::size_t t = 0; t < kTensorParallelCopyTickets; ++t) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&channel.sent[t], cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&channel.received[t], cudaEventDisableTiming));
+            }
+            void* scratch = nullptr;
+            CUDA_CHECK(cudaMalloc(&scratch, slot_bytes_ * (1 + kTensorParallelCopyPartials)));
+            channel.scratch = static_cast<std::byte*>(scratch);
+            for (std::size_t p = 0; p < kTensorParallelCopyPartials; ++p) {
+                channel.partials[p] = channel.scratch + (1 + p) * slot_bytes_;
+            }
+            channel.self_staging = staging(rank);
+            channel.peer_staging = staging(1 - rank);
+            channel.self_mailbox = copy_mailbox + rank;
+            channel.peer_mailbox = copy_mailbox + (1 - rank);
+            channel.slot_bytes   = slot_bytes_;
+            channel.timeout_ns   = timeout_ns_;
+            channel.rank         = static_cast<std::int32_t>(rank);
+        }
+    }
 }
 
 TensorParallelLink::~TensorParallelLink() {
     for (std::size_t rank = 0; rank < kTensorParallelRanks; ++rank) {
+        auto& channel = channels_[rank];
+        if (channel.send != nullptr || channel.scratch != nullptr) {
+            DeviceScope scope(devices_[rank]);
+            if (channel.send != nullptr) { (void)cudaStreamSynchronize(channel.send); }
+            if (channel.receive != nullptr) { (void)cudaStreamSynchronize(channel.receive); }
+            for (std::size_t t = 0; t < kTensorParallelCopyTickets; ++t) {
+                if (channel.sent[t] != nullptr) { (void)cudaEventDestroy(channel.sent[t]); }
+                if (channel.received[t] != nullptr) { (void)cudaEventDestroy(channel.received[t]); }
+            }
+            if (channel.fork != nullptr) { (void)cudaEventDestroy(channel.fork); }
+            if (channel.send != nullptr) { (void)cudaStreamDestroy(channel.send); }
+            if (channel.receive != nullptr) { (void)cudaStreamDestroy(channel.receive); }
+            if (channel.scratch != nullptr) { (void)cudaFree(channel.scratch); }
+        }
         if (counters_[rank] != nullptr) {
             DeviceScope scope(devices_[rank]);
             (void)cudaFree(counters_[rank]);
@@ -129,7 +187,10 @@ TensorParallelDeviceView TensorParallelLink::view(int rank) const {
                                     .counters     = counters_[static_cast<std::size_t>(rank)],
                                     .timeout_ns   = timeout_ns_,
                                     .rank         = rank,
-                                    .max_blocks   = max_blocks_};
+                                    .max_blocks   = max_blocks_,
+                                    .copy         = copy_channels_
+                                                        ? &channels_[static_cast<std::size_t>(rank)]
+                                                        : nullptr};
 }
 
 } // namespace ninfer

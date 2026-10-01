@@ -1,6 +1,7 @@
 // Two-device qualification of the tensor-parallel collectives: FP64 oracle for the residual
 // all-reduce, exact comparison for the row gather, bit-identity of the two ranks, back-to-back
-// chains without host synchronization, and independent per-rank CUDA Graph capture.
+// chains without host synchronization, independent per-rank CUDA Graph capture, and the
+// copy-channel asynchronous all-reduce.
 #include "ninfer/ops/tensor_parallel.h"
 #include "ops/op_tester.h"
 
@@ -285,6 +286,141 @@ int mixed_chain_case(TensorParallelLink& link, const std::array<int, 2>& devices
     return failures;
 }
 
+// Copy-channel collectives as the prefill pipeline issues them: a mixer stage of column-slice
+// all-reduces left in flight, then an FFN stage that waits each mixer slice before issuing its
+// own, with a synchronous decode-sized collective interleaved and rank 1 lagging. Results must
+// match the synchronous collective's bits on both ranks.
+int async_case(TensorParallelLink& link, const std::array<int, 2>& devices) {
+    constexpr std::int32_t kRows    = 5120;
+    constexpr std::int32_t kColumns = 2048;
+    constexpr int kSlices           = 4;
+    constexpr int kLayers           = 3;
+    constexpr std::int32_t kSlice   = kColumns / kSlices;
+    const std::size_t count         = std::size_t(kRows) * kColumns;
+    std::vector<float> residual0(count);
+    fill_uniform(residual0, 500, -1.0f, 1.0f);
+    round_to_bf16(residual0);
+    // partials[rank][stage]: stage 2l is layer l's mixer, 2l+1 its FFN.
+    std::array<std::vector<std::vector<float>>, 2> partials;
+    for (int r = 0; r < 2; ++r) {
+        partials[r].resize(2 * kLayers);
+        for (int k = 0; k < 2 * kLayers; ++k) {
+            partials[r][k].resize(count);
+            fill_uniform(partials[r][k], 600 + 13 * k + 1000 * r, -0.5f, 0.5f);
+            round_to_bf16(partials[r][k]);
+        }
+    }
+    std::array<std::vector<std::uint16_t>, 2> results;
+    std::array<int, 2> asynchronous{};
+    on_ranks(devices, [&](int r) {
+        cudaStream_t stream = nullptr;
+        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+        void* residual = nullptr;
+        void* small    = nullptr;
+        check(cudaMalloc(&residual, count * 2), "residual");
+        check(cudaMalloc(&small, kRows * 2), "small residual");
+        check(cudaMemset(small, 0, kRows * 2), "zero small");
+        const auto bits = bf16_bits(residual0);
+        check(cudaMemcpy(residual, bits.data(), count * 2, cudaMemcpyHostToDevice), "upload");
+        std::vector<void*> staged(2 * kLayers);
+        for (int k = 0; k < 2 * kLayers; ++k) {
+            check(cudaMalloc(&staged[k], count * 2), "partial");
+            const auto pbits = bf16_bits(partials[r][k]);
+            check(cudaMemcpy(staged[k], pbits.data(), count * 2, cudaMemcpyHostToDevice),
+                  "upload partial");
+        }
+        check(cudaDeviceSynchronize(), "uploads");
+        if (r == 1) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); }
+        const auto view = link.view(r);
+        const auto slice = [&](void* base, int index) {
+            return Tensor(static_cast<std::uint16_t*>(base) + std::size_t(kRows) * kSlice * index,
+                          DType::BF16, {kRows, kSlice});
+        };
+        Tensor small_partial(staged[0], DType::BF16, {kRows, 1});
+        Tensor small_residual(small, DType::BF16, {kRows, 1});
+        for (int layer = 0; layer < kLayers; ++layer) {
+            std::array<ops::TensorParallelTicket, kSlices> mixer{};
+            for (int i = 0; i < kSlices; ++i) {
+                Tensor x = slice(residual, i);
+                mixer[i] = ops::tp_residual_allreduce_async(slice(staged[2 * layer], i), x, view,
+                                                            stream);
+                asynchronous[r] += mixer[i] != 0;
+            }
+            ops::tp_residual_allreduce(small_partial, small_residual, view, stream);
+            std::array<ops::TensorParallelTicket, kSlices> ffn{};
+            for (int i = 0; i < kSlices; ++i) {
+                ops::tp_wait(view, mixer[i], stream);
+                Tensor x = slice(residual, i);
+                ffn[i]   = ops::tp_residual_allreduce_async(slice(staged[2 * layer + 1], i), x,
+                                                            view, stream);
+            }
+            for (const auto ticket : ffn) ops::tp_wait(view, ticket, stream);
+        }
+        check(cudaStreamSynchronize(stream), "pipeline");
+        results[r].resize(count);
+        check(cudaMemcpy(results[r].data(), residual, count * 2, cudaMemcpyDeviceToHost),
+              "download");
+        for (void* p : staged) check(cudaFree(p), "free partial");
+        check(cudaFree(residual), "free residual");
+        check(cudaFree(small), "free small");
+        check(cudaStreamDestroy(stream), "stream");
+    });
+    std::vector<float> stored = residual0;
+    for (int k = 0; k < 2 * kLayers; ++k) {
+        for (std::size_t i = 0; i < count; ++i) {
+            const float value = (stored[i] + partials[0][k][i]) + partials[1][k][i];
+            stored[i]         = bf16_to_f32(f32_to_bf16(value));
+        }
+    }
+    const auto expected = bf16_bits(stored);
+    int failures        = 0;
+    if (asynchronous[0] != kSlices * kLayers || asynchronous[1] != kSlices * kLayers) {
+        std::printf("FAIL async pipeline: copy channel not used (%d/%d)\n", asynchronous[0],
+                    asynchronous[1]);
+        ++failures;
+    }
+    failures += verify_exact("async pipeline rank0", results[0], expected);
+    failures += verify_exact("async pipeline rank1", results[1], expected);
+    return failures;
+}
+
+// Throughput of one 2048-column all-reduce, synchronous kernel versus copy channel.
+int async_timing_case(TensorParallelLink& link, std::array<RankBuffers, 2>& ranks,
+                      const std::array<int, 2>& devices) {
+    constexpr int kCalls = 16;
+    std::array<double, 2> sync_us{}, async_us{};
+    on_ranks(devices, [&](int r) {
+        auto& b         = ranks[r];
+        const auto view = link.view(r);
+        Tensor p(b.partial, DType::BF16, {5120, 2048});
+        Tensor x(b.residual, DType::BF16, {5120, 2048});
+        check(cudaMemsetAsync(b.partial, 0, p.bytes(), b.stream), "zero partial");
+        check(cudaMemsetAsync(b.residual, 0, x.bytes(), b.stream), "zero residual");
+        ops::tp_residual_allreduce(p, x, view, b.stream);
+        ops::tp_wait(view, ops::tp_residual_allreduce_async(p, x, view, b.stream), b.stream);
+        check(cudaStreamSynchronize(b.stream), "warm");
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < kCalls; ++i) ops::tp_residual_allreduce(p, x, view, b.stream);
+        check(cudaStreamSynchronize(b.stream), "sync");
+        sync_us[r] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() -
+                                                               start)
+                         .count() /
+                     kCalls;
+        start = std::chrono::steady_clock::now();
+        for (int i = 0; i < kCalls; ++i) {
+            ops::tp_wait(view, ops::tp_residual_allreduce_async(p, x, view, b.stream), b.stream);
+        }
+        check(cudaStreamSynchronize(b.stream), "async");
+        async_us[r] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() -
+                                                                start)
+                          .count() /
+                      kCalls;
+    });
+    std::printf("tp_residual_allreduce [5120,2048]: kernel %.1f us, copy channel %.1f us\n",
+                sync_us[0], async_us[0]);
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -316,6 +452,9 @@ int main() {
     failures += graph_case(link, ranks, devices);
     failures += mixed_chain_case(link, devices);
     failures += residual_case(link, ranks, devices, 5120, 3, 9, 16);
+    failures += async_case(link, devices);
+    failures += async_timing_case(link, ranks, devices);
+    failures += mixed_chain_case(link, devices);
     on_ranks(devices, [&](int r) {
         auto& b = ranks[r];
         cudaFree(b.partial);
