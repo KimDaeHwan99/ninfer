@@ -270,7 +270,10 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
             {&instance->parameters, peer->parameters.get()},
             {std::move(sequence), std::move(peer_sequence)}, {&device, &peer->device},
             {&peer->views[0], &peer->views[1]}, options.startup_observer);
+        // Synchronize the peer's stream from its own device context.
+        peer->device.bind_to_current_thread();
         peer->device.synchronize();
+        device.bind_to_current_thread();
         instance->peer = std::move(peer);
     } else {
         instance->program = models::qwen3_5::create_program(
