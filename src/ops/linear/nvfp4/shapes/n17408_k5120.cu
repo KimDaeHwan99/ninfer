@@ -13,7 +13,6 @@ using C2      = Nvfp4A16SimtSchedule<8, 1, 2, 16, 2, 1, Nvfp4SimtActivationAcces
 using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using T64R128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 4, 2, 1>;
 using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using T128R128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
@@ -34,10 +33,11 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 }
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
+    // RTX 5060 Ti: the TMA pipeline wins from 144 tokens (T=2048 2.12 -> 1.06 ms).
+    if (tokens > 128) return nvfp4_a4_tma_route<Nvfp4GeometryId::N17408K5120>();
     if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R128>();
     if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T64R128>();
-    if (tokens <= 128) return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
-    return nvfp4_a4_mma_route<Geometry, T128R128Resident>();
+    return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
 }
 
 bool uses_a4(std::int32_t, std::int32_t) { return true; }

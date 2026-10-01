@@ -35,6 +35,10 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 }
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
+    // RTX 5060 Ti: the TMA pipeline wins at 192-256 and from 448 tokens (T=2048 758 -> 585 us);
+    // its 256-token tiles leave the MMA routes ahead at 257-384.
+    if (tokens >= 448 || (tokens >= 192 && tokens <= 256))
+        return nvfp4_a4_tma_route<Nvfp4GeometryId::N5120K8704>();
     if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R64>();
     if (tokens <= 128) return nvfp4_a4_mma_route<Geometry, T32R128>();
     if (tokens <= 192) return nvfp4_a4_mma_route<Geometry, T64R128>();
