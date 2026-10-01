@@ -117,11 +117,17 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const auto& k      = matrix(inputs[1]);
     const auto& third  = matrix(inputs[2]);
     const auto& fourth = matrix(inputs[3]);
-    const bool dense =
-        attention ? q == std::vector<std::uint64_t>{6144, 5120} &&
-                        k == std::vector<std::uint64_t>{1024, 5120} && third == q && fourth == k
-                  : q == std::vector<std::uint64_t>{2048, 5120} && k == q &&
-                        third == std::vector<std::uint64_t>{6144, 5120} && fourth == third;
+    // The 27B profile, or one rank's half of its heads under a two-way tensor-parallel split.
+    const auto dense_profile = [&](std::uint64_t parts) {
+        return attention ? q == std::vector<std::uint64_t>{6144 / parts, 5120} &&
+                               k == std::vector<std::uint64_t>{1024 / parts, 5120} &&
+                               third == q && fourth == k
+                         : q == std::vector<std::uint64_t>{2048 / parts, 5120} && k == q &&
+                               third == std::vector<std::uint64_t>{6144 / parts, 5120} &&
+                               fourth == third;
+    };
+    const bool shard = dense_profile(2);
+    const bool dense = dense_profile(1) || shard;
     const bool moe =
         attention ? q == std::vector<std::uint64_t>{4096, 2048} &&
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
@@ -139,7 +145,7 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
         require(supported, "input projection: unsupported single-parent format");
         return result;
     }
-    require(dense, "input projection: unsupported multi-parent geometry");
+    require(dense && !shard, "input projection: unsupported multi-parent geometry");
     const auto first  = single(inputs.first<2>());
     const auto second = single(inputs.last<2>());
     require(first.weight.qtype == QType::Q4_G64_FP16 && second.weight.qtype == QType::Q5_G64_FP16,
@@ -189,6 +195,7 @@ ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const
 ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const WeightInput& b) {
     const auto& shape = matrix(a);
     require(shape == matrix(b) && (shape == std::vector<std::uint64_t>{48, 5120} ||
+                                   shape == std::vector<std::uint64_t>{24, 5120} ||
                                    shape == std::vector<std::uint64_t>{32, 2048}),
             "GDN control: unsupported A/B geometry");
     const std::array inputs{a, b};

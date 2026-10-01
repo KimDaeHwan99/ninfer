@@ -11,12 +11,12 @@ namespace ninfer::ops::detail {
 namespace {
 // Each head computes both control dots and the complete norm. RMS scaling can be
 // applied after the dots; h is independently rounded from the full normalized input.
-template <int Tile, int Threads>
+template <int H, int Tile, int Threads>
 __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
     const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
     float* beta, int tokens, float eps) {
-    constexpr int D = 5120, H = 48, Warps = Threads / 32;
+    constexpr int D = 5120, Warps = Threads / 32;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.x,
               first = blockIdx.y * Tile;
     float aa[Tile]{}, bb[Tile]{}, ss[Tile]{};
@@ -75,8 +75,9 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
         }
     }
     __syncthreads();
-    // Disjoint, pair-aligned h slices across the 48 heads avoid a separate norm kernel.
+    // Disjoint, pair-aligned h slices across the heads avoid a separate norm kernel.
     constexpr int PairsPerHead = (D / 2 + H - 1) / H;
+    static_assert(PairsPerHead <= Threads);
     const int pair             = head * PairsPerHead + tid;
     if (tid < PairsPerHead && pair < D / 2) {
         const float2 n = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(nw)[pair]);
@@ -96,9 +97,12 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
                                          Tensor& beta, cudaStream_t stream) {
+    // 48 heads for the full 27B layer, 24 for one tensor-parallel rank's half.
+    const int heads   = a_weight.n;
     const auto launch = [&]<int T, int Threads>() {
-        gdn_norm_gating_27_simt<T, Threads>
-            <<<dim3(48, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
+        const auto kernel = heads == 24 ? gdn_norm_gating_27_simt<24, T, Threads>
+                                        : gdn_norm_gating_27_simt<48, T, Threads>;
+        kernel<<<dim3(heads, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const __nv_bfloat16*>(norm_weight.data),
                 static_cast<const __nv_bfloat16*>(a_weight.qdata),

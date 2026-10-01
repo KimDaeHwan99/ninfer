@@ -16,14 +16,10 @@ void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor&
     using Geometry = Fp8N14336K5120;
     // Keep six CTAs resident with the four-segment output (39 registers, no spills).
     using Schedule = Fp8A16GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 6>;
-    const Fp8AttentionInputOutput output{
-        static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(k.data),
-        static_cast<__nv_bfloat16*>(gate.data),
-        static_cast<__nv_bfloat16*>(v.data),
-    };
-    launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
-        fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+    with_fp8_attention_output(weight.n, q.data, k.data, gate.data, v.data, [&](const auto& output) {
+        launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+            fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+    });
 }
 
 } // namespace ninfer::ops::detail

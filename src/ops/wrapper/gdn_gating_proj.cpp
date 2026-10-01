@@ -57,6 +57,11 @@ GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
         require_bf16_weight(parent, 64, 2048, "ab_weight");
         return {.input_rows = 2048, .heads = 32};
     }
+    if (parent.n == 48 && parent.k == 5120) {
+        // One tensor-parallel rank's half of the 27B value heads.
+        require_bf16_weight(parent, 48, 5120, "ab_weight");
+        return {.input_rows = 5120, .heads = 24};
+    }
     throw std::invalid_argument("gdn_gating_proj: unsupported ab_weight geometry");
 }
 

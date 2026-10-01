@@ -22,6 +22,13 @@ using Q8N12288K2048  = Q8LinearGeometry<12288, 2048>;
 using Q8N14336K5120  = Q8LinearGeometry<14336, 5120>;
 using Q8N34816K5120  = Q8LinearGeometry<34816, 5120>;
 using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
+// Tensor-parallel rank shards of the 27B MTP layer.
+using Q8N512K5120    = Q8LinearGeometry<512, 5120>;
+using Q8N3072K5120   = Q8LinearGeometry<3072, 5120>;
+using Q8N7168K5120   = Q8LinearGeometry<7168, 5120>;
+using Q8N17408K5120  = Q8LinearGeometry<17408, 5120>;
+using Q8N5120K3072   = Q8LinearGeometry<5120, 3072>;
+using Q8N5120K8704   = Q8LinearGeometry<5120, 8704>;
 
 // The dispatcher admits N/K and positive T; each shape owns its complete T selection.
 [[nodiscard]] Q8Launch select_q8_n1024_k2048(std::int32_t tokens);
@@ -41,5 +48,11 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n14336_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n34816_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n248320_k5120(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n512_k5120(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n3072_k5120(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n7168_k5120(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n17408_k5120(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n5120_k3072(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n5120_k8704(std::int32_t tokens);
 
 } // namespace ninfer::ops::detail

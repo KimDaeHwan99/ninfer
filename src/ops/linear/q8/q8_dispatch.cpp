@@ -28,7 +28,10 @@ constexpr std::array kShapes{
     shape<Q8N5120K25600>(select_q8_n5120_k25600),   shape<Q8N6144K5120>(select_q8_n6144_k5120),
     shape<Q8N9216K2048>(select_q8_n9216_k2048),     shape<Q8N12288K2048>(select_q8_n12288_k2048),
     shape<Q8N14336K5120>(select_q8_n14336_k5120),   shape<Q8N34816K5120>(select_q8_n34816_k5120),
-    shape<Q8N248320K5120>(select_q8_n248320_k5120),
+    shape<Q8N248320K5120>(select_q8_n248320_k5120), shape<Q8N3072K5120>(select_q8_n3072_k5120),
+    shape<Q8N7168K5120>(select_q8_n7168_k5120),     shape<Q8N17408K5120>(select_q8_n17408_k5120),
+    shape<Q8N5120K3072>(select_q8_n5120_k3072),     shape<Q8N5120K8704>(select_q8_n5120_k8704),
+    shape<Q8N512K5120>(select_q8_n512_k5120),
 };
 } // namespace
 

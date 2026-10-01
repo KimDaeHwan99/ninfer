@@ -11,7 +11,7 @@ constexpr int kGroupedPrefillMaxWidth = 256;
 
 Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope) {
-    if ((heads != 24 && heads != 16) || width < 1 || batch < 1 || batch > 8 ||
+    if ((heads != 24 && heads != 16 && heads != 12) || width < 1 || batch < 1 || batch > 8 ||
         (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)

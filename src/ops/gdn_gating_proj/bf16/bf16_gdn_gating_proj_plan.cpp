@@ -66,6 +66,12 @@ bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
 }
 
+// One tensor-parallel rank's half of the 27B value heads. Only the fused norm/control route
+// registers this geometry.
+bool is_27_shard(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 24 && problem.input_rows == 5120;
+}
+
 bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
 }
@@ -370,6 +376,9 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
 }
 
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
+    if (is_27_shard(problem) && problem.cols >= 1) {
+        return {Bf16GdnNormGatingScheduleId::FusedSimt27, Bf16GdnGatingPlan{}, 0};
+    }
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
@@ -390,6 +399,12 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
                                                           std::int32_t min_cols,
                                                           std::int32_t max_cols) {
+    if (heads == 24 && input_rows == 5120) {
+        if (min_cols <= 0 || max_cols < min_cols) {
+            throw std::invalid_argument("BF16 GDN gating: invalid column interval");
+        }
+        return 0;
+    }
     std::size_t maximum =
         bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
     if (heads == 48 && input_rows == 5120) {

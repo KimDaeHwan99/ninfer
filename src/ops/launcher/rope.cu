@@ -110,6 +110,17 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
                 return true;
             }
         }
+        // One tensor-parallel rank's half of the 27B attention heads.
+        if (q.ne[1] == 12 && k.ne[1] == 2) {
+            if (axes == 1) {
+                launch_fixed<RopeKernelMode::Text1D, 12, 2>(positions, &q, &k, stream);
+                return true;
+            }
+            if (axes == 3) {
+                launch_fixed<RopeKernelMode::TextMrope, 12, 2>(positions, &q, &k, stream);
+                return true;
+            }
+        }
     }
     if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && q.ne[1] == 16 && k.ne[1] == 16) {
         launch_fixed<RopeKernelMode::Vision2D, 16, 16>(positions, &q, &k, stream);
@@ -155,6 +166,7 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
         if (launch_text_single<24>(positions, axes, x, stream) ||
             launch_text_single<4>(positions, axes, x, stream) ||
             launch_text_single<16>(positions, axes, x, stream) ||
+            launch_text_single<12>(positions, axes, x, stream) ||
             launch_text_single<2>(positions, axes, x, stream)) {
             return true;
         }

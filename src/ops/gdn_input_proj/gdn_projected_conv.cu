@@ -126,6 +126,13 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
                                        initial_state_slots, query, key, value, publish, stream);
         return;
     }
+    // One tensor-parallel rank's half of the 27B key and value heads.
+    if (projected.ne[0] == 5120 && query.ne[0] == 1024 && key.ne[0] == 1024 &&
+        value.ne[0] == 3072) {
+        launch<5120, 1024, 1024, 3072>(projected, conv_weight, state_read, valid_columns,
+                                       initial_state_slots, query, key, value, publish, stream);
+        return;
+    }
     throw std::invalid_argument("GDN projected-conv received an unregistered geometry");
 }
 

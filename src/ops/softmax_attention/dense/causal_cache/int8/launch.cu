@@ -64,6 +64,8 @@ void execute_grouped(const Tensor& q, const Tensor& positions, float scale,
     const auto p = make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys);
     if (plan.query_heads == 24)
         grouped_instance<CausalD256H24Kv4>(p, view, input, plan.partition, partial.view(), stream);
+    else if (plan.query_heads == 12)
+        grouped_instance<CausalD256H12Kv2>(p, view, input, plan.partition, partial.view(), stream);
     else
         grouped_instance<CausalD256H16Kv2>(p, view, input, plan.partition, partial.view(), stream);
 }
@@ -101,6 +103,9 @@ void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
     if (plan.query_heads == 24)
         parallel_grouped<CausalD256H24Kv4, Int8KvCausalPlan::kTokenTile>(p, cache, plan.partition,
                                                                          partial.view(), stream);
+    else if (plan.query_heads == 12)
+        parallel_grouped<CausalD256H12Kv2, Int8KvCausalPlan::kTokenTile>(p, cache, plan.partition,
+                                                                         partial.view(), stream);
     else
         parallel_grouped<CausalD256H16Kv2, Int8KvCausalPlan::kTokenTile>(p, cache, plan.partition,
                                                                          partial.view(), stream);
@@ -109,6 +114,8 @@ void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
 void tiled(const CausalAttentionOperands& p, Int8KvReadView cache, cudaStream_t stream) {
     if (p.query_heads == 24)
         launch_int8_kv_tiled_mma<CausalD256H24Kv4, Int8KvTiledInstance>(p, cache, stream);
+    else if (p.query_heads == 12)
+        launch_int8_kv_tiled_mma<CausalD256H12Kv2, Int8KvTiledInstance>(p, cache, stream);
     else
         launch_int8_kv_tiled_mma<CausalD256H16Kv2, Int8KvTiledInstance>(p, cache, stream);
 }

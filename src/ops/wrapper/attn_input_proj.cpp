@@ -126,10 +126,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        // The full 27B profile, or one tensor-parallel rank's half of its heads.
         constexpr std::int32_t kHidden = 5120;
-        constexpr std::int32_t kQRows  = 6144;
-        constexpr std::int32_t kKvRows = 1024;
-        constexpr std::int32_t kRows   = 14336;
+        const bool shard               = weight.n == 7168;
+        const std::int32_t kQRows      = shard ? 3072 : 6144;
+        const std::int32_t kKvRows     = shard ? 512 : 1024;
+        const std::int32_t kRows       = shard ? 7168 : 14336;
         const std::int32_t cols        = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
         require_matrix(x, kHidden, cols, "x");
@@ -184,7 +186,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16:
-        if (parent_rows != detail::Fp8N14336K5120::kOutputRows ||
+        if ((parent_rows != detail::Fp8N14336K5120::kOutputRows && parent_rows != 7168) ||
             input_rows != detail::Fp8N14336K5120::kInputRows) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported FP8 profile");
         }
