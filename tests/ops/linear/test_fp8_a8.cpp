@@ -4,6 +4,7 @@
 #include <array>
 #include <exception>
 #include <iostream>
+#include <tuple>
 
 namespace {
 
@@ -210,6 +211,23 @@ int run_fp8_a8() {
                       << " K=" << problem.input_rows << '\n';
             ++failures;
         }
+    }
+    // Tensor-parallel rank shards: the A8 prefill routes of the row-parallel and gate/up shapes.
+    constexpr std::array shard_invocations{
+        Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{129, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{257, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{385, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{769, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{2048, CallForm::Policy, ops::LinearPolicy::AllowA8},
+    };
+    for (const auto& [n, k, seed] : {std::tuple{5120, 3072, 861U}, std::tuple{5120, 8704, 863U},
+                                     std::tuple{17408, 5120, 865U}}) {
+        failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                              {n, k, seed, Comparison::Sampled, true, shard_invocations});
     }
     return failures;
 }

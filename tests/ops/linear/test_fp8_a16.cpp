@@ -5,6 +5,7 @@
 #include <array>
 #include <exception>
 #include <iostream>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -93,6 +94,15 @@ int run_fp8_a16() {
         run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                   {5120, 17408, 829U, Comparison::Sampled, true, residual17408_invocations});
 
+    // Tensor-parallel rank shards of the 27B row-parallel projections, gate/up and output head.
+    for (const auto& [n, k, seed] : {std::tuple{5120, 3072, 841U}, std::tuple{5120, 8704, 843U},
+                                     std::tuple{17408, 5120, 845U}}) {
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {n, k, seed, Comparison::Sampled, true, a16_capacity_calls()});
+    }
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {124160, 5120, 847U, Comparison::Sampled, true, vocabulary_invocations});
+
     auto packed = make_fp8_weight(14336, 5120, 831U);
     try {
         (void)ops::detail::validate_fp8_weight(packed.weight, "FP8 validator test");
@@ -117,7 +127,9 @@ int run_fp8_a16() {
     invalid.payload_bytes = invalid.payload_bytes - 1;
     expect_invalid("payload bound", invalid);
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
-                        std::pair{248320, 5120}, std::pair{5120, 6144}, std::pair{5120, 17408}}) {
+                        std::pair{248320, 5120}, std::pair{5120, 6144}, std::pair{5120, 17408},
+                        std::pair{5120, 3072}, std::pair{5120, 8704}, std::pair{17408, 5120},
+                        std::pair{124160, 5120}}) {
         failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, n, k);
     }
     return failures;

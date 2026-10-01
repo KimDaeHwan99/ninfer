@@ -317,12 +317,19 @@ int run_nvfp4() {
     return failures;
 }
 
+// Q (=K) and V (=Z) rows of the FP8 parent: the full 27B layer, or one tensor-parallel rank's
+// half of its heads.
+struct GdnRows {
+    std::int32_t query = 2048;
+    std::int32_t value = 6144;
+};
+
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
-                 bool convenience = false, bool replay = false) {
-    constexpr std::int32_t kHidden  = 5120;
-    constexpr std::int32_t kQkvRows = 10240;
-    constexpr std::int32_t kZRows   = 6144;
-    constexpr std::int32_t kRows    = kQkvRows + kZRows;
+                 bool convenience = false, bool replay = false, GdnRows profile = {}) {
+    constexpr std::int32_t kHidden = 5120;
+    const std::int32_t kQkvRows    = 2 * profile.query + profile.value;
+    const std::int32_t kZRows      = profile.value;
+    const std::int32_t kRows       = kQkvRows + kZRows;
     std::vector<float> activation =
         make_bf16_activation(kHidden, tokens, 617U + static_cast<std::uint32_t>(tokens));
     std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
@@ -381,15 +388,16 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
         failures += z.verify_guards("gdn z" + suffix);
         failures += qkv.verify_fully_written("gdn qkv" + suffix);
         failures += z.verify_fully_written("gdn z" + suffix);
-        failures +=
-            verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, 2048, parent.host,
-                                        0, activation, kHidden, tokens, criterion, sample_count);
-        failures +=
-            verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, 2048, 2048, parent.host,
-                                        2048, activation, kHidden, tokens, criterion, sample_count);
-        failures += verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 4096, 6144,
-                                                parent.host, 4096, activation, kHidden, tokens,
+        const std::int32_t q_rows = profile.query, v_rows = profile.value;
+        failures += verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, q_rows,
+                                                parent.host, 0, activation, kHidden, tokens,
                                                 criterion, sample_count);
+        failures += verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, q_rows, q_rows,
+                                                parent.host, q_rows, activation, kHidden, tokens,
+                                                criterion, sample_count);
+        failures += verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 2 * q_rows,
+                                                v_rows, parent.host, 2 * q_rows, activation,
+                                                kHidden, tokens, criterion, sample_count);
         failures += verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host,
                                                 kQkvRows, activation, kHidden, tokens, criterion,
                                                 sample_count);
@@ -447,12 +455,35 @@ int run_fp8() {
     return failures;
 }
 
+// One tensor-parallel rank's FP8 shard: 8 key and 24 value heads in the same Q|K|V|Z order.
+int run_fp8_shard() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kRows   = 8192;
+    constexpr GdnRows kShard{1024, 3072};
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 619U));
+    int failures = 0;
+    for (int tokens : {1, 2, 4, 5, 8, 16, 24, 32, 33, 64, 65, 96, 97, 128, 129})
+        failures += run_fp8_case(parent, tokens, ops::LinearPolicy::A16Only, false, false, kShard);
+    for (const std::int32_t tokens : {1, 4, 16, 17, 32, 33, 64, 65, 128, 129, 191, 192, 193, 255,
+                                      256, 257, 384, 385, 512, 513, 1024, 1025, 2048})
+        failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8, false, false, kShard);
+    for (int tokens : {4, 17, 193, 385})
+        failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8, false, true, kShard);
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--tensor-parallel-only") {
+        const int shard_failures = run_fp8_shard();
+        std::cout << (shard_failures == 0 ? "OK" : "FAIL") << " gdn_input_proj shard\n";
+        return shard_failures == 0 ? 0 : 1;
     }
 
     int failures = 0;
@@ -460,6 +491,7 @@ int main() {
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();
+    failures += run_fp8_shard();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

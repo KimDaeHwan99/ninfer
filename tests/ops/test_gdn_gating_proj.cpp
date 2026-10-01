@@ -30,6 +30,8 @@ struct Geometry {
 constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
 constexpr Geometry kQwen38Parent{"qwen3_8_27b_parent", 5120, 48, true};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
+// One tensor-parallel rank's half of the 27B value heads in a combined parent.
+constexpr Geometry kQwen38Shard{"qwen3_8_27b_tp2_shard", 5120, 24, true};
 
 constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
                                                 /*gross_absolute=*/5.0e-7,
@@ -536,6 +538,14 @@ int main() {
     for (int tokens : {2, 8, 15, 127, 128, 1024, 1025, 2048, 2049, 4097})
         failures += run_norm_projection_case(kQwen35, tokens, 0x7800u + tokens, norm_execution,
                                              tokens == 15);
+
+    // Tensor-parallel shard: the fused norm/control route at every decode, verify and prefill width.
+    for (int tokens : {1, 2, 3, 4, 8, 9, 14, 15, 16, 28, 29, 32, 42, 43, 64, 128, 1024, 2048})
+        failures +=
+            run_norm_projection_case(kQwen38Shard, tokens, 0x9800u + tokens, norm_execution);
+    for (int tokens : {1, 4, 16, 43})
+        failures += run_norm_projection_case(kQwen38Shard, tokens, 0xa800u + tokens,
+                                             norm_execution, true);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";
     return failures == 0 ? 0 : 1;

@@ -45,6 +45,11 @@ int run_nvfp4_a4() {
                           {5120, 6144, 723U, Comparison::Sampled, true, invocations});
     failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
                           {5120, 17408, 725U, Comparison::Sampled, true, invocations});
+    // Tensor-parallel rank shards of the 27B MLP gate/up and down projections.
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {5120, 8704, 727U, Comparison::Sampled, true, invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {17408, 5120, 729U, Comparison::Sampled, true, invocations});
     return failures;
 }
 

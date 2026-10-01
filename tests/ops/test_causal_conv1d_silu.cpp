@@ -751,6 +751,14 @@ int main() {
                                7000U + static_cast<std::uint32_t>(T));
     }
 
+    // One tensor-parallel rank's half of the 27B key and value heads.
+    for (const std::int32_t T : {1, 2, 15, 16, 17, 33, 64, 257, 2048}) {
+        failures += split_case(5120, 1024, 1024, 3072, T, false, false,
+                               8000U + static_cast<std::uint32_t>(T));
+        failures += split_case(5120, 1024, 1024, 3072, T, true, false,
+                               8100U + static_cast<std::uint32_t>(T));
+    }
+
     // The exact-alias state form, on both geometries, across every route boundary.
     for (const std::int32_t T : {1, 2, 15, 16, 17, 32, 33, 64, 65, 257}) {
         failures += split_case(kQwen27Channels, 2048, 2048, 6144, T, true, false,

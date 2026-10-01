@@ -63,9 +63,19 @@ WeightView rows(const WeightParent& parent, std::uint64_t begin, std::uint64_t c
     return {{count, k}, {{&parent, begin * k, (begin + count) * k}}};
 }
 
+// Head rows of the projected Q/gate and K/V outputs: the full 27B layer, or one tensor-parallel
+// rank's half of its heads.
+struct AttentionRows {
+    int query = 6144;
+    int kv    = 1024;
+};
+
 int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* gate_value,
-                               int tokens, ops::LinearPolicy policy, bool replay = false) {
-    constexpr int hidden = 5120, qrows = 6144, kvrows = 1024;
+                               int tokens, ops::LinearPolicy policy, bool replay = false,
+                               AttentionRows profile = {}) {
+    constexpr int hidden = 5120;
+    const int qrows = profile.query, kvrows = profile.kv;
+    const int gate_begin = qrows + kvrows, value_begin = 2 * qrows + kvrows;
     const bool dual      = gate_value != nullptr;
     auto activation      = make_bf16_activation(hidden, tokens, 101U + tokens);
     auto activation_bits = bf16_bits(activation);
@@ -76,16 +86,17 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
                                                       k = key.tensor(), v = value.tensor();
     const auto capacity =
         dual ? 0
-             : ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, 14336,
-                                                             hidden, policy, tokens, tokens);
+             : ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16,
+                                                             2 * (qrows + kvrows), hidden, policy,
+                                                             tokens, tokens);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
     DeviceContext device;
     const auto first    = physical_parent(parent.view());
     const auto second   = gate_value ? physical_parent(gate_value->view()) : first;
     const auto q_weight = rows(first, 0, qrows), k_weight = rows(first, qrows, kvrows);
-    const auto g_weight = rows(dual ? second : first, dual ? 0 : 7168, qrows);
-    const auto v_weight = rows(dual ? second : first, dual ? 6144 : 13312, kvrows);
+    const auto g_weight = rows(dual ? second : first, dual ? 0 : gate_begin, qrows);
+    const auto v_weight = rows(dual ? second : first, dual ? qrows : value_begin, kvrows);
     const auto prepared = ops::prepare_attn_input_proj_weights(
         {q_weight, policy}, {k_weight, policy}, {g_weight, policy}, {v_weight, policy});
     const auto launch = [&] {
@@ -135,11 +146,12 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         failures += verify_output("attn k" + suffix, key, parent.host, qrows, kvrows, activation,
                                   hidden, tokens, criterion, sample_count);
         failures += verify_output("attn gate" + suffix, gate, dual ? gate_value->host : parent.host,
-                                  dual ? 0 : 7168, qrows, activation, hidden, tokens, criterion,
-                                  sample_count);
+                                  dual ? 0 : gate_begin, qrows, activation, hidden, tokens,
+                                  criterion, sample_count);
         failures += verify_output("attn value" + suffix, value,
-                                  dual ? gate_value->host : parent.host, dual ? 6144 : 13312,
-                                  kvrows, activation, hidden, tokens, criterion, sample_count);
+                                  dual ? gate_value->host : parent.host,
+                                  dual ? qrows : value_begin, kvrows, activation, hidden, tokens,
+                                  criterion, sample_count);
         failures += verify_preserved("attn input" + suffix, input, activation_bits);
         failures += scratch.verify_guards(suffix);
         if (workspace.used() != 0 || workspace.peak_used() > capacity) {
@@ -474,6 +486,24 @@ int run_fp8_target() {
     return failures;
 }
 
+// One tensor-parallel rank's FP8 shard: 12 query and 2 KV heads in the same Q|K|G|V order.
+int run_fp8_shard_target() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kRows   = 7168;
+    constexpr AttentionRows kShard{3072, 512};
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 353U));
+    int failures = 0;
+    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+        for (int t : {1, 2, 3, 4, 5, 6, 8, 16, 17, 24, 32, 33, 48, 64, 65, 80, 96, 97, 128, 129,
+                      160, 192, 193, 288, 289, 385, 512, 1024, 2048})
+            failures += run_target_projection_case(parent, nullptr, t, policy, false, kShard);
+        for (int t : {1, 4, 17, 65, 385})
+            failures += run_target_projection_case(parent, nullptr, t, policy, true, kShard);
+    }
+    return failures;
+}
+
 int run_q8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
     constexpr std::int32_t kHidden      = 2048;
     constexpr std::int32_t kQRows       = 4096;
@@ -637,8 +667,10 @@ int run_weight_inputs() {
 int main(int argc, char** argv) {
     const bool dflash2_only = argc == 2 && std::string(argv[1]) == "--dflash2-only";
     const bool inputs_only  = argc == 2 && std::string(argv[1]) == "--weight-inputs-only";
-    if (argc != 1 && !dflash2_only && !inputs_only) {
-        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only]\n";
+    const bool shard_only   = argc == 2 && std::string(argv[1]) == "--tensor-parallel-only";
+    if (argc != 1 && !dflash2_only && !inputs_only && !shard_only) {
+        std::cerr << "usage: ninfer_attn_input_proj_test "
+                     "[--dflash2-only|--weight-inputs-only|--tensor-parallel-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -648,11 +680,17 @@ int main(int argc, char** argv) {
 
     int failures = 0;
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
+    if (shard_only) {
+        const int shard_failures = run_fp8_shard_target();
+        std::cout << (shard_failures ? "FAIL" : "PASS") << " attn_input_proj tensor-parallel shard\n";
+        return shard_failures == 0 ? 0 : 1;
+    }
     if (!dflash2_only) {
         failures += run_q4_q5();
         failures += run_bf16_target();
         failures += run_nvfp4_target();
         failures += run_fp8_target();
+        failures += run_fp8_shard_target();
         failures += run_q8_target();
         failures += run_q8_companion();
     }

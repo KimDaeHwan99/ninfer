@@ -27,8 +27,9 @@ constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{1.0 / 256.
                                                                       2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 
-constexpr std::int32_t kQueryRows = 2048;
-constexpr std::int32_t kKeyRows   = 2048;
+// Query/key rows of the exercised profile; a tensor-parallel rank's shard halves them.
+std::int32_t kQueryRows = 2048;
+std::int32_t kKeyRows   = 2048;
 
 // The FP64 formula is complete either way; the sample count only decides how many output rows
 // and state channels are handed to the comparison. `full_reference` compares every row and
@@ -1141,12 +1142,76 @@ int run_fp8() {
     return failures;
 }
 
+// One tensor-parallel rank's FP8 shard: 8 key and 24 value heads through the composed route.
+int run_fp8_shard() {
+    kQueryRows = 1024;
+    kKeyRows   = 1024;
+    constexpr std::int32_t kHidden    = 5120;
+    constexpr std::int32_t kValueRows = 3072;
+    constexpr std::int32_t kChannels  = 5120;
+    constexpr std::int32_t kRows      = kChannels + kValueRows;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 931U));
+    int failures = 0;
+    const auto run_batched = [&](std::int32_t width, std::int32_t batch,
+                                 std::vector<std::int32_t> valid_columns, ops::LinearPolicy policy,
+                                 std::uint32_t seed) {
+        const std::vector<float> conv_weight = make_conv_weight(kChannels, seed);
+        const bool uses_a8 = policy == ops::LinearPolicy::AllowA8 && width * batch >= 17;
+        const std::size_t workspace_bytes =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, policy, batch, width, width);
+        return run_batched_case(
+            "FP8 shard policy=" + std::to_string(static_cast<int>(policy)) +
+                " B=" + std::to_string(batch) + " W=" + std::to_string(width),
+            kHidden, kValueRows, kValueRows, width, batch, std::move(valid_columns), conv_weight,
+            workspace_bytes,
+            uses_a8 ? kFp8GdnInputProjConvSnapshotA8Tolerance
+                    : kFp8GdnInputProjConvSnapshotA16Tolerance,
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, kChannels + row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                                  snapshot_base, q, k, v, z, policy, workspace,
+                                                  nullptr);
+            });
+    };
+    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+        failures += run_batched(1, 1, {}, policy, 951U);
+        failures += run_batched(1, 2, {1, 1}, policy, 953U);
+        failures += run_batched(1, 8, {1, 1, 1, 0, 1, 1, 1, 1}, policy, 955U);
+        failures += run_batched(4, 1, {4}, policy, 957U);
+        failures += run_batched(4, 2, {4, 2}, policy, 959U);
+        failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, policy, 961U);
+    }
+    failures += parent.verify_preserved("batched FP8 shard parent weight");
+    kQueryRows = 2048;
+    kKeyRows   = 2048;
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--tensor-parallel-only") {
+        const int shard_failures = run_fp8_shard();
+        std::cout << (shard_failures == 0 ? "OK" : "FAIL")
+                  << " gdn_input_proj_conv_snapshot shard\n";
+        return shard_failures == 0 ? 0 : 1;
     }
 
     int failures = 0;
@@ -1201,6 +1266,7 @@ int main() {
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();
+    failures += run_fp8_shard();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

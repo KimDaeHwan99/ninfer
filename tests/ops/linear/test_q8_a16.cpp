@@ -20,7 +20,10 @@ constexpr std::array kGeometries{
     Geometry{5120, 4608, 281U},  Geometry{5120, 6144, 239U},  Geometry{5120, 10240, 211U},
     Geometry{5120, 17408, 241U}, Geometry{5120, 25600, 293U}, Geometry{6144, 5120, 227U},
     Geometry{9216, 2048, 263U},  Geometry{12288, 2048, 269U}, Geometry{14336, 5120, 229U},
-    Geometry{34816, 5120, 233U}, Geometry{248320, 5120, 197U}};
+    Geometry{34816, 5120, 233U}, Geometry{248320, 5120, 197U},
+    // Tensor-parallel rank shards of the 27B MTP layer.
+    Geometry{512, 5120, 301U},   Geometry{3072, 5120, 303U},  Geometry{7168, 5120, 305U},
+    Geometry{17408, 5120, 307U}, Geometry{5120, 3072, 309U},  Geometry{5120, 8704, 311U}};
 
 int q8_a16_conformance() {
     int failures = 0;

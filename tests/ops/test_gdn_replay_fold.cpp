@@ -22,6 +22,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -30,7 +31,8 @@ using namespace ninfer::test;
 namespace {
 
 constexpr std::int32_t kStateDim       = 128;
-constexpr std::int32_t kQkHeads        = 16;
+// Key heads of the exercised profile; a tensor-parallel rank's shard runs with 8.
+std::int32_t kQkHeads = 16;
 constexpr std::int32_t kRecordCapacity = 8;
 constexpr std::size_t kGuardBytes      = 256;
 
@@ -754,10 +756,27 @@ int run_record_fold_rounds() {
 
 } // namespace
 
-int main() {
+int run_shard_cases() {
+    // One tensor-parallel rank's half of the 27B heads: 8 key heads, 24 value heads.
+    kQkHeads     = 8;
+    int failures = 0;
+    failures += run_case({48, 24, 5120}, 2, 1, {2}, 1871U, true);
+    failures += run_case({48, 24, 5120}, 4, 1, {3}, 1873U);
+    failures += run_case({48, 24, 5120}, 4, 8, {0, 1, 2, 3, 4, 4, 1, 2}, 1875U, true);
+    failures += run_case({48, 24, 5120}, 16, 8, {0, 1, 2, 3, 7, 13, 15, 16}, 1877U);
+    kQkHeads = 16;
+    return failures;
+}
+
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--tensor-parallel-only") {
+        const int shard_failures = run_shard_cases();
+        std::cout << (shard_failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold shard\n";
+        return shard_failures == 0 ? 0 : 1;
     }
 
     int failures = 0;
@@ -772,6 +791,7 @@ int main() {
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
+    failures += run_shard_cases();
     failures += run_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;

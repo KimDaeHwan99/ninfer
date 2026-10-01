@@ -21,8 +21,9 @@ using namespace ninfer::test::input_projection;
 
 namespace {
 
-constexpr std::int32_t kQueryRows = 2048;
-constexpr std::int32_t kKeyRows   = 2048;
+// Query/key rows of the exercised profile; a tensor-parallel rank's shard halves them.
+std::int32_t kQueryRows = 2048;
+std::int32_t kKeyRows   = 2048;
 
 std::vector<std::uint16_t> make_bf16_bits(std::size_t elements, std::uint32_t seed, float low,
                                           float high) {
@@ -397,15 +398,18 @@ int run_nvfp4() {
 }
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t width, std::int32_t batch,
-                 std::vector<std::int32_t> valid, ops::LinearPolicy policy, std::uint32_t seed) {
+                 std::vector<std::int32_t> valid, ops::LinearPolicy policy, std::uint32_t seed,
+                 std::int32_t value_rows = 6144) {
+    const std::int32_t rows          = 2 * kQueryRows + 2 * value_rows;
     const std::size_t snapshot_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, 16384, 5120, policy, batch, width, width);
+        QType::FP8_E4M3FN_ROW_BF16, rows, 5120, policy, batch, width, width);
     const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, 16384, 5120, policy, batch, width, width);
+        QType::FP8_E4M3FN_ROW_BF16, rows, 5120, policy, batch, width, width);
     return run_case(
-        "FP8 policy=" + std::to_string(static_cast<int>(policy)) + " B=" + std::to_string(batch) +
+        "FP8 rows=" + std::to_string(rows) + " policy=" +
+            std::to_string(static_cast<int>(policy)) + " B=" + std::to_string(batch) +
             " W=" + std::to_string(width),
-        5120, 6144, 6144, width, batch, std::move(valid), snapshot_bytes, record_bytes,
+        5120, value_rows, value_rows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
             Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
@@ -440,12 +444,39 @@ int run_fp8() {
     return failures;
 }
 
+// One tensor-parallel rank's FP8 shard: 8 key and 24 value heads.
+int run_fp8_shard() {
+    kQueryRows = 1024;
+    kKeyRows   = 1024;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, 8192, 5120, 1703U));
+    int failures = 0;
+    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+        for (int width : {2, 3, 4, 5, 6, 8, 16}) {
+            failures += run_fp8_case(parent, width, 1, {}, policy, 1900U + width, 3072);
+            failures +=
+                run_fp8_case(parent, width, 8, ragged(width, 8), policy, 1950U + width, 3072);
+        }
+        for (int batch : {2, 3, 4})
+            failures += run_fp8_case(parent, 4, batch, ragged(4, batch), policy, 2010U + batch, 3072);
+    }
+    failures += parent.verify_preserved("FP8 shard record parent weight");
+    kQueryRows = 2048;
+    kKeyRows   = 2048;
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--tensor-parallel-only") {
+        const int shard_failures = run_fp8_shard();
+        std::cout << (shard_failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record shard\n";
+        return shard_failures == 0 ? 0 : 1;
     }
 
     int failures = 0;
@@ -453,6 +484,7 @@ int main() {
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();
+    failures += run_fp8_shard();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

@@ -461,6 +461,10 @@ int main() {
     }
     failures += run_pair_case({"27b text decode", 256, 64, 1, 1, kTextTheta}, 24, 4, 31);
     failures += run_pair_case({"27b text mrope prefill", 256, 64, 3, 128, kTextTheta}, 24, 4, 4096);
+    // One tensor-parallel rank's half of the 27B heads.
+    failures += run_pair_case({"27b tp2 text decode", 256, 64, 1, 4, kTextTheta}, 12, 2, 31);
+    failures += run_pair_case({"27b tp2 text mrope prefill", 256, 64, 3, 128, kTextTheta}, 12, 2,
+                              4096);
     failures +=
         run_pair_case({"35b text native-context tail", 256, 64, 1, 7, kTextTheta}, 16, 2, 262'137);
     failures += run_pair_case({"35b text mrope", 256, 64, 3, 7, kTextTheta}, 16, 2, 2048, 16, 8);

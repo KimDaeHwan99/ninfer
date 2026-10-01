@@ -117,6 +117,8 @@ struct Geometry {
 constexpr Geometry kGeometries[] = {
     {"d256-h24-kv4", 24, 4},
     {"d256-h16-kv2", 16, 2},
+    // One tensor-parallel rank's half of the 27B heads.
+    {"d256-h12-kv2", 12, 2},
 };
 
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
@@ -2270,6 +2272,24 @@ int run_verify_width_cases(KvCacheStorage storage) {
     for (int width : {7, 8, 9, 16})
         for (int batch : {1, 8}) failures += run(width, batch, 127, true);
     failures += run(16, 8, 2048, true);
+    // Speculative verify rounds of one tensor-parallel rank's half of the heads.
+    for (int width = 1; width <= 6; ++width) {
+        for (int batch : {1, 2, 8}) {
+            BatchAttentionCase c{width,
+                                 {},
+                                 {},
+                                 {},
+                                 MappingPattern::Fragmented,
+                                 static_cast<unsigned>(1900 + width + 31 * batch),
+                                 width % 2 == 0};
+            for (int b = 0; b < batch; ++b) {
+                c.contexts.push_back(b % 3 == 0 ? 0 : b % 3 == 1 ? 1041 : 61);
+                c.valid_columns.push_back(b % 2 == 0 ? width : 1);
+                c.table_rows.push_back(order[b]);
+            }
+            failures += run_batch_case(kGeometries[2], storage, c);
+        }
+    }
     for (int width : {8, 9, 16}) {
         failures +=
             run_a1_case(kGeometries[0], storage,
