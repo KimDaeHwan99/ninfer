@@ -43,16 +43,22 @@ hardware comparison. Quick-corpus perplexity at `--tp 2` (`ninfer-perplexity --q
 ## Usage
 
 Requirements are those of upstream NInfer, but with two `sm_120a` GPUs (tested on RTX 5060 Ti 16 GB)
-instead of one RTX 5090. Build as usual, then convert an official v2 download if needed:
+instead of one RTX 5090. Build as usual.
+
+Use the official v3 artifact as published. No conversion is needed, and the branch was verified with
+it (SHA256 `74d2c571…bbb77d82`, same speed as the results below):
 
 ```bash
-python3 tools/upgrade_ninfer_v2_to_v3.py qwen3_8_27b_nvfp4.ninfer qwen3_8_27b_nvfp4.v3.ninfer
+hf download neroued/Qwen3.8-27B-nvfp4-NInfer --local-dir Qwen3.8-27B-nvfp4-NInfer
 ```
+
+An older v2 download also works after `python3 tools/upgrade_ninfer_v2_to_v3.py <v2> <v3>`. The
+results below were first measured that way.
 
 Serve with the configuration used for the results above:
 
 ```bash
-ninfer-serve qwen3_8_27b_nvfp4.v3.ninfer --host 0.0.0.0 --port 8080 \
+ninfer-serve Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --tp 2 --devices 0,1 \
   --kv-dtype fp8 --max-context 65536 --kv-capacity 65536 --max-concurrency 1 \
   --prefill-chunk 8192 --spec mtp --draft-tokens 3 --lm-head-draft
