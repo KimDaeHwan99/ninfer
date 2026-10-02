@@ -13,6 +13,8 @@ operator set the goals, approved each production change and ran the server. Ever
 > 구현(lynx-gt/ninfer-tp2-5060ti) 대비 생성 속도는 약 15% 빠르고, 1.6만 토큰 프롬프트의 첫 응답
 > 시간은 5.2초에서 2.7초로 줄었습니다. 권장 설정(동시 처리 4, KV 자동, 생각 상한 2048)에서는 동시
 > 요청 4개의 전체 처리량이 264 tok/s(1개일 때의 3.4배)이고, 토큰 한도 4096에서 답이 끊기지 않습니다.
+> 실행 옵션은 기준 구현을 그대로 따르지 않고 이 하드웨어(SM 36개, GPU 16GB, RAM 64GB)에 맞게 다시
+> 점검했습니다(아래 "Hardware fit audit").
 
 ## Results
 
@@ -61,19 +63,22 @@ Recommended serving configuration (what the measurements below use unless stated
 ```bash
 ninfer-serve Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --tp 2 --devices 0,1 \
-  --kv-dtype fp8 --max-context 65536 --kv-capacity auto \
-  --max-concurrency 4 --device-state-slots 2 --default-thinking-budget 2048 \
+  --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
+  --max-concurrency 4 --device-state-slots 2 --host-kv-mib 16384 --host-state-slots 16 \
+  --default-thinking-budget 2048 \
   --prefill-chunk 8192 --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
 | Option | Why |
 |---|---|
 | `--kv-dtype fp8` | Same perplexity as bf16 KV (table above), fastest long-context prefill. |
+| `--max-context 131072` | The auto-sized KV pool holds 140,608 tokens, so one request may use up to 131,072 of them. Raising the ceiling from 65,536 did not shrink the pool. |
 | `--kv-capacity auto` | Uses the VRAM left after weights and runtime: 140,608 KV tokens instead of 65,536, so more conversations and shared prompts stay cached on the GPU. Leaves 1 GiB headroom (14.8 GB used per card). |
 | `--max-concurrency 4` | The 27B weights already sit entirely on the GPUs, so spare memory cannot speed up a single request; it buys parallel requests instead (table below). |
+| `--host-kv-mib 16384 --host-state-slots 16` | Pinned host cache for conversations that leave the GPU, doubled from the 8 GiB / 8-slot default. The 64 GB host keeps 34 GB available with the server running. |
 | `--default-thinking-budget 2048` | Caps thinking so the answer fits the request's `max_tokens`. At the cap the engine closes thinking and the model answers (table below). Per-request overrides use Anthropic `thinking.budget_tokens`. |
 | `--prefill-chunk 8192` | Faster first token on long prompts than 4096 (31,306 tokens 6.2 → 6.0 s, 59,417 tokens 14.0 → 13.7 s, measured before the last attention change); short prompts are unaffected. |
-| `--draft-tokens 3 --lm-head-draft` | Best measured MTP setting for both greedy and sampled chat; 2 and 4 drafts were slower on average, and turning off the reduced draft head was about 10% slower. |
+| `--draft-tokens 3 --lm-head-draft` | Best measured MTP setting for single requests; 2 and 4 drafts were slower on average, and turning off the reduced draft head was about 10% slower. With four parallel requests 2, 3 and 4 drafts all reached about 200 tok/s. |
 
 `ninfer` (CLI) and `ninfer-perplexity` accept the same `--tp 2 --devices 0,1`.
 
@@ -126,6 +131,25 @@ small single-sample sets, so differences of one or two items are within sampling
 5. **Device-aware attention.** Causal KV split budgets assumed 170 SMs; they now read the current
    device. FP8 prefill attention accumulates PV per key tile in FP16. Consumer Blackwell runs
    FP32-accumulating MMAs at half rate, so 16K-key attention dropped from 7.01 to 5.22 ms.
+
+## Hardware fit audit
+
+The serving options started from the baseline project's production command. Each was rechecked
+against this machine (36-SM GPUs, 16 GB each, 64 GB host) instead of being copied:
+
+| Item | Before | Now | Evidence |
+|---|---|---|---|
+| KV pool | fixed 65,536 tokens | `auto`, 140,608 tokens | ~2.6 GB per GPU was unused |
+| Request ceiling | 65,536 | 131,072 | pool unchanged |
+| Concurrency | 1 | 4 | 3.4x aggregate output, single request unchanged |
+| Host conversation cache | 8 GiB, 8 slots | 16 GiB, 16 slots | 34 GB host memory still free |
+| Thinking | unlimited | 2048-token budget | no cut-off answers, better scores |
+| FP8 attention/GDN input shards | split-K waves for 170 SMs | 36-SM waves through 1024 / 2048 tokens | 4-11% faster on those widths. Wider inputs keep the old plan, which measured as fast or faster. No change in 16K/31K first-token time. |
+
+Checked and left as is:
+- **RMSNorm prefetch threshold (170 blocks).** It only matters for 24-113-token gated norms, which this workload rarely hits.
+- **Context-cost model.** It has no RTX 5060 Ti preset, so the generic coefficients apply. They overprice recompute by about 1.4x and underprice host transfer by about 2.6x for this TP2 machine. Restoring a cached 4K-token context (~10 ms) still beats recomputing it (~700 ms) by far more than that error, so no cache decision changes.
+- **CPU governor, PCIe ASPM, GPU power limit.** No measurable effect.
 
 ## Findings that may help other consumer-GPU setups
 
