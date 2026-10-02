@@ -182,6 +182,31 @@ Swift 1.5 answered with about a third fewer tokens on coding. Strata's 4-item le
 samples is within noise; with the thinking budget above, ninfer scored 34/42 and 20/20 on the same
 MMLU-Pro and HumanEval items. ninfer reads long prompts 2-3x faster.
 
+### Tuned Strata, 2-bit versus 3-bit
+
+Strata's own calibration (`tools/calibrate.py`) was run for each quant, and both servers got a
+2048-token thinking budget (`reasoning_budget_tokens` in the Strata config, `--default-thinking-budget`
+in ninfer). Calibration kept PCIe share 0 and draft floor 0.7 for IQ2_XS (about +4% decode), and
+3 CPU workers for IQ3_XXS. IQ3_XXS (about 3.1 bits per weight, 76 GB of files) leaves only about
+11 GB of RAM free on this 64 GB machine.
+
+| Test | ninfer, 27B NVFP4 | Strata IQ2_XS | Strata IQ3_XXS |
+|---|---:|---:|---:|
+| Greedy code, 1500 tokens | 95.2 tok/s | 86.8 tok/s | 90.6 tok/s |
+| Sampled essay | 79.0 tok/s | 82.4 tok/s | 78.6 tok/s |
+| Korean explanation | - | 91.6 tok/s | 77.2 tok/s |
+| First token, 15,840-token prompt | 2.65 s | 7.69 s | 7.58 s |
+| First token, 31,325-token prompt | 5.71 s | 12.09 s | 11.73 s |
+| AIME 2025 #6-15 | 4/10 | 3/10 | 3/10 |
+| MMLU-Pro 42 | 34/42 | 33/42 | 35/42 |
+| HumanEval 20 | 20/20 | 19/20 | 19/20 |
+| Truncated answers (72 items) | 0 | 0 | 0 |
+
+The budget removed all of Strata's truncations and cut its average AIME time from 121 s to 39 s
+without losing a point. The 3-bit quant scored 2 more MMLU-Pro items, which is within noise for 42
+single samples, and decoded about 5-15% slower on most prompts. On this hardware ninfer stays
+ahead on speed and long prompts with equal quality.
+
 ## Limits
 
 - Two ranks only, for the Qwen3.5-family 27B dense package. MoE layers have no tensor-parallel split.
