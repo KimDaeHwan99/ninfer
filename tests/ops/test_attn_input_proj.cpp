@@ -496,7 +496,7 @@ int run_fp8_shard_target() {
     int failures = 0;
     for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
         for (int t : {1, 2, 3, 4, 5, 6, 8, 16, 17, 24, 32, 33, 48, 64, 65, 80, 96, 97, 128, 129,
-                      160, 192, 193, 288, 289, 385, 512, 1024, 2048})
+                      160, 192, 193, 288, 289, 385, 512, 1024, 1025, 2048})
             failures += run_target_projection_case(parent, nullptr, t, policy, false, kShard);
         for (int t : {1, 4, 17, 65, 385})
             failures += run_target_projection_case(parent, nullptr, t, policy, true, kShard);

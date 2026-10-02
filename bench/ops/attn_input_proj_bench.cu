@@ -34,7 +34,7 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 
-enum class Format : std::uint8_t { Q4Q5, Q8Qgkv, Q8Qkv, Q8DFlash2Qkv, Bf16, Nvfp4, Fp8, All };
+enum class Format : std::uint8_t { Q4Q5, Q8Qgkv, Q8Qkv, Q8DFlash2Qkv, Bf16, Nvfp4, Fp8, Fp8Shard, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
@@ -74,7 +74,7 @@ struct Measurement {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_attn_input_proj_bench "
-                 "[--format q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|bf16|nvfp4|fp8|all] "
+                 "[--format q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|bf16|nvfp4|fp8|fp8-shard|all] "
                  "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
@@ -134,11 +134,13 @@ Options parse_options(int argc, char** argv) {
                 options.format = Format::Nvfp4;
             else if (value == "fp8")
                 options.format = Format::Fp8;
+            else if (value == "fp8-shard")
+                options.format = Format::Fp8Shard;
             else if (value == "all")
                 options.format = Format::All;
             else
                 usage("--format expects q4q5, q8-qgkv, q8-qkv, q8-dflash2-qkv, bf16, nvfp4, "
-                      "fp8, or all");
+                      "fp8, fp8-shard, or all");
         } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
             if (value == "a16")
@@ -442,6 +444,14 @@ void run_fp8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t s
                     6144, 1024, 14336, weight, flush, stream, results);
 }
 
+// One tensor-parallel rank's half of the 27B attention heads.
+void run_fp8_shard(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
+                   std::vector<Result>& results) {
+    auto weight = bench::make_fp8_weight(7168, 5120);
+    run_four_output(options, "fp8-shard", QType::FP8_E4M3FN_ROW_BF16, options.fp8_policy, false, 5120,
+                    3072, 512, 7168, weight, flush, stream, results);
+}
+
 void write_csv(const Options& options, const std::vector<Result>& results) {
     if (options.csv_out.empty()) return;
     const std::filesystem::path path(options.csv_out);
@@ -510,6 +520,9 @@ int main(int argc, char** argv) {
                             1024, 14336, weight, flush, stream, results);
         }
         if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, stream, results); }
+        if (selected(options.format, Format::Fp8Shard)) {
+            run_fp8_shard(options, flush, stream, results);
+        }
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

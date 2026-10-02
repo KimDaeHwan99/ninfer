@@ -9,6 +9,11 @@ using Tma64x128  = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma192x128 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>;
 using MidBulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>, 170, 4, 8>;
 using Bulk    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+// A tensor-parallel rank's 8192-row shard balances its final wave for an RTX 5060 Ti's 36 SMs
+// through 2048 tokens (T=512 287 -> 268 us, T=1536 831 -> 768 us, T=2048 1071 -> 1044 us); at 3000
+// tokens the 170-CTA plan is 3% faster.
+using ShardMidBulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>, 36, 4, 8>;
+using ShardBulk    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 36, 4, 8>;
 
 } // namespace
 
@@ -36,8 +41,10 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
         if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
         if (x.ne[1] <= 192) return launch.template operator()<Tma192x128>();
         // Smaller output tiles leave only two full-K tiles to split near the 512-token anchor.
-        if (x.ne[1] > 384 && x.ne[1] <= 512) return launch.template operator()<MidBulk>();
-        launch.template operator()<Bulk>();
+        const bool shard = weight.n == 8192 && x.ne[1] <= 2048;
+        if (x.ne[1] > 384 && x.ne[1] <= 512)
+            return shard ? launch.template operator()<ShardMidBulk>() : launch.template operator()<MidBulk>();
+        shard ? launch.template operator()<ShardBulk>() : launch.template operator()<Bulk>();
     });
 }
 } // namespace ninfer::ops::detail

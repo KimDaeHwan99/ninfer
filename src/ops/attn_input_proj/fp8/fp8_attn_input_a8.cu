@@ -9,6 +9,9 @@ using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
 using Tma96x256 = Fp8A8TmaMmaSchedule<96, 256, 128, 3, 4, 2, 1>;
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+// A tensor-parallel rank's 7168-row shard balances its final wave for an RTX 5060 Ti's 36 SMs:
+// T=512 288 -> 256 us, T=1024 520 -> 481 us; from 1536 tokens the 170-CTA plan is as fast or faster.
+using ShardBulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 36, 4, 8>;
 
 } // namespace
 
@@ -39,6 +42,7 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
         if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
         // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
         if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
+        if (weight.n == 7168 && x.ne[1] <= 1024) return launch.template operator()<ShardBulk>();
         launch.template operator()<Bulk>();
     });
 }

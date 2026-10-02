@@ -32,7 +32,7 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 constexpr double kRtx5090DramGBs  = 1792.0;
 
-enum class Format : std::uint8_t { Q4Q5, Q8, Nvfp4, Fp8, All };
+enum class Format : std::uint8_t { Q4Q5, Q8, Nvfp4, Fp8, Fp8Shard, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
@@ -125,10 +125,12 @@ Options parse_options(int argc, char** argv) {
                 options.format = Format::Nvfp4;
             else if (value == "fp8")
                 options.format = Format::Fp8;
+            else if (value == "fp8-shard")
+                options.format = Format::Fp8Shard;
             else if (value == "all")
                 options.format = Format::All;
             else
-                usage("--format expects q4q5, q8, nvfp4, fp8, or all");
+                usage("--format expects q4q5, q8, nvfp4, fp8, fp8-shard, or all");
         } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
             if (value == "a16")
@@ -393,12 +395,13 @@ void run_nvfp4(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t
                    results);
 }
 
+// `shard` is one tensor-parallel rank's half of the 27B heads.
 void run_fp8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
-             std::vector<Result>& results) {
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQkvRows    = 10240;
-    constexpr std::int32_t kZRows      = 6144;
-    constexpr std::int32_t kOutputRows = kQkvRows + kZRows;
+             std::vector<Result>& results, bool shard) {
+    constexpr std::int32_t kHidden = 5120;
+    const std::int32_t kQkvRows    = shard ? 5120 : 10240;
+    const std::int32_t kZRows      = shard ? 3072 : 6144;
+    const std::int32_t kOutputRows = kQkvRows + kZRows;
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     bench::PackedQuantizedWeight parent = bench::make_fp8_weight(kOutputRows, kHidden);
     const std::size_t maximum_workspace = ops::gdn_input_proj_workspace_capacity_bytes(
@@ -420,7 +423,8 @@ void run_fp8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t s
         return ops::gdn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, kOutputRows, kHidden, options.fp8_policy, tokens, tokens);
     };
-    measure_points(options, "fp8", policy_name(options.fp8_policy), kHidden, kOutputRows,
+    measure_points(options, shard ? "fp8-shard" : "fp8", policy_name(options.fp8_policy), kHidden,
+                   kOutputRows,
                    parent.model_weight_bytes(), workspace_capacity, make_launch, flush, stream,
                    results);
 }
@@ -465,7 +469,10 @@ int main(int argc, char** argv) {
         if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
         if (selected(options.format, Format::Q8)) { run_q8(options, flush, stream, results); }
         if (selected(options.format, Format::Nvfp4)) { run_nvfp4(options, flush, stream, results); }
-        if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, stream, results); }
+        if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, stream, results, false); }
+        if (selected(options.format, Format::Fp8Shard)) {
+            run_fp8(options, flush, stream, results, true);
+        }
 
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));

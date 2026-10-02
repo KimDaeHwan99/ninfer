@@ -466,7 +466,7 @@ int run_fp8_shard() {
     for (int tokens : {1, 2, 4, 5, 8, 16, 24, 32, 33, 64, 65, 96, 97, 128, 129})
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::A16Only, false, false, kShard);
     for (const std::int32_t tokens : {1, 4, 16, 17, 32, 33, 64, 65, 128, 129, 191, 192, 193, 255,
-                                      256, 257, 384, 385, 512, 513, 1024, 1025, 2048})
+                                      256, 257, 384, 385, 512, 513, 1024, 1025, 2048, 2049})
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8, false, false, kShard);
     for (int tokens : {4, 17, 193, 385})
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8, false, true, kShard);
