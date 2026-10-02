@@ -10,11 +10,10 @@ operator set the goals, approved each production change and ran the server. Ever
 
 > 한국어 요약: RTX 5060 Ti 16GB 두 장(P2P 없음)에서 Qwen3.8-27B NVFP4를 텐서 병렬로 서빙하는
 > 브랜치입니다. 모든 코드는 Claude Code의 Claude Opus 5.5(Medium)가 작성했습니다. 기준
-> 구현(lynx-gt/ninfer-tp2-5060ti) 대비 생성 속도는 약 15% 빠르고, 1.6만 토큰 프롬프트의 첫 응답
-> 시간은 5.2초에서 2.7초로 줄었습니다. 권장 설정(동시 처리 4, KV 자동, 생각 상한 2048)에서는 동시
-> 요청 4개의 전체 처리량이 264 tok/s(1개일 때의 3.4배)이고, 토큰 한도 4096에서 답이 끊기지 않습니다.
-> 실행 옵션은 기준 구현을 그대로 따르지 않고 이 하드웨어(SM 36개, GPU 16GB, RAM 64GB)에 맞게 다시
-> 점검했습니다(아래 "Hardware fit audit").
+> 구현(lynx-gt/ninfer-tp2-5060ti)보다 생성 속도가 약 15% 빠르고, 1.6만 토큰 프롬프트의 첫 응답
+> 시간은 5.2초에서 2.7초로 줄었습니다. 권장 설정(동시 처리 4, KV 자동, 생각 상한 2048)에서 동시
+> 요청 4개의 전체 처리량은 264 tok/s로, 1개일 때의 3.4배입니다. 실행 옵션은 이 하드웨어(SM 36개,
+> GPU 16GB, RAM 64GB)에 맞게 다시 점검했습니다(아래 "Hardware fit audit").
 
 ## Results
 
@@ -157,55 +156,37 @@ Checked and left as is:
   Host memory bandwidth is the limit, whichever engine (SM loads or copy engines) moves the data.
 - Measured `mma.sync` peaks on RTX 5060 Ti: FP16→FP32 54, FP16→FP16 109, E4M3→FP32 109,
   E4M3→FP16 218 TFLOPS.
-- Decode reaches about 95% of attainable memory bandwidth. CPU performance governor, disabling PCIe
-  ASPM and a 198 W power limit made no measurable difference.
+- Decode reaches about 95% of attainable memory bandwidth.
 
 ## Comparison with Strata and Swift 1.5 Qwen3.8-Flash-Next
 
 Same machine and prompts. [Strata](https://github.com/Niko1221/Strata) v0.1.32 serves
-[Swift 1.5 Qwen3.8-Flash-Next GSQ-RCO IQ2_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
-(125B MoE, 6B active, about 2.4 bits per weight). It splits layers across both GPUs, keeps experts in
-RAM, uses int8 KV and MTP. It fills both GPUs (15.5 GB) and about 40 GB of RAM, so the two servers
-cannot run side by side. ninfer ran with concurrency 1 and no thinking budget for this comparison.
+[Swift 1.5 Qwen3.8-Flash-Next GSQ-RCO](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+(125B MoE, 6B active). It splits layers across both GPUs, keeps experts in RAM and uses int8 KV and
+MTP. It fills both GPUs (15.5 GB each) and 40-46 GB of RAM, so it cannot run beside ninfer. Strata
+was tuned with its own calibration (`tools/calibrate.py`). Both servers used a 2048-token thinking
+budget; ninfer used the recommended configuration above.
 
-| Test | ninfer, Qwen3.8-27B NVFP4 | Strata, Swift 1.5 IQ2_XS |
-|---|---:|---:|
-| Greedy code, 1500 tokens | 95.2 tok/s | 82.3 tok/s |
-| Sampled essay | 79.0 tok/s | 83.0 tok/s |
-| First token, 15,840-token prompt | 2.65 s | 7.64 s |
-| First token, 31,325-token prompt | 5.71 s | 12.08 s |
-| AIME 2025 #6-15 (14K tokens) | 3/10 | 3/10 |
-| MMLU-Pro 42 (4K tokens) | 30/42 | 33/42 |
-| HumanEval 20 (4K tokens) | 18/20 | 19/20 |
-
-Swift 1.5 answered with about a third fewer tokens on coding. Strata's 4-item lead on 72 single
-samples is within noise; with the thinking budget above, ninfer scored 34/42 and 20/20 on the same
-MMLU-Pro and HumanEval items. ninfer reads long prompts 2-3x faster.
-
-### Tuned Strata, 2-bit versus 3-bit
-
-Strata's own calibration (`tools/calibrate.py`) was run for each quant, and both servers got a
-2048-token thinking budget (`reasoning_budget_tokens` in the Strata config, `--default-thinking-budget`
-in ninfer). Calibration kept PCIe share 0 and draft floor 0.7 for IQ2_XS (about +4% decode), and
-3 CPU workers for IQ3_XXS. IQ3_XXS (about 3.1 bits per weight, 76 GB of files) leaves only about
-11 GB of RAM free on this 64 GB machine.
-
-| Test | ninfer, 27B NVFP4 | Strata IQ2_XS | Strata IQ3_XXS |
+| Test | ninfer, 27B NVFP4 | Strata IQ2_XS (2.4 bpw) | Strata IQ3_XXS (3.1 bpw) |
 |---|---:|---:|---:|
 | Greedy code, 1500 tokens | 95.2 tok/s | 86.8 tok/s | 90.6 tok/s |
 | Sampled essay | 79.0 tok/s | 82.4 tok/s | 78.6 tok/s |
-| Korean explanation | - | 91.6 tok/s | 77.2 tok/s |
+| Korean explanation | 64.1 tok/s | 91.6 tok/s | 77.2 tok/s |
 | First token, 15,840-token prompt | 2.65 s | 7.69 s | 7.58 s |
 | First token, 31,325-token prompt | 5.71 s | 12.09 s | 11.73 s |
 | AIME 2025 #6-15 | 4/10 | 3/10 | 3/10 |
 | MMLU-Pro 42 | 34/42 | 33/42 | 35/42 |
 | HumanEval 20 | 20/20 | 19/20 | 19/20 |
 | Truncated answers (72 items) | 0 | 0 | 0 |
+| Parallel requests | 4 | 1 | 1 |
 
-The budget removed all of Strata's truncations and cut its average AIME time from 121 s to 39 s
-without losing a point. The 3-bit quant scored 2 more MMLU-Pro items, which is within noise for 42
-single samples, and decoded about 5-15% slower on most prompts. On this hardware ninfer stays
-ahead on speed and long prompts with equal quality.
+Calibration chose PCIe share 0 and draft floor 0.7 for IQ2_XS, about 4% faster decode, and 3 CPU
+workers for IQ3_XXS. Without calibration and without a thinking budget, IQ2_XS decoded code at
+82.3 tok/s and cut off 10 of the 72 answers. The budget removed every cut-off and reduced the average
+AIME time from 121 s to 39 s without losing a point. IQ3_XXS scored 2 more MMLU-Pro items, which is
+within noise for 42 single samples. It decoded 5-15% slower on most prompts and left only about 11 GB
+of RAM free. Strata writes Korean faster; ninfer reads long prompts 2-3x faster and serves four
+requests at once, at equal quality.
 
 ## Limits
 
