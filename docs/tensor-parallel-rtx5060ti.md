@@ -11,7 +11,8 @@ operator set the goals, approved each production change and ran the server. Ever
 > 한국어 요약: RTX 5060 Ti 16GB 두 장(P2P 없음)에서 Qwen3.8-27B NVFP4를 텐서 병렬로 서빙하는
 > 브랜치입니다. 모든 코드는 Claude Code의 Claude Opus 5.5(Medium)가 작성했습니다. 기준
 > 구현(lynx-gt/ninfer-tp2-5060ti) 대비 생성 속도는 약 15% 빠르고, 1.6만 토큰 프롬프트의 첫 응답
-> 시간은 5.2초에서 2.7초로 줄었습니다.
+> 시간은 5.2초에서 2.7초로 줄었습니다. 권장 설정(동시 처리 4, KV 자동, 생각 상한 2048)에서는 동시
+> 요청 4개의 전체 처리량이 264 tok/s(1개일 때의 3.4배)이고, 토큰 한도 4096에서 답이 끊기지 않습니다.
 
 ## Results
 
@@ -55,16 +56,57 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer --local-dir Qwen3.8-27B-nvfp4-NInfe
 An older v2 download also works after `python3 tools/upgrade_ninfer_v2_to_v3.py <v2> <v3>`. The
 results below were first measured that way.
 
-Serve with the configuration used for the results above:
+Recommended serving configuration (what the measurements below use unless stated otherwise):
 
 ```bash
 ninfer-serve Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --tp 2 --devices 0,1 \
-  --kv-dtype fp8 --max-context 65536 --kv-capacity 65536 --max-concurrency 1 \
+  --kv-dtype fp8 --max-context 65536 --kv-capacity auto \
+  --max-concurrency 4 --device-state-slots 2 --default-thinking-budget 2048 \
   --prefill-chunk 8192 --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
+| Option | Why |
+|---|---|
+| `--kv-dtype fp8` | Same perplexity as bf16 KV (table above), fastest long-context prefill. |
+| `--kv-capacity auto` | Uses the VRAM left after weights and runtime: 140,608 KV tokens instead of 65,536, so more conversations and shared prompts stay cached on the GPU. Leaves 1 GiB headroom (14.8 GB used per card). |
+| `--max-concurrency 4` | The 27B weights already sit entirely on the GPUs, so spare memory cannot speed up a single request; it buys parallel requests instead (table below). |
+| `--default-thinking-budget 2048` | Caps thinking so the answer fits the request's `max_tokens`. At the cap the engine closes thinking and the model answers (table below). Per-request overrides use Anthropic `thinking.budget_tokens`. |
+| `--prefill-chunk 8192` | Faster first token on long prompts than 4096 (31,306 tokens 6.2 → 6.0 s, 59,417 tokens 14.0 → 13.7 s, measured before the last attention change); short prompts are unaffected. |
+| `--draft-tokens 3 --lm-head-draft` | Best measured MTP setting for both greedy and sampled chat; 2 and 4 drafts were slower on average, and turning off the reduced draft head was about 10% slower. |
+
 `ninfer` (CLI) and `ninfer-perplexity` accept the same `--tp 2 --devices 0,1`.
+
+### Concurrency
+
+Sampled 800-token essays sent in parallel to the recommended configuration:
+
+| Parallel requests | Aggregate output |
+|---:|---:|
+| 1 | 77.9 tok/s |
+| 2 | 144.6 tok/s |
+| 4 | 263.9 tok/s |
+
+A single request runs as before (greedy code 95.0 tok/s, 31K-token prompt first token 5.8 s).
+Batched decoding changes floating-point order, so a greedy answer generated alongside others can
+diverge from the same request served alone after a few dozen to a few hundred characters. Accuracy on
+the hard set below did not drop when four requests ran at once.
+
+### Thinking budget
+
+With `max_tokens` 4096, long thinking used the whole budget and the answer was cut off. Measured
+with four parallel requests (temperature 0.6, top_p 0.95, top_k 20; one sample per item):
+
+| `--default-thinking-budget` | MMLU-Pro (42) | HumanEval (20, executed) | Cut off |
+|---|---:|---:|---:|
+| none | 30 | 18 | 9 |
+| 3072 | 33 | 19 | 0 |
+| **2048** | **34** | **20** | **0** |
+| 1024 | 31 | 20 | 0 |
+
+On AIME 2025 problems 6-15 (`max_tokens` 14000), no budget scored 3/10 with 7 answers cut off and
+119 s per problem. A 2048 budget scored 4/10 with none cut off and 51 s per problem. These are
+small single-sample sets, so differences of one or two items are within sampling noise.
 
 ## What the branch changes
 
@@ -93,6 +135,28 @@ ninfer-serve Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --
   E4M3→FP16 218 TFLOPS.
 - Decode reaches about 95% of attainable memory bandwidth. CPU performance governor, disabling PCIe
   ASPM and a 198 W power limit made no measurable difference.
+
+## Comparison with Strata and Swift 1.5 Qwen3.8-Flash-Next
+
+Same machine and prompts. [Strata](https://github.com/Niko1221/Strata) v0.1.32 serves
+[Swift 1.5 Qwen3.8-Flash-Next GSQ-RCO IQ2_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+(125B MoE, 6B active, about 2.4 bits per weight). It splits layers across both GPUs, keeps experts in
+RAM, uses int8 KV and MTP. It fills both GPUs (15.5 GB) and about 40 GB of RAM, so the two servers
+cannot run side by side. ninfer ran with concurrency 1 and no thinking budget for this comparison.
+
+| Test | ninfer, Qwen3.8-27B NVFP4 | Strata, Swift 1.5 IQ2_XS |
+|---|---:|---:|
+| Greedy code, 1500 tokens | 95.2 tok/s | 82.3 tok/s |
+| Sampled essay | 79.0 tok/s | 83.0 tok/s |
+| First token, 15,840-token prompt | 2.65 s | 7.64 s |
+| First token, 31,325-token prompt | 5.71 s | 12.08 s |
+| AIME 2025 #6-15 (14K tokens) | 3/10 | 3/10 |
+| MMLU-Pro 42 (4K tokens) | 30/42 | 33/42 |
+| HumanEval 20 (4K tokens) | 18/20 | 19/20 |
+
+Swift 1.5 answered with about a third fewer tokens on coding. Strata's 4-item lead on 72 single
+samples is within noise; with the thinking budget above, ninfer scored 34/42 and 20/20 on the same
+MMLU-Pro and HumanEval items. ninfer reads long prompts 2-3x faster.
 
 ## Limits
 
