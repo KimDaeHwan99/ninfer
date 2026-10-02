@@ -80,6 +80,7 @@ ParameterSplit split_for(const std::string& name, const Shape& shape, const Conf
     };
     const auto replicated = ParameterSplit{};
     const auto& text      = full.text;
+    if (name.starts_with("vision/")) { return replicated; }
     if (ends_with(name, "/attention/query") || ends_with(name, "/attention/gate")) {
         return rows(text.attention->num_attention_heads, text.attention->head_dim);
     }
@@ -333,7 +334,8 @@ Config shard_config(const Config& full, TensorParallelPlacement tp) {
         !full.text.gdn) {
         throw ArtifactError("tensor parallel: requires the dense Qwen3.5 text architecture");
     }
-    if (full.vision) { throw ArtifactError("tensor parallel: Vision is not split"); }
+    // Vision stays whole on both ranks: each rank encodes the same media into its replicated
+    // hidden state, so the text layers see identical inputs without a cross-GPU transfer.
     if (full.draft) { throw ArtifactError("tensor parallel: DFlash drafts are not split"); }
     Config out          = full;
     auto& attention     = *out.text.attention;

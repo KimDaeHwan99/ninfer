@@ -112,6 +112,23 @@ On AIME 2025 problems 6-15 (`max_tokens` 14000), no budget scored 3/10 with 7 an
 119 s per problem. A 2048 budget scored 4/10 with none cut off and 51 s per problem. These are
 small single-sample sets, so differences of one or two items are within sampling noise.
 
+### Image input (`--vision`)
+
+`--tp 2` accepts `--vision`. The Vision encoder is not split: both GPUs hold a full copy
+(+0.3 GiB each) and encode the same media, so each rank's replicated hidden state stays identical
+without a cross-GPU transfer. On 16 GB cards the copy and the Vision workspace leave room for
+`--max-context 98304` and an auto KV pool of 114,176 tokens, compared with 131,072 and 140,608 without
+Vision. With 131,072 the minimum runtime reservation no longer fits.
+
+```bash
+ninfer-serve ... --tp 2 --devices 0,1 --vision --max-context 98304 --kv-capacity auto ...
+```
+
+Checked with the bundled example images (scene description, chart text and shapes, a two-image
+difference). All answers matched the images. Text-only speed was unchanged: greedy code 95.0 tok/s,
+first token for a 15,840-token prompt 2.68 s. Repeating the same greedy image request is not
+byte-identical, because the second run reuses cached media and prefix state.
+
 ## What the branch changes
 
 1. **TP2 runtime.** Each GPU runs a full program over its weight shard (SPMD). Attention q/gate/k/v,
@@ -190,7 +207,8 @@ requests at once, at equal quality.
 
 ## Limits
 
-- Two ranks only, for the Qwen3.5-family 27B dense package. MoE layers have no tensor-parallel split.
+- Two ranks only, for the Qwen3.5-family 27B dense package. MoE layers and DFlash drafts have no
+  tensor-parallel split; the Vision encoder is replicated rather than split.
 - The full test suite passes except tests that need the whole model on one GPU (the `*_real` tests).
   TP1 versus TP2 could not be compared end to end on 16 GB cards. The checks used instead were
   bit-identical ranks and a perplexity match against bf16 KV.

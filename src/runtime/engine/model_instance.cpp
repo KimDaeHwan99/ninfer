@@ -67,9 +67,6 @@ void validate_options(const EngineOptions& options) {
             throw std::invalid_argument(
                 "Engine tensor_parallel 2 needs two distinct devices led by the primary device");
         }
-        if (options.enable_vision) {
-            throw std::invalid_argument("tensor-parallel execution does not split Vision");
-        }
         if (options.speculative.backend != SpeculativeBackend::None &&
             options.speculative.backend != SpeculativeBackend::Mtp) {
             throw std::invalid_argument("tensor-parallel execution supports MTP speculation only");
