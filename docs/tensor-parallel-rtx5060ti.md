@@ -12,7 +12,9 @@ operator set the goals, approved each production change and ran the server. Ever
 > 브랜치입니다. 모든 코드는 Claude Code의 Claude Opus 5.5(Medium)가 작성했습니다. 기준
 > 구현(lynx-gt/ninfer-tp2-5060ti)보다 생성 속도가 약 15% 빠르고, 1.6만 토큰 프롬프트의 첫 응답
 > 시간은 5.2초에서 2.7초로 줄었습니다. 권장 설정(동시 처리 4, KV 자동, 생각 상한 2048)에서 동시
-> 요청 4개의 전체 처리량은 264 tok/s로, 1개일 때의 3.4배입니다. 실행 옵션은 이 하드웨어(SM 36개,
+> 요청 4개의 전체 처리량은 264 tok/s로, 1개일 때의 3.4배입니다. Swift 1.5 Flash-Next(Strata)와 비교하면
+> 품질은 같은 수준(72문항 중 58 대 55)이고, 긴 글 읽기는 27B가 2~3배 빠르며, 한국어 출력은 Swift가 약 35%
+> 빠릅니다(아래 "Comparison with Strata"). 실행 옵션은 이 하드웨어(SM 36개,
 > GPU 16GB, RAM 64GB)에 맞게 다시 점검했습니다(아래 "Hardware fit audit").
 
 ## Results
@@ -204,6 +206,33 @@ AIME time from 121 s to 39 s without losing a point. IQ3_XXS scored 2 more MMLU-
 within noise for 42 single samples. It decoded 5-15% slower on most prompts and left only about 11 GB
 of RAM free. Strata writes Korean faster; ninfer reads long prompts 2-3x faster and serves four
 requests at once, at equal quality.
+
+### With image input enabled (current serving setup)
+
+Both servers now run with image input on (`--vision` for ninfer, Strata's GPU image encoder), which
+costs ninfer KV room and Strata some expert-cache VRAM. Same prompts and thinking budget as above.
+
+| Test | ninfer, 27B NVFP4 | Strata IQ2_XS |
+|---|---:|---:|
+| Greedy code, 1500 tokens | 95.0 tok/s | 80.8 tok/s |
+| Korean explanation | 64.6 tok/s | 87.2 tok/s |
+| Sampled essay (2 runs) | 78.7 tok/s | 85.2 tok/s |
+| First token, 15,840-token prompt | 2.68 s | 8.06 s |
+| First token, 31,325-token prompt | 5.73 s | 12.47 s |
+| Four parallel 800-token essays, total | 264 tok/s | one request at a time |
+| GPU memory per card | 14.8 GB | 15.5 GB |
+| System RAM | 24 GB | about 40 GB |
+| KV / context | fp8, 114,176 tokens, 98,304 per request | int8, 32,768 resident + RAM streaming, 65,536 |
+
+The quality rows above were measured before image input was enabled. Without the thinking budget,
+ninfer cut off 16 of the 72 answers and Strata 10. ninfer's 264 tok/s is with four identical essay
+prompts; four different prompts give about 190-200 tok/s.
+
+Which one fits: ninfer for long documents (2-3x faster first token), several requests at once, or a
+machine with less RAM. Strata/Swift 1.5 for one Korean conversation at a time (about 35% faster Korean
+output) on a machine with 64 GB of RAM or more. The two cannot run side by side on these cards; a small
+router can switch engines per request model in about 15-20 s. A one-page version of these tables
+is kept for community sharing.
 
 ## Limits
 
