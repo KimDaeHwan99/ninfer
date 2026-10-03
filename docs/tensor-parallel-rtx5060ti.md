@@ -8,14 +8,53 @@ The branch was written by **Claude Opus 5.5 (medium reasoning effort)** in Claud
 operator set the goals, approved each production change and ran the server. Every commit carries a
 `Co-Authored-By: Claude Opus 5.5` trailer.
 
-> 한국어 요약: RTX 5060 Ti 16GB 두 장(P2P 없음)에서 Qwen3.8-27B NVFP4를 텐서 병렬로 서빙하는
-> 브랜치입니다. 모든 코드는 Claude Code의 Claude Opus 5.5(Medium)가 작성했습니다. 기준
-> 구현(lynx-gt/ninfer-tp2-5060ti)보다 생성 속도가 약 15% 빠르고, 1.6만 토큰 프롬프트의 첫 응답
-> 시간은 5.2초에서 2.7초로 줄었습니다. 권장 설정(동시 처리 4, KV 자동, 생각 상한 2048)에서 동시
-> 요청 4개의 전체 처리량은 264 tok/s로, 1개일 때의 3.4배입니다. Swift 1.5 Flash-Next(Strata)와 비교하면
-> 품질은 같은 수준(72문항 중 58 대 55)이고, 긴 글 읽기는 27B가 2~3배 빠르며, 한국어 출력은 Swift가 약 35%
-> 빠릅니다(아래 "Comparison with Strata"). 실행 옵션은 이 하드웨어(SM 36개,
-> GPU 16GB, RAM 64GB)에 맞게 다시 점검했습니다(아래 "Hardware fit audit").
+> 한국어 요약 (2026-10-03 갱신): RTX 5060 Ti 16GB 두 장(P2P 없음)에서 Qwen3.8-27B를 텐서 병렬로
+> 서빙하는 브랜치입니다. 모든 코드는 Claude Code의 Claude Opus 5.5가 작성했습니다. 현재 권장 구성은
+> QUASAR-QAT 전체 NVFP4 아티팩트 + MTP3 + n-gram 복사 드래프트 + hybrid prefix 캐시입니다. 공식
+> 아티팩트 구성 대비 코드 생성 94.9 → 106 tok/s, 한국어 67.6 → 73~85, 1.6만/3.1만 토큰 첫 응답 2.70/5.71 →
+> 2.37/5.19초, 짧은 요청 첫 응답 0.10 → 0.06~0.08초, 파일을 거의 그대로 다시 쓰는 편집 128 → 396 tok/s,
+> 여러 대화를 번갈아 이어갈 때 첫 응답 0.125 → 0.041초, KV 용량 114K → 223K 토큰입니다. 품질은
+> GSM8K 200문항(193~196 대 195)과 MMLU-Pro 210문항(175 대 172)에서 같은 수준입니다. 아래
+> "2026-10-03 update"에 측정과 근거가 있고, 그 아래 절들은 공식 아티팩트 시절의 기록입니다.
+
+## 2026-10-03 update
+
+The branch now also carries
+[Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom) (89 commits on the same
+upstream base: hybrid prefix cache, ngram copy drafting, programmatic-dependent decode launches,
+tool-call and serving fixes, CUDA Graph allowance from measurement) and two-GPU work that makes those
+features and more artifacts run at `--tp 2`. Ideas and one technique (compiling the parent kernels a
+second time for a shard) come from [ValerioDolci/ninfer-tp2](https://github.com/ValerioDolci/ninfer-tp2).
+
+Recommended serving configuration (production since 2026-10-03):
+
+```bash
+hf download Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer qwen3_8_27b_quasar_nvfp4.ninfer --local-dir models
+ninfer-serve models/qwen3_8_27b_quasar_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
+  --tp 2 --devices 0,1 --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
+  --max-concurrency 4 --host-cache-mib 16384 --default-thinking-budget 2048 \
+  --prefill-chunk 8192 --spec mtp --draft-tokens 3 --lm-head-draft \
+  --ngram-draft-tokens 15 --ngram-min-match 12 --vision
+```
+
+What changed, each measured on the machine below against the previous production
+(official artifact, original prefix cache, image `dbd162d1`):
+
+| Change | Effect on 2x RTX 5060 Ti |
+|---|---|
+| NVFP4 shards of the attention/GDN input and [5120,3072] output projections | All-NVFP4 artifacts run at `--tp 2`. QUASAR-QAT weights take 8.85 GiB per card instead of 10.8: code 94.9 → 106 tok/s, Korean 67.6 → 73, 16K/31K-token first token 2.70/5.71 → 2.43/5.22 s, KV pool 114K → 248K tokens. Shards tested against the FP64 oracle (attention) and bit for bit against the parent (GDN). |
+| Hybrid prefix cache at `--tp 2` | Both ranks publish Host transfers up to the frontier complete on both (deterministic poll), so their prefix indexes stay identical. Three conversations alternating over 12K-token documents: resumed-turn first token 0.107 → 0.041 s. |
+| ngram copy drafting at `--tp 2` + two-width MTP graph families | Copy rounds verify 16 wide, every other round 4 wide on the same frame. Rewriting a source file: 128 → 396 tok/s with ordinary generation unchanged (before the two-width families, ngram cost ordinary generation 10-13 %). |
+| Admission search budget back to upstream's | Wallawalla's 250 ms search spent 40-128 ms per short request once long conversations were cached and found nothing: short-request first token 0.19-0.25 → 0.06 s. |
+| `ninfer-serve` exits with status 2 after an Engine-wide failure | A container restart policy now reloads a dead engine. |
+| DFlash2 at `--tp 2` (replicated drafter) | Works (official artifact: code +31 %, copy edits +65 % over MTP3), but not recommended here: with QUASAR the grafted drafter accepts fewer drafts (Korean 12 % vs 20 %) and costs 60 % of the KV pool. |
+
+Quality of the recommended configuration: GSM8K 200 (zero-shot, greedy) 193-196 against 195 for the
+previous production; MMLU-Pro 210 (15 per category, thinking budget 2048) 175 against 172 for the
+official artifact on the same build. Not adopted, with measurements: `nvfp4` KV, earlier A4 routes,
+ValerioDolci's pipelined mailbox kernel (our collectives already avoid the bottleneck it fixed),
+shorter TP timeouts. Benchmarks: `bench/gsm8k_eval.py`, `bench/multiturn.py`, `bench/copy_edit.py`
+in the operator's workspace; the commits list their own measurements.
 
 ## Results
 

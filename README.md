@@ -1,4 +1,27 @@
-# NInfer — custom fork
+# NInfer — two-GPU fork for 2x RTX 5060 Ti (`tp2-5060ti`)
+
+This fork runs Qwen3.8-27B on **two 16 GB GeForce RTX 5060 Ti cards without P2P**, with two-GPU tensor
+parallelism (`--tp 2 --devices 0,1`). It combines:
+
+- [Neroued/ninfer](https://github.com/Neroued/ninfer) at `d44ab584` (the engine);
+- this fork's two-GPU layer: split weights and collectives over a pinned-host mailbox, NVFP4/FP8 rank
+  shards, Vision, the hybrid prefix cache, ngram copy drafting and DFlash2 at `--tp 2`;
+- [Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom), merged whole (its notes
+  follow below, unchanged);
+- ideas and the shard-compilation technique of [ValerioDolci/ninfer-tp2](https://github.com/ValerioDolci/ninfer-tp2).
+
+Everything this fork adds was written by **Claude Opus 5.5** in Claude Code; a human operator set the
+goals, approved production changes and ran the server. Usage, the recommended configuration and every
+measurement: [Two-GPU tensor parallelism on RTX 5060 Ti](docs/tensor-parallel-rtx5060ti.md).
+
+Production numbers on that machine (QUASAR-QAT all-NVFP4 artifact, MTP3 + ngram copy drafting, hybrid
+prefix cache, 4 concurrent requests, Vision on): greedy code 106 tok/s, Korean 73-85 tok/s, rewriting a
+source file 396 tok/s, first token 0.06 s for a short prompt and 2.4 / 5.2 s for 16K / 31K-token
+prompts, 223K KV tokens; GSM8K 193-196/200 and MMLU-Pro 175/210.
+
+---
+
+# Merged: Wallawalla47/ninfer-custom notes
 
 > **AI disclaimer:** Everything added to this fork, including most of this README, was written with
 > AI (mostly Claude Opus 5.5, Qwen3.8-27B running on NInfer, plus a few other AI systems I’ve been
