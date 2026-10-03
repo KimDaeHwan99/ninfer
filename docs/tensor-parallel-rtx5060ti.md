@@ -231,8 +231,7 @@ prompts; four different prompts give about 190-200 tok/s.
 Which one fits: ninfer for long documents (2-3x faster first token), several requests at once, or a
 machine with less RAM. Strata/Swift 1.5 for one Korean conversation at a time (about 35% faster Korean
 output) on a machine with 64 GB of RAM or more. The two cannot run side by side on these cards; a small
-router can switch engines per request model in about 15-20 s. A one-page version of these tables
-is kept for community sharing.
+router can switch engines per request model in about 15-20 s.
 
 ## Limits
 
