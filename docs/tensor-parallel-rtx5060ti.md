@@ -10,8 +10,8 @@ operator set the goals, approved each production change and ran the server. Ever
 
 > 한국어 요약 (2026-10-03 갱신): RTX 5060 Ti 16GB 두 장(P2P 없음)에서 Qwen3.8-27B를 텐서 병렬로
 > 서빙하는 브랜치입니다. 모든 코드는 Claude Code의 Claude Opus 5.5가 작성했습니다. 현재 권장 구성은
-> QUASAR-QAT 전체 NVFP4 아티팩트 + MTP3 + n-gram 복사 드래프트 + hybrid prefix 캐시입니다. 공식
-> 아티팩트 구성 대비 코드 생성 94.9 → 106 tok/s, 한국어 67.6 → 73~85, 1.6만/3.1만 토큰 첫 응답 2.70/5.71 →
+> QUASAR-QAT 전체 NVFP4 아티팩트 + MTP(드래프트 4) + n-gram 복사 드래프트 + hybrid prefix 캐시입니다. 공식
+> 아티팩트 구성 대비 코드 생성 94.9 → 117 tok/s, 한국어 67.6 → 73~85, 1.6만/3.1만 토큰 첫 응답 2.70/5.71 →
 > 2.37/5.19초, 짧은 요청 첫 응답 0.10 → 0.06~0.08초, 파일을 거의 그대로 다시 쓰는 편집 128 → 396 tok/s,
 > 여러 대화를 번갈아 이어갈 때 첫 응답 0.125 → 0.041초, KV 용량 114K → 223K 토큰입니다. 품질은
 > GSM8K 200문항(193~196 대 195)과 MMLU-Pro 210문항(175 대 172)에서 같은 수준입니다. 아래
@@ -33,7 +33,7 @@ hf download Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer qwen3_8_27b_quasar_nvfp4.
 ninfer-serve models/qwen3_8_27b_quasar_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --tp 2 --devices 0,1 --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
   --max-concurrency 4 --host-cache-mib 16384 --default-thinking-budget 2048 \
-  --prefill-chunk 8192 --spec mtp --draft-tokens 3 --lm-head-draft \
+  --prefill-chunk 8192 --spec mtp --draft-tokens 4 --lm-head-draft \
   --ngram-draft-tokens 15 --ngram-min-match 12 --vision
 ```
 
@@ -47,13 +47,17 @@ What changed, each measured on the machine below against the previous production
 | ngram copy drafting at `--tp 2` + two-width MTP graph families | Copy rounds verify 16 wide, every other round 4 wide on the same frame. Rewriting a source file: 128 → 396 tok/s with ordinary generation unchanged (before the two-width families, ngram cost ordinary generation 10-13 %). |
 | Admission search budget back to upstream's | Wallawalla's 250 ms search spent 40-128 ms per short request once long conversations were cached and found nothing: short-request first token 0.19-0.25 → 0.06 s. |
 | `ninfer-serve` exits with status 2 after an Engine-wide failure | A container restart policy now reloads a dead engine. |
+| `--draft-tokens 4` instead of 3 (with QUASAR and the two-width families) | Three interleaved runs per setting: greedy code 102-106 → 117-120 tok/s, Korean 74.5-75.5 → 73.2-75.9, sampled essay mean 91.1 → 89.8 (−1.4 %, within the run-to-run spread of 84-96), copy edits 388 → 379-386, GSM8K 100 at four parallel requests 96 → 97 correct in 115 → 112 s. Five drafts were no faster than four on code and slower on Korean and copy edits. The older `--draft-tokens 3` advice below predates QUASAR and the two-width families. |
 | DFlash2 at `--tp 2` (replicated drafter) | Works (official artifact: code +31 %, copy edits +65 % over MTP3), but not recommended here: with QUASAR the grafted drafter accepts fewer drafts (Korean 12 % vs 20 %) and costs 60 % of the KV pool. |
 
 Quality of the recommended configuration: GSM8K 200 (zero-shot, greedy) 193-196 against 195 for the
 previous production; MMLU-Pro 210 (15 per category, thinking budget 2048) 175 against 172 for the
 official artifact on the same build. Not adopted, with measurements: `nvfp4` KV, earlier A4 routes,
-ValerioDolci's pipelined mailbox kernel (our collectives already avoid the bottleneck it fixed),
-shorter TP timeouts. Benchmarks: `bench/gsm8k_eval.py`, `bench/multiturn.py`, `bench/copy_edit.py`
+ValerioDolci's pipelined mailbox kernel and wide mailbox slots (our slot is sized for the widest
+exchange, so no staged copies remain), ValerioDolci's four-rows-per-warp [5120,8704] GEMV for
+T=3..5 (on the RTX 5060 Ti 65.5 → 67.6 µs at T=3/4 and 67.6 → 71.7 µs at T=5, slower than the
+sliced-K route kept here), shorter TP timeouts, and a second Wallawalla47 merge (39 commits; equal
+speed in an interleaved A/B, kept on branch `tp2-5060ti-walla2`). Benchmarks: `bench/gsm8k_eval.py`, `bench/multiturn.py`, `bench/copy_edit.py`
 in the operator's workspace; the commits list their own measurements.
 
 ## Results

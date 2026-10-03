@@ -14,10 +14,10 @@ Everything this fork adds was written by **Claude Opus 5.5** in Claude Code; a h
 goals, approved production changes and ran the server. Usage, the recommended configuration and every
 measurement: [Two-GPU tensor parallelism on RTX 5060 Ti](docs/tensor-parallel-rtx5060ti.md).
 
-Production numbers on that machine (QUASAR-QAT all-NVFP4 artifact, MTP3 + ngram copy drafting, hybrid
-prefix cache, 4 concurrent requests, Vision on): greedy code 106 tok/s, Korean 73-85 tok/s, rewriting a
-source file 396 tok/s, first token 0.06 s for a short prompt and 2.4 / 5.2 s for 16K / 31K-token
-prompts, 223K KV tokens; GSM8K 193-196/200 and MMLU-Pro 175/210.
+Production numbers on that machine (QUASAR-QAT all-NVFP4 artifact, MTP with 4 drafts + ngram copy
+drafting, hybrid prefix cache, 4 concurrent requests, Vision on): greedy code 117 tok/s, Korean 73-85
+tok/s, rewriting a source file 379-396 tok/s, first token 0.06 s for a short prompt and 2.4 / 5.2 s for 16K / 31K-token
+prompts, 223K KV tokens; GSM8K 193-196/200 (97/100 with 4 drafts) and MMLU-Pro 175/210 (3 drafts).
 
 ---
 
