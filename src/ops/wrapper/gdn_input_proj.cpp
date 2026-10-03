@@ -6,6 +6,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#include "ops/gdn_input_proj/nvfp4_shard/nvfp4_gdn_input_shard.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
@@ -26,7 +27,8 @@ namespace ninfer::ops {
 namespace {
 
 // One tensor-parallel rank's FP8 QKVZ parent: half of the 27B key and value heads.
-constexpr std::int32_t kFp8GdnShardRows = 8192;
+// One tensor-parallel rank's half of the 27B GDN heads, FP8 or NVFP4.
+constexpr std::int32_t kGdnShardRows = 8192;
 
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -299,10 +301,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
 
     if (weight.qtype == QType::NVFP4) {
+        // The full 27B profile, or one tensor-parallel rank's half of its heads.
         constexpr std::int32_t kHidden  = 5120;
-        constexpr std::int32_t kQkvRows = 10240;
-        constexpr std::int32_t kZRows   = 6144;
-        constexpr std::int32_t kRows    = kQkvRows + kZRows;
+        const bool shard                = weight.n == kGdnShardRows;
+        const std::int32_t kQkvRows     = shard ? 5120 : 10240;
+        const std::int32_t kZRows       = shard ? 3072 : 6144;
+        const std::int32_t kRows        = kQkvRows + kZRows;
         require_matrix(x, kHidden, cols, "x");
         require_matrix(qkv, kQkvRows, cols, "qkv");
         require_matrix(z, kZRows, cols, "z");
@@ -311,6 +315,10 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
         }
+        if (shard) {
+            detail::nvfp4_gdn_input_shard_dispatch(x, weight, qkv, z, policy, workspace, stream);
+            return;
+        }
         detail::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
     }
@@ -318,7 +326,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         // The full 27B profile, or one tensor-parallel rank's half of its heads.
         constexpr std::int32_t kHidden  = 5120;
-        const bool shard                = weight.n == kFp8GdnShardRows;
+        const bool shard                = weight.n == kGdnShardRows;
         const std::int32_t kQkvRows     = shard ? 5120 : 10240;
         const std::int32_t kZRows       = shard ? 3072 : 6144;
         const std::int32_t kRows        = kQkvRows + kZRows;
@@ -422,7 +430,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy);
 
-    if (weight.qtype == QType::NVFP4) {
+    if (weight.qtype == QType::NVFP4 && weight.n != kGdnShardRows) {
         constexpr std::int32_t kHidden     = 5120;
         constexpr std::int32_t kQueryRows  = 2048;
         constexpr std::int32_t kKeyRows    = 2048;
@@ -467,12 +475,17 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         return;
     }
 
-    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && weight.n == kFp8GdnShardRows) {
+    if ((weight.qtype == QType::FP8_E4M3FN_ROW_BF16 || weight.qtype == QType::NVFP4) &&
+        weight.n == kGdnShardRows) {
         // A tensor-parallel rank's shard composes the segmented projection with the generic
         // projected convolution; the fused snapshot routes register only the full profile.
         constexpr std::int32_t kHidden = 5120;
         const ConvGeometry geometry    = require_snapshot_input(x, kHidden);
-        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_snapshot");
+        if (weight.qtype == QType::NVFP4) {
+            detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_snapshot");
+        } else {
+            detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_snapshot");
+        }
         if (weight.k != kHidden) {
             throw std::invalid_argument(
                 "fp8 gdn_input_proj_conv_snapshot: unsupported weight shape");
@@ -598,7 +611,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    cudaStream_t stream) {
     validate_policy(policy);
 
-    if (weight.qtype == QType::NVFP4) {
+    if (weight.qtype == QType::NVFP4 && weight.n != kGdnShardRows) {
         constexpr std::int32_t kHidden     = 5120;
         constexpr std::int32_t kQueryRows  = 2048;
         constexpr std::int32_t kKeyRows    = 2048;
@@ -652,12 +665,17 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         return;
     }
 
-    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && weight.n == kFp8GdnShardRows) {
+    if ((weight.qtype == QType::FP8_E4M3FN_ROW_BF16 || weight.qtype == QType::NVFP4) &&
+        weight.n == kGdnShardRows) {
         // A tensor-parallel rank's shard: segmented projection into the record, then the
         // generic projected convolution.
         constexpr std::int32_t kHidden = 5120;
         const ConvGeometry geometry    = require_record_input(x, kHidden);
-        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_record");
+        if (weight.qtype == QType::NVFP4) {
+            detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_record");
+        } else {
+            detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_record");
+        }
         if (weight.k != kHidden) {
             throw std::invalid_argument("fp8 gdn_input_proj_conv_record: unsupported weight shape");
         }
@@ -791,15 +809,20 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
     if (parent_qtype == QType::NVFP4) {
-        if (parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
+        if ((parent_rows != detail::Nvfp4N16384K5120::kOutputRows &&
+             parent_rows != kGdnShardRows) ||
             input_rows != detail::Nvfp4N16384K5120::kInputRows) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return parent_rows == kGdnShardRows
+                   ? detail::nvfp4_gdn_input_shard_workspace_capacity_bytes(policy, min_tokens,
+                                                                            max_tokens)
+                   : detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens,
+                                                                      max_tokens);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16) {
         if ((parent_rows != detail::Fp8N16384K5120::kOutputRows &&
-             parent_rows != kFp8GdnShardRows) ||
+             parent_rows != kGdnShardRows) ||
             input_rows != detail::Fp8N16384K5120::kInputRows) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported FP8 profile");
         }
@@ -872,8 +895,8 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
-    if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 && parent_rows == kFp8GdnShardRows &&
-        input_rows == detail::Fp8N16384K5120::kInputRows) {
+    if ((parent_qtype == QType::FP8_E4M3FN_ROW_BF16 || parent_qtype == QType::NVFP4) &&
+        parent_rows == kGdnShardRows && input_rows == detail::Fp8N16384K5120::kInputRows) {
         const std::int32_t aggregate_columns   = batch_size * max_width;
         const std::size_t projection_workspace = gdn_input_proj_workspace_capacity_bytes(
             parent_qtype, parent_rows, input_rows, policy, batch_size * min_width,
@@ -929,8 +952,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
-    if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 && parent_rows == kFp8GdnShardRows &&
-        input_rows == detail::Fp8N16384K5120::kInputRows) {
+    if ((parent_qtype == QType::FP8_E4M3FN_ROW_BF16 || parent_qtype == QType::NVFP4) &&
+        parent_rows == kGdnShardRows && input_rows == detail::Fp8N16384K5120::kInputRows) {
         return gdn_input_proj_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows,
                                                        policy, batch_size * min_width,
                                                        batch_size * max_width);

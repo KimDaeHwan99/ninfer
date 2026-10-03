@@ -10,6 +10,11 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_plan.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_shard/nvfp4_gdn_input_shard_decode.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_shard/nvfp4_gdn_input_shard_small_t.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_shard/nvfp4_gdn_input_shard_a16.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_shard/nvfp4_gdn_input_shard_a4.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_shard/nvfp4_gdn_input_shard_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_small_t.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_post.cu"
@@ -28,4 +33,5 @@ target_sources(ninfer_ops PRIVATE
 
 target_sources(ninfer_nvfp4_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a4_tma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_shard/nvfp4_gdn_input_shard_a4_tma.cu"
 )

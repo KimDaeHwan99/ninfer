@@ -17,5 +17,6 @@ extern const Nvfp4LinearShape kNvfp4N5120K6144;
 extern const Nvfp4LinearShape kNvfp4N5120K17408;
 // Tensor-parallel rank shard of the 27B MLP down projection.
 extern const Nvfp4LinearShape kNvfp4N5120K8704;
+extern const Nvfp4LinearShape kNvfp4N5120K3072;
 extern const Nvfp4LinearShape kNvfp4N17408K5120;
 } // namespace ninfer::ops::detail

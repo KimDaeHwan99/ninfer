@@ -35,12 +35,16 @@ using Nvfp4N5120K17408 = Nvfp4Geometry<5120, 17408>;
 using Nvfp4N17408K5120 = Nvfp4Geometry<17408, 5120>;
 // ... and of its down projection.
 using Nvfp4N5120K8704 = Nvfp4Geometry<5120, 8704>;
+// ... and of its attention and GDN output projections (all-NVFP4 artifacts).
+using Nvfp4N5120K3072 = Nvfp4Geometry<5120, 3072>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
 // A tensor-parallel rank shard's MLP down contraction width.
 using Nvfp4Activation8704Geometry  = Nvfp4ActivationGeometry<8704>;
+// ... and its attention/GDN output contraction width.
+using Nvfp4Activation3072Geometry  = Nvfp4ActivationGeometry<3072>;
 
 enum class Nvfp4GeometryId : std::uint8_t {
     N14336K5120,
@@ -50,6 +54,7 @@ enum class Nvfp4GeometryId : std::uint8_t {
     N5120K17408,
     N17408K5120,
     N5120K8704,
+    N5120K3072,
 };
 
 inline Nvfp4GeometryId resolve_nvfp4_geometry(std::int32_t output_rows, std::int32_t input_rows) {
@@ -78,6 +83,9 @@ inline Nvfp4GeometryId resolve_nvfp4_geometry(std::int32_t output_rows, std::int
     }
     if (output_rows == Nvfp4N5120K8704::kOutputRows && input_rows == Nvfp4N5120K8704::kInputRows) {
         return Nvfp4GeometryId::N5120K8704;
+    }
+    if (output_rows == Nvfp4N5120K3072::kOutputRows && input_rows == Nvfp4N5120K3072::kInputRows) {
+        return Nvfp4GeometryId::N5120K3072;
     }
     throw std::invalid_argument("unsupported NVFP4 problem");
 }

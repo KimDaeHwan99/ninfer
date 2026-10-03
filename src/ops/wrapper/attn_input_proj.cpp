@@ -4,6 +4,7 @@
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "ops/attn_input_proj/nvfp4_shard/nvfp4_attn_input_shard.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_geometry.h"
@@ -107,10 +108,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::NVFP4) {
+        // The full 27B profile, or one tensor-parallel rank's half of its heads.
         constexpr std::int32_t kHidden = 5120;
-        constexpr std::int32_t kQRows  = 6144;
-        constexpr std::int32_t kKvRows = 1024;
-        constexpr std::int32_t kRows   = 14336;
+        const bool shard               = weight.n == detail::kNvfp4AttnInputShardRows;
+        const std::int32_t kQRows      = shard ? 3072 : 6144;
+        const std::int32_t kKvRows     = shard ? 512 : 1024;
+        const std::int32_t kRows       = shard ? detail::kNvfp4AttnInputShardRows : 14336;
         const std::int32_t cols        = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
         require_matrix(x, kHidden, cols, "x");
@@ -121,6 +124,11 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         detail::validate_nvfp4_weight(weight, "nvfp4 attn_input_proj");
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
+        }
+        if (shard) {
+            detail::nvfp4_attn_input_shard_dispatch(x, weight, q, gate, k, v, policy, workspace,
+                                                    stream);
+            return;
         }
         detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
         return;
@@ -181,11 +189,16 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return 0;
     case QType::NVFP4:
-        if (parent_rows != detail::Nvfp4N14336K5120::kOutputRows ||
+        if ((parent_rows != detail::Nvfp4N14336K5120::kOutputRows &&
+             parent_rows != detail::kNvfp4AttnInputShardRows) ||
             input_rows != detail::Nvfp4N14336K5120::kInputRows) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return parent_rows == detail::kNvfp4AttnInputShardRows
+                   ? detail::nvfp4_attn_input_shard_workspace_capacity_bytes(policy, min_tokens,
+                                                                             max_tokens)
+                   : detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens,
+                                                                       max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16:
         if ((parent_rows != detail::Fp8N14336K5120::kOutputRows && parent_rows != 7168) ||
             input_rows != detail::Fp8N14336K5120::kInputRows) {

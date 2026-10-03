@@ -359,10 +359,10 @@ int run_bf16_target() {
 
 int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
                           ops::LinearPolicy policy = ops::LinearPolicy::A16Only,
-                          bool omit_divisors       = false) {
+                          bool omit_divisors = false, AttentionRows shape = {6144, 1024}) {
     constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
+    const std::int32_t kQRows      = shape.query;
+    const std::int32_t kKvRows     = shape.kv;
     const std::vector<float> activation =
         make_bf16_activation(kHidden, tokens, 337U + static_cast<std::uint32_t>(tokens));
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
@@ -378,11 +378,12 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     Tensor k                   = key.tensor();
     Tensor v                   = value.tensor();
     const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
-        QType::NVFP4, 14336, kHidden, policy, tokens, tokens);
+        QType::NVFP4, 2 * (kQRows + kKvRows), kHidden, policy, tokens, tokens);
     DeviceArena workspace(std::max<std::size_t>(capacity, 256));
     const auto physical = physical_parent(parent.view());
-    const auto qw = rows(physical, 0, 6144), kw = rows(physical, 6144, 1024);
-    const auto gw = rows(physical, 7168, 6144), vw = rows(physical, 13312, 1024);
+    const auto qw = rows(physical, 0, kQRows), kw = rows(physical, kQRows, kKvRows);
+    const auto gw = rows(physical, kQRows + kKvRows, kQRows);
+    const auto vw = rows(physical, 2 * kQRows + kKvRows, kKvRows);
     const auto divisor      = parent.view().input_scale_divisor;
     const float unused_step = ops::allows_a4(policy) ? 0.0F : 1.0F;
     const auto auxiliary    = [&](int index) -> std::optional<float> {
@@ -405,16 +406,17 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     ops::attn_input_proj(x, prepared.weight, q, g, k, v, prepared.policy, workspace, nullptr);
     cuda_synchronize();
 
-    constexpr std::int32_t kKeyBegin   = kQRows;
-    constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
-    constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
-    int failures                       = 0;
-    const bool a4                      = policy == ops::LinearPolicy::AllowA4;
+    const std::int32_t kKeyBegin   = kQRows;
+    const std::int32_t kGateBegin  = kKeyBegin + kKvRows;
+    const std::int32_t kValueBegin = kGateBegin + kQRows;
+    int failures                   = 0;
+    const bool a4                  = policy == ops::LinearPolicy::AllowA4;
     const ReductionCriterion& criterion =
         a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance;
     const std::int32_t sample_count = a4 ? kA4SampleRows : 7;
     const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
+        std::string(" NVFP4 ") + (kQRows == 6144 ? "" : "shard ") + (a4 ? "A4" : "A16") +
+        " T=" + std::to_string(tokens);
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
                               tokens, criterion, sample_count);
     failures += verify_output("attn k" + suffix, key, parent.host, kKeyBegin, kKvRows, activation,
@@ -451,6 +453,27 @@ int run_nvfp4_target() {
     failures += run_nvfp4_target_case(parent, 1023, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1025, ops::LinearPolicy::AllowA4);
+    return failures;
+}
+
+// One tensor-parallel rank's NVFP4 shard (all-NVFP4 artifacts): 12 query and 2 KV heads in the
+// parent's Q|K|G|V order, through every A16 and A4 route of the parent's token ladder.
+int run_nvfp4_shard_target() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr AttentionRows kShard{3072, 512};
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::NVFP4, 7168, kHidden, 359U, options));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 3, 4, 8, 16, 20, 32, 33}) {
+        failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::A16Only,
+                                          tokens == 1, kShard);
+    }
+    for (const std::int32_t tokens : {4, 17, 64, 129, 511, 512, 513, 1023, 1024, 1025, 2048}) {
+        failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4, false, kShard);
+    }
     return failures;
 }
 
@@ -679,7 +702,7 @@ int main(int argc, char** argv) {
     int failures = 0;
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
     if (shard_only) {
-        const int shard_failures = run_fp8_shard_target();
+        const int shard_failures = run_fp8_shard_target() + run_nvfp4_shard_target();
         std::cout << (shard_failures ? "FAIL" : "PASS") << " attn_input_proj tensor-parallel shard\n";
         return shard_failures == 0 ? 0 : 1;
     }
@@ -689,6 +712,7 @@ int main(int argc, char** argv) {
         failures += run_nvfp4_target();
         failures += run_fp8_target();
         failures += run_fp8_shard_target();
+        failures += run_nvfp4_shard_target();
         failures += run_q8_target();
         failures += run_q8_companion();
     }

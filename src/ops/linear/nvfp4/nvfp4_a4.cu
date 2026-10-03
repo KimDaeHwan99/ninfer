@@ -97,6 +97,10 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
         launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, layout, stream,
                                                             reciprocal_quotient);
         return;
+    case Nvfp4Activation3072Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation3072Geometry>(x, weight, workspace, layout, stream,
+                                                           reciprocal_quotient);
+        return;
     case Nvfp4Activation8704Geometry::kInputRows:
         launch_quantize_exact<Nvfp4Activation8704Geometry>(x, weight, workspace, layout, stream,
                                                            reciprocal_quotient);

@@ -248,11 +248,14 @@ int verify_output_range_sampled(std::string_view label, const GuardedBf16Tensor&
     return compare(label, actual, expected, criterion);
 }
 
-int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy) {
+// `qk` / `vz` are the query (=key) and value (=z) rows: the full 27B layer, or one
+// tensor-parallel rank's shard.
+int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
+                   std::int32_t qk = 2048, std::int32_t vz = 6144) {
     constexpr std::int32_t kHidden      = 5120;
-    constexpr std::int32_t kQkvRows     = 10240;
-    constexpr std::int32_t kZRows       = 6144;
-    constexpr std::int32_t kRows        = kQkvRows + kZRows;
+    const std::int32_t kQkvRows         = 2 * qk + vz;
+    const std::int32_t kZRows           = vz;
+    const std::int32_t kRows            = kQkvRows + kZRows;
     const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 601U + tokens);
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
@@ -270,19 +273,19 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     const bool a4                       = policy == ops::LinearPolicy::AllowA4;
     const ReductionCriterion& criterion = a4 ? kGdnInputProjA4Tolerance : kGdnInputProjA16Tolerance;
     const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
+        std::string(" NVFP4 ") + (qk == 2048 ? "" : "shard ") + (a4 ? "A4" : "A16") +
+        " T=" + std::to_string(tokens);
     int failures = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
-    failures += verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, 2048,
+    failures += verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, qk,
                                             parent.host, 0, activation, kHidden, tokens, criterion);
-    failures +=
-        verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, 2048, 2048, parent.host,
-                                    2048, activation, kHidden, tokens, criterion);
-    failures +=
-        verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 4096, 6144, parent.host,
-                                    4096, activation, kHidden, tokens, criterion);
+    failures += verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, qk, qk,
+                                            parent.host, qk, activation, kHidden, tokens, criterion);
+    failures += verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 2 * qk, vz,
+                                            parent.host, 2 * qk, activation, kHidden, tokens,
+                                            criterion);
     failures += verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host,
                                             kQkvRows, activation, kHidden, tokens, criterion);
     if (workspace.peak_used() != capacity) {
@@ -473,6 +476,73 @@ int run_fp8_shard() {
     return failures;
 }
 
+// One tensor-parallel rank's NVFP4 shard (all-NVFP4 artifacts): 8 key and 24 value heads in the
+// parent's Q|K|V|Z order. The shard compiles the parent's own sources with its section output, and
+// the patterned generator makes weight row r independent of the row count, so the shard's qkv|z
+// rows must equal the parent's first 8192 output rows bit for bit on every route. That proves the
+// shard's output mapping exactly; the parent's routes keep their own oracle qualification.
+int run_nvfp4_shard_case(DevicePackedWeight& parent, DevicePackedWeight& shard,
+                         std::int32_t tokens, ops::LinearPolicy policy) {
+    constexpr std::int32_t kHidden = 5120;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 631U + tokens);
+    DeviceBuffer device_activation      = to_device(bf16_bits(activation));
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    GuardedBf16Tensor parent_qkv(10240, tokens), parent_z(6144, tokens);
+    GuardedBf16Tensor shard_qkv(5120, tokens), shard_z(3072, tokens);
+    const auto run = [&](DevicePackedWeight& weight, std::int32_t rows, GuardedBf16Tensor& qkv,
+                         GuardedBf16Tensor& z) {
+        const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::NVFP4, rows, kHidden, policy, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        Tensor qkv_output = qkv.tensor(), z_output = z.tensor();
+        ops::gdn_input_proj(x, weight.view(), qkv_output, z_output, policy, workspace, nullptr);
+        cuda_synchronize();
+    };
+    run(parent, 16384, parent_qkv, parent_z);
+    run(shard, 8192, shard_qkv, shard_z);
+    const std::string suffix = std::string(" NVFP4 shard ") +
+                               (policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16") +
+                               " T=" + std::to_string(tokens);
+    int failures = shard_qkv.verify_guards("gdn qkv" + suffix) + shard_z.verify_guards("gdn z" + suffix);
+    failures += shard_qkv.verify_fully_written("gdn qkv" + suffix);
+    failures += shard_z.verify_fully_written("gdn z" + suffix);
+    const std::vector<std::uint16_t> full  = parent_qkv.bits();
+    const std::vector<std::uint16_t> qkv   = shard_qkv.bits();
+    const std::vector<std::uint16_t> z     = shard_z.bits();
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t row = 0; row < 8192; ++row) {
+            const std::uint16_t expected = full[static_cast<std::size_t>(token) * 10240 + row];
+            const std::uint16_t actual =
+                row < 5120 ? qkv[static_cast<std::size_t>(token) * 5120 + row]
+                           : z[static_cast<std::size_t>(token) * 3072 + row - 5120];
+            if (actual != expected) {
+                std::cerr << "gdn" << suffix << ": row " << row << " token " << token
+                          << " differs from the parent's\n";
+                return failures + 1;
+            }
+        }
+    }
+    return failures;
+}
+
+int run_nvfp4_shard() {
+    constexpr std::int32_t kHidden = 5120;
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::NVFP4, 16384, kHidden, 623U, options));
+    DevicePackedWeight shard(
+        quantized_weight::make_patterned_weight(QType::NVFP4, 8192, kHidden, 623U, options));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 3, 4, 8, 16, 32, 33})
+        failures += run_nvfp4_shard_case(parent, shard, tokens, ops::LinearPolicy::A16Only);
+    for (const std::int32_t tokens :
+         {1, 2, 4, 17, 64, 65, 96, 97, 128, 129, 192, 193, 511, 512, 513, 1023, 1024, 1025, 2048})
+        failures += run_nvfp4_shard_case(parent, shard, tokens, ops::LinearPolicy::AllowA4);
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -481,7 +551,7 @@ int main(int argc, char** argv) {
         return 77;
     }
     if (argc == 2 && std::string(argv[1]) == "--tensor-parallel-only") {
-        const int shard_failures = run_fp8_shard();
+        const int shard_failures = run_fp8_shard() + run_nvfp4_shard();
         std::cout << (shard_failures == 0 ? "OK" : "FAIL") << " gdn_input_proj shard\n";
         return shard_failures == 0 ? 0 : 1;
     }
@@ -492,6 +562,7 @@ int main(int argc, char** argv) {
     failures += run_nvfp4();
     failures += run_fp8();
     failures += run_fp8_shard();
+    failures += run_nvfp4_shard();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }
