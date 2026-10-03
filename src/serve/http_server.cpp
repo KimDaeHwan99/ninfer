@@ -511,6 +511,37 @@ void HttpServer::attach(GenerationService& service) {
                                       service.memory_summary());
 }
 
+// ENGINE WATCH. After an Engine-wide failure (an error thrown by the worker; a failed CUDA call
+// aborts the process instead) the Engine fails every queued request and rejects every new one, but
+// never recovers, while /v1/models keeps answering: the process would stay up as a dead endpoint.
+// The watch polls availability while listen() runs and stops the accept loop the first time it is
+// gone, so main() exits non-zero and the container's restart policy reloads the model.
+void HttpServer::run_engine_watch() {
+    constexpr auto kInterval = std::chrono::milliseconds(250);
+    for (;;) {
+        {
+            std::unique_lock lock(watch_mutex_);
+            if (watch_cv_.wait_for(lock, kInterval, [this] { return watch_stopping_; })) { return; }
+        }
+        if (!service_->is_available()) {
+            engine_failed_.store(true);
+            operational_log_.engine_failure();
+            server_.stop();
+            return;
+        }
+    }
+}
+
+void HttpServer::stop_engine_watch() {
+    if (!watch_thread_.joinable()) { return; }
+    {
+        std::lock_guard lock(watch_mutex_);
+        watch_stopping_ = true;
+    }
+    watch_cv_.notify_one();
+    watch_thread_.join();
+}
+
 bool HttpServer::listen() {
     if (service_ == nullptr) { throw std::logic_error("HTTP generation service is not attached"); }
     if (public_model_id_.empty()) {
@@ -520,11 +551,15 @@ bool HttpServer::listen() {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }
+    watch_stopping_ = false;
+    watch_thread_   = std::thread([this] { run_engine_watch(); });
     try {
         const bool result = server_.listen_after_bind();
+        stop_engine_watch();
         stop_stats_reporter();
         return result;
     } catch (...) {
+        stop_engine_watch();
         stop_stats_reporter();
         throw;
     }

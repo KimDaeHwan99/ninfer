@@ -517,6 +517,11 @@ void OperationalLog::server_ready(std::string_view host, int port, std::string_v
 
 void OperationalLog::server_stopped() const { logger_->info("server stopped"); }
 
+void OperationalLog::engine_failure() const {
+    logger_->critical("engine unavailable after an engine-wide failure | stopping the server so a "
+                      "supervisor can reload the model (exit status 2)");
+}
+
 void OperationalLog::server_failure(bool serving, std::string_view detail) const {
     logger_->critical("server failed during {} | {}", serving ? "serving" : "startup",
                       product::format_pretty_text(detail));

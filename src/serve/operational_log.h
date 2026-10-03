@@ -58,6 +58,7 @@ public:
     void server_ready(std::string_view host, int port, std::string_view model_id,
                       bool auth_enabled) const;
     void server_stopped() const;
+    void engine_failure() const;
     void server_failure(bool serving, std::string_view detail) const;
 
 private:
