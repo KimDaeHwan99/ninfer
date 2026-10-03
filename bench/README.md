@@ -10,6 +10,14 @@ The frozen request corpus for the separate black-box Serve TTFT tool is document
 [`fixtures/ttft/`](fixtures/ttft/README.md). That client does not call the benchmark executables or
 Engine directly.
 
+The closed-loop agentic A/B suite under [`agentic_ab/`](agentic_ab/README.md) (upstream + Windows
+port vs this fork, black-box OpenAI API) replays interleaved agent sessions, subagent fan-outs,
+compaction, retries and aborts shaped from the production request logs, and reports cache hits,
+TTFT, cold prefill and output rates. It and the decode-saturation suite of
+`tools/bench/run_serve_concurrency.py` produce the numbers in the
+[fork README](../README.md#performance-this-fork-vs-upstream). The older serve A/B rig
+under [`ab/`](ab/README.md) predates the `e31bc99b` merge.
+
 ## Benchmark inputs
 
 Synthetic numerical inputs use reproducible pseudorandom values with distinct operand seeds,
@@ -72,13 +80,18 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>]
+          [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--use-original-int8-prefill-kernel]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
 
 With no `-p`, `-n`, or `-pg`, the matrix is `pp512` and `tg128`.
+
+`--rope-yarn-factor F` selects the startup-fixed runtime YaRN factor, finite `[1,4]`, default `1`
+(native RoPE). It extends only the allowed ceiling, not the context selected from the workload or
+`--max-ctx`, and does not modify the artifact. Long-context extrapolation is not a quality guarantee.
+The factor is included in table, JSON and CSV reports.
 
 Example:
 
@@ -106,8 +119,18 @@ For a DFlash2 companion artifact:
 ```
 
 The benchmark disables context retention because every repetition is an independent root request.
-Schema v15 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
-JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
+Schema v17 records `rope_yarn_factor`, `speculative_backend`, `draft_tokens`, `ngram_draft_tokens`,
+`ngram_min_match`, and the proposal head independently. JSON and CSV identify DFlash2
+explicitly. MTP alone reserves its extra lookahead KV margin.
+
+`--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
+[ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.
+It defaults to off. Reports separate ngram rounds, drafted tokens and accepted
+tokens from aggregate speculative counters; JSON includes per-repetition values.
+A one-token `tg` seed is not a file-copy benchmark. Use a suitable repeated-token
+corpus with `-pg`, verify the output separately, and require positive ngram
+acceptance before attributing a speed change to copying. The standard matrix
+remains neural-only unless its cases explicitly request ngram.
 
 ## Context-cost calibration
 
@@ -1143,14 +1166,15 @@ closed.
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 15 records the public value objects directly:
+statistics. JSON schema version 17 records the public value objects directly:
 
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
   file/H2D/staging bytes and Device/Host object counts;
 - `memory`: weights/sequence/unified-workspace arenas, the optional non-additive Vision layout,
   planned context, KV storage, CUDA Graph allowance, and KV payload;
 - each repetition's `timings`: prepare, Vision, prefill, decode, and total seconds;
-- each repetition's `speculative`: window, rounds, drafted/accepted tokens, fallbacks, and per-position
+- each repetition's `speculative`: window, rounds, drafted/accepted tokens, fallbacks,
+  separate ngram rounds/drafted/accepted tokens, and per-position
 acceptance.
 
 Each test reports `workspace_peak_bytes` from the planned phase markers, including CUDA Graph

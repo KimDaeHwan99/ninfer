@@ -13,12 +13,24 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
 using namespace ninfer::serve;
 using Json = nlohmann::json;
+
+long long test_process_id() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return ::getpid();
+#endif
+}
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -130,10 +142,14 @@ int main() {
     memory.available_after_startup_bytes     = 180;
     memory.planned_slack_bytes               = 100;
     memory.cuda_graph_allowance_bytes        = 600;
+    memory.cuda_graph_measured_bytes         = 450;
     memory.kv_payload_bytes                  = 400;
     memory.host_state_capacity_slots         = 3;
     memory.host_state_occupied_slots         = 1;
-    memory.host_kv_capacity_bytes            = 64ULL << 20;
+    memory.host_state_image_bytes            = 195897344;
+    memory.host_kv_page_group_bytes          = 4194304;
+    memory.host_cache_budget_bytes           = 24ULL << 20;
+    memory.host_kv_capacity_bytes            = 12ULL << 20;
     memory.host_kv_occupied_bytes            = 8ULL << 20;
 
     ServerLogEnvironment environment;
@@ -232,6 +248,8 @@ int main() {
                   server.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 200 &&
                   server.at("memory").at("vision_workspace").at("handoff_peak_bytes") == 150,
               "Vision workspace layout missing");
+    failures += check(server.at("memory").at("cuda_graph_measured_bytes") == 450,
+                      "server_start memory reports the measured CUDA Graph bytes");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
@@ -242,7 +260,10 @@ int main() {
                       "adaptive KV memory ledger missing");
     failures += check(server.at("memory").at("host_state_capacity_slots") == 3 &&
                           server.at("memory").at("host_state_occupied_slots") == 1 &&
-                          server.at("memory").at("host_kv_capacity_bytes") == (64ULL << 20) &&
+                          server.at("memory").at("host_state_image_bytes") == 195897344 &&
+                          server.at("memory").at("host_kv_page_group_bytes") == 4194304 &&
+                          server.at("memory").at("host_cache_budget_bytes") == (24ULL << 20) &&
+                          server.at("memory").at("host_kv_capacity_bytes") == (12ULL << 20) &&
                           server.at("memory").at("host_kv_occupied_bytes") == (8ULL << 20),
                       "Host context-cache memory ledger missing");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,
@@ -397,6 +418,17 @@ int main() {
     outcome.metrics.speculative_accepted_tokens       = 720;
     outcome.metrics.speculative_fallback_steps        = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.ngram_archive_rounds              = 7;
+    outcome.metrics.ngram_archive_drafted_tokens      = 441;
+    outcome.metrics.ngram_archive_accepted_tokens     = 400;
+    outcome.metrics.ngram_archive                     = {.enabled       = true,
+                                                         .bound         = true,
+                                                         .published     = true,
+                                                         .generation    = 3,
+                                                         .sources       = 12,
+                                                         .session_bytes = 1024,
+                                                         .total_bytes   = 4096,
+                                                         .sampling_seed = 0};
     outcome.metrics.materialization                   = {
                           .predicted_now_ns           = 200000,
                           .predicted_future_loss_ns   = 50000,
@@ -462,6 +494,12 @@ int main() {
         check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
               "TTFT missing or lost precision");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
+    failures += check(done.at("speculative").at("ngram_archive_accepted_tokens") == 400 &&
+                          done.at("speculative").at("ngram_archive").at("generation") == 3 &&
+                          done.at("speculative").at("ngram_archive").at("bound") == true &&
+                          done.at("speculative").at("ngram_archive").at("sampling_seed") == 0 &&
+                          done.at("speculative").at("ngram_archive").at("session_bytes") == 1024,
+                      "archive provenance or memory metrics missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");
     failures += check(done.at("speculative").at("fallback_steps") == 2,
@@ -488,7 +526,8 @@ int main() {
         pretty_done.message ==
             "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
             "(25.2%, response replay) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
-            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | thinking 256/256, control 19",
+            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | archive bound 400/441 accepted, "
+            "gen 3, 12 sources | thinking 256/256, control 19",
         "pretty request-done record mismatch");
 
     GenerationOutcome normalized_tool_outcome = outcome;
@@ -537,6 +576,21 @@ int main() {
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
+    // With returned markup, the warning shows at most 240 bytes of it from the first marker on,
+    // on one line, and none of the answer text before it.
+    fallback_outcome.text = "sentinel-answer-text\n<tool_call>\n<function=edit>\t" +
+                            std::string(400, 'x') + "</function>\n</tool_call>";
+    const std::optional<OperationalRecord> snippet_warning =
+        render_tool_call_fallback(context, fallback_outcome);
+    const std::string expected_snippet =
+        "<tool_call> <function=edit> " + std::string(240 - 28, 'x') + "...";
+    failures += check(snippet_warning &&
+                          snippet_warning->message ==
+                              "req#7 tool markup returned as text | duplicate parameter | " +
+                                  expected_snippet &&
+                          snippet_warning->message.find("sentinel-answer-text") ==
+                              std::string::npos,
+                      "tool-call fallback snippet is unbounded, multi-line or leaks prior text");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
@@ -579,6 +633,11 @@ int main() {
     throughput.current.state_h2d_seconds                = 0.25;
     throughput.current.device_state_occupied_slots      = 3;
     throughput.current.host_state_occupied_slots        = 1;
+    throughput.current.device_main_kv_occupied_pages    = 9;
+    throughput.current.device_main_kv_lease_pages       = 4;
+    throughput.current.device_backend_kv_occupied_pages = 5;
+    throughput.current.device_backend_kv_lease_pages    = 2;
+    throughput.current.active_captures_skipped          = 1;
     throughput.current.last_selected_frontier_tokens    = 64;
     throughput.current.pressure_spill_pages             = 4;
     throughput.current.pressure_private_owners_degraded = 1;
@@ -681,10 +740,24 @@ int main() {
             !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
 
+    // An active request holding 9 Main page-groups of which 4 are still unmaterialized leaves the
+    // context cache only 5. Occupancy alone cannot show that, so the growth lease must be a
+    // separate published quantity.
+    failures +=
+        check(throughput_json.at("context_cache").at("occupancy").at("device_main_kv_pages") == 9 &&
+                  throughput_json.at("context_cache").at("occupancy")
+                          .at("device_main_kv_lease_pages") == 4 &&
+                  throughput_json.at("context_cache").at("occupancy")
+                          .at("device_backend_kv_pages") == 5 &&
+                  throughput_json.at("context_cache").at("occupancy")
+                          .at("device_backend_kv_lease_pages") == 2,
+              "Device KV growth lease is not reported separately from occupied pages");
+    failures += check(throughput_json.at("context_cache").at("captures").at("skipped") == 1,
+                      "feasibility-skipped captures must be counted and published");
+
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
-         ".jsonl");
+        ("ninfer-request-log-test-" + std::to_string(test_process_id()) + ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());

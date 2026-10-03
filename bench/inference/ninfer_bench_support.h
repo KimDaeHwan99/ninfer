@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 15;
+inline constexpr int kSchemaVersion                   = 17;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -59,8 +59,11 @@ struct BenchOptions {
     std::vector<std::pair<int, int>> prompt_gen;
     int repetitions = kDefaultRepetitions;
     int warmup      = kDefaultWarmup;
+    float rope_yarn_factor = 1.0F;
     std::optional<std::uint32_t> max_context;
-    std::uint32_t prefill_chunk = kDefaultPrefillChunk;
+    bool original_int8_prefill_kernel = false;
+    bool original_nvfp4_prefill_kernel = false;
+    std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     int device            = 0;
@@ -101,9 +104,12 @@ struct BenchEnvironment {
     LoadSummary load;
     MemorySummary memory;
 
+    float rope_yarn_factor      = 1.0F;
     std::uint32_t max_context   = 0;
-    std::uint32_t prefill_chunk = kDefaultPrefillChunk;
-    KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
+    bool original_int8_prefill_kernel = false;
+    bool original_nvfp4_prefill_kernel = false;
+    KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;
     bool decode_graph_primed                       = false;

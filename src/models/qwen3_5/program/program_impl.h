@@ -14,14 +14,21 @@
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
+#include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
+#include "models/qwen3_5/program/ngram_proposer.h"
 
 #include <algorithm>
+#include <string_view>
+#include <filesystem>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <array>
 #include <limits>
 #include <memory>
@@ -37,6 +44,20 @@ namespace ninfer::models::qwen3_5::detail {
 using PreparedPromptData    = qwen3_5::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
+
+// Device KV is leased on demand. An active request holds a bounded window of its remaining
+// output rather than the whole client budget, and extends that window at a decode-round
+// boundary; a full window is requested first and a step-sized extension is enough when the pool
+// cannot spare one.
+inline constexpr std::uint32_t kKVLeaseGrowthMarginTokens = 4096;
+
+[[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
+    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+[[nodiscard]] constexpr std::uint32_t kv_tokens_for_pages(std::uint32_t pages) noexcept {
+    return pages == 0 ? 0U : (pages - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize) + 1U;
+}
 
 using ReusePath = ninfer::PrefixReusePath;
 
@@ -256,6 +277,71 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
 
+// Hybrid prefix cache admission decision (docs/maintainer/hybrid-prefix-cache-spec.md §6). The
+// base-plan facts the start path needs are copied so the quote outlives the Engine's base plan.
+struct HybridQuoteImpl {
+    runtime::RequestPlanSummary summary;
+    ops::SamplingConfig sampling;
+    std::uint32_t text_kv_page_entitlement    = 0;
+    std::uint32_t backend_kv_page_entitlement = 0;
+    std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
+    runtime::PrefillWork root_rebuild_work;
+    std::uint32_t root_rebuild_tail_begin = 0;
+    runtime::prefix_cache::SnapshotRef snapshot; // invalid: root
+    std::uint32_t reuse_frontier = 0;
+    // Longest prompt prefix held as cached full blocks, reusable or not.
+    std::uint32_t cached_prefix_tokens = 0;
+    std::uint32_t destination          = 0;
+    std::uint64_t destination_epoch    = 0;
+};
+
+// A prefill tap whose StateImage is captured but whose snapshot waits for the blocks it anchors
+// on: a frontier inside a block needs that block complete, and an MTP backend trails the text
+// frontier by one token, so even a page-aligned frontier waits for its last block's backend page.
+struct HybridPendingTap {
+    std::uint32_t frontier = 0;
+    StateImageHandle image;
+    std::uint32_t slot = 0; // staging device snapshot slot
+    bool boundary      = false;
+};
+
+// Per-lane hybrid bookkeeping for the active sequence.
+struct HybridLaneState {
+    bool active  = false;
+    bool publish = false;
+    // Root path of full blocks this sequence pins, in prompt order. Blocks past the reuse
+    // frontier are appended as the sequence commits them.
+    std::vector<runtime::prefix_cache::NodeRef> path;
+    std::uint64_t path_hash = runtime::prefix_cache::kRootLookupHash;
+    // Extra key of every full prompt block (Vision identity), empty for text-only prompts.
+    std::vector<std::uint64_t> prompt_extras;
+    // Extra key of blocks after the last full prompt block: every Vision item precedes them.
+    std::uint64_t trailing_extra = 0;
+    std::vector<runtime::prefix_cache::PlannedTap> taps;
+    std::size_t next_tap = 0;
+    std::vector<runtime::prefix_cache::TapExclusion> exclusions;
+    std::vector<HybridPendingTap> pending;
+    // Most recent snapshot frontier this sequence reused or captured.
+    std::uint32_t last_capture = 0;
+    // Deepest snapshot frontier known on this path (reused or created by this sequence).
+    std::uint32_t deepest_snapshot = 0;
+    // The snapshot this sequence resumed from (invalid: root). Once the sequence publishes a
+    // deeper snapshot, its lineage resumes from that one and this one is superseded.
+    runtime::prefix_cache::SnapshotRef resume_snapshot;
+    std::uint32_t resume_frontier = 0;
+    // The newest Tap (not Boundary) this sequence published. A deeper tap of the same prompt
+    // supersedes it: the lineage resumes from the deeper one, and it only serves a request
+    // diverging between them. The endpoint does not, since a next turn whose template re-renders
+    // the reply resumes from the prompt-end tap.
+    runtime::prefix_cache::SnapshotRef tap_snapshot;
+    std::uint32_t tap_frontier = 0;
+    // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
+    // queues behind the restore's per-layer events; releasing the lane queues behind the whole
+    // restore if it may still be landing.
+    std::uint64_t restore_ticket = 0;
+    bool restore_layers_pending  = false;
+};
+
 } // namespace ninfer::models::qwen3_5::detail
 
 namespace ninfer::models::qwen3_5::detail {
@@ -279,6 +365,16 @@ struct PendingCandidate {
     std::uint32_t base_S        = 0;
     std::uint32_t prompt_tokens = 0;
     std::uint32_t produced      = 0;
+    // Draft columns the speculative round verified: its egress/frame row stride is this + 1 and
+    // its ReplaySSM records use the matching record view.
+    std::uint32_t verify_drafts = 0;
+};
+
+// Why every owner is being dropped: a failure discards everything; an orderly shutdown first saves
+// the hybrid Host tier when a cache file is attached.
+enum class ProgramCleanup : std::uint8_t {
+    Failure,
+    Shutdown,
 };
 
 enum class Lifecycle : std::uint8_t {
@@ -398,7 +494,13 @@ struct SharedPrefixSlot {
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
 // gives every occupied request slot its own instance of this state.
 struct RequestControl {
-    Lifecycle lifecycle = Lifecycle::Empty;
+    std::unique_ptr<NgramProposer> ngram;
+    std::shared_ptr<const NgramSnapshot> ngram_snapshot;
+    std::uint64_t ngram_copy_source = 0;
+    std::uint32_t ngram_copy_offset = 0;
+    std::size_t ngram_copy_ledger   = 0;
+    std::size_t ngram_indexed       = 0;
+    Lifecycle lifecycle             = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
@@ -406,6 +508,17 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    // The sequence's own output ceiling: the largest frontier its lease may ever cover, so
+    // on-demand growth never leases pages the request cannot reach.
+    std::uint32_t lease_ceiling = 0;
+    // Set when the Device KV lease cannot be extended any further: the request finishes at the
+    // frontier its lease covers with its generation limit reason instead of failing a launch on
+    // coverage.
+    bool lease_settled = false;
+    // A settlement caused by pool space rather than the output ceiling, and the entitlement its
+    // smallest growth step asked for: retained cache may give those pages back.
+    bool lease_space_limited = false;
+    DeviceKVPages lease_minimum_target;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -425,6 +538,20 @@ struct RequestControl {
     };
 
     std::optional<Prefill> prefill;
+
+    // Returns the request slot to Empty once its lane's resources have been released.
+    void retire() noexcept {
+        prefill.reset();
+        lifecycle            = Lifecycle::Empty;
+        pending              = {};
+        active_resources     = {};
+        optional_resources   = {};
+        publish_continuation = true;
+        lease_settled        = false;
+        lease_space_limited  = false;
+        lease_minimum_target = {};
+        lease_ceiling        = 0;
+    }
 };
 
 class ProgramImpl {
@@ -499,6 +626,9 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    [[nodiscard]] bool wait_context_transfer() noexcept;
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
@@ -543,15 +673,64 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
-    void fail_all_cleanup() noexcept;
+    [[nodiscard]] std::optional<qwen3_5::PhysicalUsageSnapshot>
+    fail_all_cleanup(ProgramCleanup cleanup) noexcept;
+    [[nodiscard]] bool context_stores_idle() const noexcept;
+    [[nodiscard]] bool rebuild_context_stores() noexcept;
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
+
+    [[nodiscard]] bool hybrid_prefix_cache() const noexcept { return hybrid_ != nullptr; }
+
+    [[nodiscard]] HybridAdmissionQuote hybrid_quote(const PreparedPromptData& prompt,
+                                                    const RequestBasePlan& base,
+                                                    runtime::LaneId destination);
+    [[nodiscard]] bool hybrid_reservable(const HybridAdmissionQuote& quote,
+                                         runtime::CancellationFlagView cancellation) const noexcept;
+    [[nodiscard]] runtime::ContextTransactionReserveStatus
+    hybrid_reserve_materialization(HybridAdmissionQuote&& quote, const PreparedPromptData& prompt,
+                                   const std::function<PreparedPromptData()>& take_prompt,
+                                   runtime::CancellationFlagView cancellation);
+    [[nodiscard]] std::uint32_t hybrid_reclaim_device_kv(std::uint32_t main_pages,
+                                                         std::uint32_t backend_pages);
+    // Prefetch for a waiting request (spec §6.6): blocks whose copy started, absent while a
+    // prefetch or an admission is still in flight.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const PreparedPromptData& prompt,
+                                                               const RequestBasePlan& base);
+    // Device pages a prefetch could fill now: free ones and host-backed cached ones.
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
+    // Installs the Engine's calibrated machine model for hybrid admission and eviction.
+    void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
+
+    void set_hybrid_coalesce_wait_limit(double seconds) noexcept {
+        hybrid_coalesce_wait_seconds_ = seconds > 0.0 ? seconds : 0.0;
+    }
+
+    [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
+
+    [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
+        return hybrid_shutdown_save_;
+    }
 
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept {
         return resource_revision_;
     }
 
     [[nodiscard]] qwen3_5::PhysicalUsageSnapshot physical_usage() const noexcept;
+
+    [[nodiscard]] std::optional<std::uint32_t>
+    device_kv_lease_settlement_tokens(SequenceHandle sequence,
+                                      std::uint32_t forced_span_tokens) const noexcept;
+    [[nodiscard]] std::optional<DeviceKVLeaseShortfall>
+    device_kv_lease_shortfall(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] bool resume_device_kv_lease(SequenceHandle sequence) noexcept;
+    [[nodiscard]] DeviceKVPages
+    retained_device_kv_pages(const ContinuationHandle& continuation) const noexcept;
+    [[nodiscard]] DeviceKVPages
+    retained_device_kv_pages(const SharedPrefixHandle& shared) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -567,11 +746,17 @@ public:
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
+    // Frozen context-cache shape: an engaged host budget has already resolved host_state_slots,
+    // host_kv_capacity_bytes and the long-anchor count on the plan this Program was built from.
     const ContextCacheOptions context_cache;
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
+    const bool fast_prefill_kernel;
     const std::uint32_t draft_window;
+    const std::uint32_t neural_draft_window;
+    const std::uint32_t ngram_draft_window;
+    const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -580,6 +765,9 @@ public:
     const bool causal_scoring;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
+    // Free Device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
+    // launch of every executable), for comparison with graph_allowance_bytes.
+    std::size_t graph_measured_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;
@@ -599,6 +787,11 @@ public:
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
+    // When the DFlash neural and ngram windows differ, rounds of the narrower family verify at
+    // their own width for every batch size. They record ReplaySSM transitions through a dense
+    // narrowed view of the same record storage and are replayed by the matching fold plan.
+    std::optional<GdnReplayRecords> narrow_replay_records;
+    std::optional<ops::GdnReplayFoldPlan> narrow_replay_fold;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
@@ -617,6 +810,7 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
+    DecodeGraphFamily ngram_graphs;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -712,6 +906,12 @@ private:
 
     std::optional<PendingTransaction> pending_transaction_;
     std::uint64_t next_transaction_id_ = 1;
+
+    // Serializes the materialization seal window (final assess -> seal) so a concurrent
+    // demote cannot steal the incumbent's allocation and bump a victim's slot generation
+    // between assess and seal. Claimed by the planner, released after seal (success or
+    // failure) or on the planner's early exit.
+    std::atomic<bool> seal_window_claimed_ = false;
 
     enum class PressureTransitionPhase : std::uint8_t {
         HostReleases,
@@ -895,8 +1095,31 @@ private:
 
     std::uint64_t next_capture_offer_id_ = 1;
 
+    struct HybridMaterializationTransaction {
+        std::shared_ptr<HybridQuoteImpl> quote;
+        PreparedPromptData prompt;
+        // Staged by the first progress step: the pinned path and snapshot, the Device pages the
+        // restore and the fork consume, the reserved StateImage destination and whether Host
+        // slabs filled it. A Host restore in flight keeps the transaction in progress.
+        bool staged          = false;
+        bool snapshot_pinned = false;
+        bool state_restored  = false;
+        bool terminal        = false;
+        std::vector<runtime::prefix_cache::NodeRef> path;
+        std::vector<std::uint64_t> hashes;
+        std::vector<std::uint64_t> extras;
+        std::optional<StateImageHandle> state;
+        std::optional<DeviceKVPageReservation> text_pages;
+        std::optional<DeviceKVPageReservation> backend_pages;
+        std::uint64_t restore_bytes = 0;
+        // Names the landing Host restore whose per-layer events the lane's first prefill pass
+        // waits on (0 without one).
+        std::uint64_t restore_ticket = 0;
+    };
+
     using ContextTransaction =
-        std::variant<std::monostate, MaterializationTransaction, ActiveCaptureTransaction>;
+        std::variant<std::monostate, MaterializationTransaction, ActiveCaptureTransaction,
+                     HybridMaterializationTransaction>;
     ContextTransaction context_transaction_;
 
     [[nodiscard]] MaterializationResult
@@ -912,6 +1135,68 @@ private:
                                 runtime::CancellationFlagView cancellation);
 
     std::array<CudaEventTimer, 3> context_transfer_timers_;
+
+    // Hybrid prefix cache (null in Legacy mode).
+    std::unique_ptr<HybridPrefixCache> hybrid_;
+    std::array<HybridLaneState, kMaximumConcurrency> hybrid_lanes_;
+    runtime::prefix_cache::CacheCostModel hybrid_cost_;
+    double hybrid_coalesce_wait_seconds_ = 0.0;
+    std::filesystem::path hybrid_file_;
+    std::string hybrid_fingerprint_;
+    std::optional<HybridCachePersistence> hybrid_shutdown_save_;
+
+    void create_hybrid_prefix_cache(const StartupObserver& observer);
+    // The per-layer events the lane's first prefill pass waits on, consumed by this call; empty
+    // once the batch has landed. The view is valid only until the cache's next poll(), which every
+    // KV commit runs, so only PrefillContext::take_layer_ready calls it, inside the chunk function.
+    [[nodiscard]] std::span<const cudaEvent_t> hybrid_take_restore_layers(std::uint32_t lane);
+    // True when a sibling lane still prefilling a prompt that shares more with this one than the
+    // cache offers will publish a snapshot where they diverge soon enough to wait for. Plans that
+    // snapshot as an exact tap of the sibling when none is planned near the divergence.
+    [[nodiscard]] bool hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse,
+                                            std::uint32_t destination);
+    // Writes the Host tier to the attached file once every Host write has landed. Called by the
+    // shutdown cleanup after the lanes wrote their blocks through.
+    void save_hybrid_cache_for_shutdown() noexcept;
+    [[nodiscard]] MaterializationResult
+    progress_hybrid_materialization(runtime::CancellationFlagView cancellation);
+    // Pins the quoted path and snapshot, reserves every Device page the admission needs and
+    // submits the Host restores its source requires. Returns false, with nothing staged left
+    // behind by the caller's abort, when the quote went stale or the pools cannot supply it.
+    [[nodiscard]] bool hybrid_stage(HybridMaterializationTransaction& transaction,
+                                    const PreparedPromptData& prompt);
+    // Builds the lane from the staged, Device-resident source.
+    [[nodiscard]] StartResult hybrid_activate(HybridMaterializationTransaction& transaction);
+    void hybrid_abort_materialization(HybridMaterializationTransaction& transaction) noexcept;
+    [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages);
+    // The backend KV frontier restored with a snapshot at `frontier` (MTP trails by one token).
+    [[nodiscard]] std::uint32_t hybrid_backend_frontier(std::uint32_t frontier) const noexcept;
+    // Inserts every newly committed full block of the lane's sequence into the tree, then
+    // publishes the pending taps those blocks complete.
+    void hybrid_publish_blocks(SequenceState& sequence);
+    // Snapshots the lane's committed state at the prefill frontier `frontier`; a boundary tap is
+    // published as SnapshotKind::Boundary.
+    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary);
+    // Realizes the planned taps a completed prefill chunk reached.
+    void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
+                                    std::uint32_t prompt_tokens);
+    // Publishes pending taps whose blocks are committed; a finishing lane hands its own last
+    // pages to the remaining ones or drops them.
+    void hybrid_publish_pending(SequenceState& sequence, bool finishing);
+    // Copies a tail bundle into cache-owned pages; absent when no Device page can be freed.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_copy_tail(const HybridBlockPages& source,
+                                                                std::uint32_t columns);
+    // Terminal publication: committed blocks and, when useful, an endpoint snapshot; the snapshot
+    // the lane resumed from is superseded once a deeper one exists. Then the lane's sequence is
+    // released. Returns false when the lane could not be released strictly.
+    [[nodiscard]] bool hybrid_finish_lane(SequenceState& sequence, RequestControl& request,
+                                          std::uint32_t lane, bool endpoint) noexcept;
+    // Drops the lane's index pins. Safe on any lane state.
+    void hybrid_release_lane(std::uint32_t lane) noexcept;
+    // Supersedes the snapshot the sequence resumed from once it snapshots past it at
+    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
+    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);
+    void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
 
     [[nodiscard]] std::optional<AdmissionCandidate>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
@@ -973,6 +1258,22 @@ private:
     owner_exclusive_resources(const SequenceState& sequence) const;
     [[nodiscard]] detail::PhysicalResources
     owner_exclusive_resources(const SharedPrefixState& shared) const;
+    // What an active snapshot of this sequence moves out of its exclusive ownership: every full
+    // page it alone references (Device page and any Host replica).
+    [[nodiscard]] detail::PhysicalResources
+    active_snapshot_shared_resources(const SequenceState& sequence) const;
+    // Releasing an owner can leave pages or checkpoints it shared with an active sequence
+    // referenced by that sequence alone. Their ownership then moves into the active lineage, so
+    // the active entitlement grows by exactly what became exclusive. A release site takes the
+    // baseline first and credits after; lanes whose continuation changed in between are skipped.
+    struct ActiveExclusiveEntry {
+        std::uint32_t continuation = 0;
+        detail::PhysicalResources resources;
+    };
+    using ActiveExclusiveBaseline =
+        std::array<std::optional<ActiveExclusiveEntry>, kMaximumConcurrency>;
+    [[nodiscard]] ActiveExclusiveBaseline active_exclusive_baseline() const noexcept;
+    void credit_active_ownership_transfers(const ActiveExclusiveBaseline& baseline) noexcept;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] StateImageHandle
@@ -1126,6 +1427,11 @@ private:
     void refresh_state_views(SequenceState& sequence);
     void reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots);
     void settle_state_fork(SequenceState& sequence);
+    bool publish_active_continuation(SequenceState& state, RequestControl& request,
+                                     std::uint32_t lane, std::uint32_t continuation_index,
+                                     qwen3_5::ContinuationSummary& summary) noexcept;
+    bool salvage_continuation(SequenceState& state, RequestControl& request, std::uint32_t lane,
+                              std::uint32_t continuation_index, qwen3_5::AbortResult& out) noexcept;
     [[nodiscard]] detail::PhysicalResources
     release_checkpoint_reference(StateImageHandle checkpoint) noexcept;
     [[nodiscard]] bool can_release_shared_prefix_state(std::uint32_t index,
@@ -1169,6 +1475,16 @@ private:
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    // ReplaySSM record view and fold plan for a speculative round verified at verify_drafts.
+    [[nodiscard]] const GdnReplayRecords* round_replay_records(std::uint32_t verify_drafts) const;
+    [[nodiscard]] const ops::GdnReplayFoldPlan& round_replay_fold(std::uint32_t verify_drafts) const;
+    [[nodiscard]] std::vector<NgramProposer::Match>
+    propose_ngram(std::span<const std::uint32_t> lanes,
+                  std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
+                                                         const runtime::RoundBudget& budget);
+    // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
+    static void take_ngram_index(RequestControl& request, PreparedPromptData& prompt);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets,
@@ -1187,6 +1503,28 @@ private:
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
+    [[nodiscard]] std::uint32_t kv_lease_growth_margin_tokens() const noexcept {
+        return std::max(prefill_chunk, kKVLeaseGrowthMarginTokens);
+    }
+    [[nodiscard]] std::uint32_t kv_lease_cushion_pages() const noexcept {
+        // One round's Backend requirement can sit a whole draft window above the frontier the
+        // previous round checked, so the cushion has to absorb that jump before the lease is
+        // extended again.
+        const auto page  = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const auto slack = 2U * draft_window + 2U;
+        return (slack + page - 1U) / page + 1U;
+    }
+    // The Backend lease also covers the drafts a round may still verify past the sequence's
+    // output ceiling, and one forced control span.
+    [[nodiscard]] std::uint32_t kv_lease_backend_allowance_tokens() const noexcept {
+        return draft_window + std::min(draft_window, qwen3_5::kMtpDecodeMaximumDrafts) + 1U;
+    }
+    // Page groups an entitlement needs to cover `tokens` and still hold a full cushion.
+    [[nodiscard]] std::uint32_t kv_lease_pages_for_tokens(std::uint32_t tokens) const noexcept {
+        return kv_pages_for_tokens(tokens) + kv_lease_cushion_pages();
+    }
+    void ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
+                                  std::uint32_t backend_tokens);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
@@ -1243,6 +1581,10 @@ struct PressurePlanningSessionImpl {
         std::uint32_t owner_index = 0;
         std::vector<PressureDecision> decisions;
         std::uint16_t eviction_choice = 0;
+        // Escape-hatch preserve choice: frees this owner's device KV while keeping its host copy
+        // (a demote-to-host outcome). Zero when the owner cannot be preserved this way; the
+        // protected maximal target then falls back to eviction for that owner.
+        std::uint16_t preserve_choice = 0;
     };
 
     struct CandidateOptions {
@@ -1290,8 +1632,26 @@ struct PressurePlanningSessionImpl {
         std::span<const ContinuationHandle* const> private_owners,
         std::span<const runtime::PlanningOwnerId> private_owner_ids,
         std::span<const SharedPrefixHandle* const> shared_owners,
-        std::span<const runtime::PlanningOwnerId> shared_owner_ids);
+        std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+        std::span<const runtime::PlanningOwnerId> recency_order);
     ~PressurePlanningSessionImpl() noexcept;
+
+    // Full eviction of an owner is reachable from incremental enumeration only inside the LRU tail
+    // the admission planner had to sacrifice: one of the `eviction_licence_count_` oldest ranks.
+    // Every other ranked owner, private or shared, is either demoted to Host (leaving its prefix
+    // matchable) or kept, so a plan can never trade a more recent prefix's content for an older
+    // one's device KV. An owner the caller left out of the recency order (rank -1) is sacrificed
+    // by every escape-hatch rung, so it is licensed whenever any sacrifice is licensed.
+    [[nodiscard]] bool owner_eviction_licensed(std::uint32_t owner_index) const {
+        if (owner_index >= recency_rank_.size() || eviction_licence_count_ == 0) {
+            return false;
+        }
+        const std::int32_t rank = recency_rank_[owner_index];
+        if (rank < 0) { return true; }
+        return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_ &&
+               std::find(licence_spared_ranks_.begin(), licence_spared_ranks_.end(),
+                         static_cast<std::uint32_t>(rank)) == licence_spared_ranks_.end();
+    }
 
     [[nodiscard]] qwen3_5::PressureTargetHandle
     identity_target(runtime::PlanningCandidateId candidate) const;
@@ -1299,6 +1659,26 @@ struct PressurePlanningSessionImpl {
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] qwen3_5::PressureTargetHandle
     maximal_target(runtime::PlanningCandidateId candidate);
+    // Escape-hatch recency-ladder rung. For `sacrifice_oldest` = k, the k oldest ranked owners
+    // (private and shared, by recency rank) are fully evicted, and every other owner is kept — a
+    // kept owner frees its device resources through a demote-to-host outcome wherever Host can
+    // take it (keeping its host copy). Whether the sacrifice frees enough device and host capacity
+    // is the rung's adoption check, so a pool without a host tier still expresses "evict the k
+    // oldest and keep the rest". The ladder walks k = 0..R-1 (most-preserving first) and, if no
+    // rung is adoptable, the caller falls back to `root_maximal_target` (k = R: clear everything),
+    // the guaranteed liveness backstop.
+    [[nodiscard]] qwen3_5::PressureTargetHandle
+    recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+                           std::span<const std::uint32_t> spared_ranks = {},
+                           bool demote_kept                            = true);
+    // Number of owners in the recency order; bounds the escape-hatch ladder (rungs 0..R-1, then
+    // terminal).
+    [[nodiscard]] std::uint32_t ranked_owner_count() const;
+    // Licences incremental eviction of the `oldest_licensed` oldest ranked owners. Set once per
+    // admission, from the escape-hatch ladder's smallest feasible sacrifice count (0 when the
+    // identity target is feasible, i.e. nothing needs to be evicted).
+    void set_eviction_licence(std::uint32_t oldest_licensed,
+                              std::span<const std::uint32_t> spared_ranks = {});
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -1307,6 +1687,12 @@ struct PressurePlanningSessionImpl {
                              runtime::PressureConstructionOptionId option);
     [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
     construction_target(const qwen3_5::PressureConstructionCursor& cursor);
+    // Canonical target slots the arena can still hold. The arena also holds targets a planning
+    // layer does not count in its own budget (identity targets, escape-hatch maximal rungs), so
+    // layers must bound expansion commits by optional_targets_remaining, not by their own
+    // budget, or commit_expansion rejects a commit the layer approved.
+    [[nodiscard]] std::size_t target_arena_maximum() const noexcept;
+    [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept;
     [[nodiscard]] ConstructionSlot&
     construction_slot(const qwen3_5::PressureConstructionCursor& cursor);
     static void release_construction(const void*, std::uint32_t, std::uint32_t) noexcept;
@@ -1365,6 +1751,18 @@ struct PressurePlanningSessionImpl {
     std::vector<PhysicalCandidateBinding> candidates;
     std::vector<runtime::PlanningCandidateId> candidate_ids;
     std::vector<Owner> owners;
+    // Parallel to `owners`; recency rank in the caller's order over private and shared owners
+    // (0 = most recently hit or published), or -1 for an owner left out of it. Orders the
+    // escape-hatch sacrifice: the oldest ranked owner (highest rank) gives up its host copy first.
+    std::vector<std::int32_t> recency_rank_;
+    // Number of ranked owners; the escape-hatch ladder has this many sacrifice rungs
+    // plus the clear-all terminal.
+    std::uint32_t ranked_owner_count_ = 0;
+    // Ranked owners the escape-hatch ladder had to sacrifice for the current admission, oldest
+    // first. Full eviction is reachable from incremental enumeration only inside this LRU tail.
+    std::uint32_t eviction_licence_count_ = 0;
+    // Ranks inside that tail the ladder proved it did not need to sacrifice.
+    std::vector<std::uint32_t> licence_spared_ranks_;
     std::vector<CandidateOptions> candidate_options;
     std::vector<TargetNode> targets;
     std::vector<std::uint16_t> target_choice_arena;

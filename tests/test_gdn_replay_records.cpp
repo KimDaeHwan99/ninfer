@@ -9,14 +9,32 @@
 #include <stdexcept>
 #include <utility>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 namespace {
 
-using AlignedBacking = std::unique_ptr<void, decltype(&std::free)>;
+// 256-byte aligned backing storage; std::aligned_alloc is C++26, so on MSVC use the
+// CRT's _aligned_malloc (which must be released with _aligned_free).
+#ifdef _WIN32
+inline void* aligned_backing_alloc(std::size_t bytes) {
+    return _aligned_malloc(bytes, 256);
+}
+inline void aligned_backing_free(void* data) { _aligned_free(data); }
+#else
+inline void* aligned_backing_alloc(std::size_t bytes) {
+    return std::aligned_alloc(256, bytes);
+}
+inline void aligned_backing_free(void* data) { std::free(data); }
+#endif
+
+using AlignedBacking = std::unique_ptr<void, decltype(&aligned_backing_free)>;
 
 AlignedBacking make_backing(std::size_t bytes) {
-    void* data = std::aligned_alloc(256, bytes);
+    void* data = aligned_backing_alloc(bytes);
     if (data == nullptr) { throw std::bad_alloc(); }
-    return AlignedBacking(data, &std::free);
+    return AlignedBacking(data, &aligned_backing_free);
 }
 
 int fail(const char* label) {
@@ -119,6 +137,70 @@ int main() {
     failures += expect_throw([&] { (void)records.layer(3, 1); }, "past-end layer");
     failures += expect_throw([&] { (void)records.layer(0, 0); }, "zero active rows");
     failures += expect_throw([&] { (void)records.layer(0, 6); }, "excess active rows");
+
+    for (int width = 1; width <= spec.width; ++width) {
+        const auto narrow = records.narrowed(width);
+        failures += expect(narrow.spec.width == width && narrow.spec.layers == spec.layers &&
+                               narrow.spec.record_capacity == spec.record_capacity,
+                           "narrowed spec differs");
+        failures += expect_shape(narrow.conv, 256, width, 15, 1, "narrowed conv plane");
+        failures += expect_shape(narrow.key, 128, 2, width, 15, "narrowed key plane");
+        failures += expect_shape(narrow.value, 128, 6, width, 15, "narrowed value plane");
+        failures += expect_shape(narrow.gate, 2, 6, width, 15, "narrowed gate plane");
+        failures += expect(narrow.conv.data == records.conv.data &&
+                               narrow.key.data == records.key.data &&
+                               narrow.value.data == records.value.data &&
+                               narrow.gate.data == records.gate.data,
+                           "narrowed view moved a plane base");
+        const auto narrow_layer = narrow.layer(2, 3);
+        failures += expect_shape(narrow_layer.key, 128, 2, width, 3, "narrowed layer key");
+        failures += expect(static_cast<std::byte*>(narrow_layer.key.data) -
+                                   static_cast<std::byte*>(records.key.data) ==
+                               static_cast<std::ptrdiff_t>(2 * spec.record_capacity *
+                                                           narrow.key.nb[3]),
+                           "narrowed layer offset is not dense at the narrowed width");
+        failures += expect(narrow_layer.key.is_contiguous() && narrow_layer.conv.is_contiguous(),
+                           "narrowed layer rows are not dense");
+    }
+    failures += expect_throw([&] { (void)records.narrowed(0); }, "zero narrowed width");
+    failures += expect_throw([&] { (void)records.narrowed(spec.width + 1); },
+                             "narrowed width above the storage width");
+
+    auto wide_spec  = spec;
+    wide_spec.width = 64;
+    ninfer::LayoutBuilder wide_builder;
+    const auto wide_layout = ninfer::plan_gdn_replay_records(wide_builder, wide_spec);
+    const auto wide_bytes  = wide_builder.finish(256);
+    auto wide_backing      = make_backing(wide_bytes);
+    const ninfer::GdnReplayRecords wide({wide_backing.get(), wide_bytes}, wide_layout);
+    const auto row = wide.layer(2, 1);
+    for (int width = 1; width <= 64; ++width) {
+        const auto prefix = row.single_row_prefix(width);
+        failures += expect_shape(prefix.conv, 256, width, 1, 1, "prefix conv");
+        failures += expect_shape(prefix.key, 128, 2, width, 1, "prefix key");
+        failures += expect_shape(prefix.value, 128, 6, width, 1, "prefix value");
+        failures += expect_shape(prefix.gate, 2, 6, width, 1, "prefix gate");
+        failures +=
+            expect(prefix.conv.data == row.conv.data && prefix.key.data == row.key.data &&
+                       prefix.value.data == row.value.data && prefix.gate.data == row.gate.data,
+                   "prefix moved the record base");
+        failures += expect(prefix.conv.is_contiguous() && prefix.key.is_contiguous() &&
+                               prefix.value.is_contiguous() && prefix.gate.is_contiguous(),
+                           "single-row record prefix is not packed");
+    }
+    for (int width : {0, -1, 65}) {
+        failures +=
+            expect_throw([&] { (void)row.single_row_prefix(width); }, "invalid prefix width");
+    }
+    failures += expect_throw([&] { (void)wide.layer(1, 2).single_row_prefix(6); },
+                             "multi-row record prefix");
+    auto strided = row;
+    strided.key.nb[1] *= 2;
+    failures += expect_throw([&] { (void)strided.single_row_prefix(6); }, "strided record prefix");
+    auto mismatched       = row;
+    mismatched.gate.ne[2] = 32;
+    failures +=
+        expect_throw([&] { (void)mismatched.single_row_prefix(6); }, "mismatched record width");
 
     failures += expect_size(record_bytes({.layers          = 48,
                                           .record_capacity = 8,

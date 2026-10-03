@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -16,6 +17,7 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
     const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
     float* beta, int tokens, float eps) {
+    pdl::enter();
     constexpr int D = 5120, Warps = Threads / 32;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.x,
               first = blockIdx.y * Tile;
@@ -102,14 +104,14 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
     const auto launch = [&]<int T, int Threads>() {
         const auto kernel = heads == 24 ? gdn_norm_gating_27_simt<24, T, Threads>
                                         : gdn_norm_gating_27_simt<48, T, Threads>;
-        kernel<<<dim3(heads, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const __nv_bfloat16*>(norm_weight.data),
-                static_cast<const __nv_bfloat16*>(a_weight.qdata),
-                static_cast<const __nv_bfloat16*>(b_weight.qdata),
-                static_cast<const float*>(alog.data), static_cast<const float*>(bias.data),
-                static_cast<__nv_bfloat16*>(h.data), static_cast<float*>(g.data),
-                static_cast<float*>(beta.data), x.ne[1], eps);
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(heads, (x.ne[1] + T - 1) / T), dim3(Threads), 0, stream}, kernel,
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(norm_weight.data),
+            static_cast<const __nv_bfloat16*>(a_weight.qdata),
+            static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(alog.data),
+            static_cast<const float*>(bias.data), static_cast<__nv_bfloat16*>(h.data),
+            static_cast<float*>(g.data), static_cast<float*>(beta.data), x.ne[1], eps));
     };
     const int tokens = x.ne[1];
     if (tokens <= 2)

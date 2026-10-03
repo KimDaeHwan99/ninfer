@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <array>
@@ -14,6 +15,14 @@
 namespace ninfer::models::qwen3_5::execution {
 
 using LinearParameters = ops::SingleProjectionWeight;
+
+[[nodiscard]] inline ops::LinearPolicy residual_projection_policy(const LinearParameters& p,
+                                                                  bool wide_verification) {
+    // Keep the neural path's residual activation precision in wide copy verification.
+    return wide_verification && p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16
+               ? ops::LinearPolicy::A16Only
+               : p.policy;
+}
 
 [[nodiscard]] inline std::int32_t dimension(std::uint64_t value) {
     if (value > std::uint64_t(std::numeric_limits<std::int32_t>::max())) {
@@ -50,6 +59,8 @@ struct BlockParameters {
 };
 
 struct TextParameters {
+    // Prepared once for the Text backbone and its MTP companion; absent for GDN-only data.
+    std::optional<ops::PreparedRope> rope;
     Weight token_embedding;
     LinearParameters output_head;
     Tensor final_norm;
@@ -57,7 +68,10 @@ struct TextParameters {
 };
 
 struct MtpProjectionParameters {
-    LinearParameters packed;
+    // Set only when the four attention projections share one contiguous parent region,
+    // which the fused attn_input_proj / packed-linear path requires. Mixed-format
+    // artifacts (e.g. Q8 K/V with bf16 Q/gate) leave this empty.
+    std::optional<LinearParameters> packed;
     // Dense MTP projects K/V and Q/gate independently in its incremental path.
     // MoE MTP uses its existing complete-parent Attention projection.
     std::optional<std::array<LinearParameters, 4>> rows;
@@ -114,6 +128,7 @@ struct SelectorParameters {
 };
 
 struct DraftParameters {
+    ops::PreparedRope rope;
     LinearParameters feature_projection;
     Tensor context_norm, final_norm;
     std::vector<DraftBlockParameters> layers;

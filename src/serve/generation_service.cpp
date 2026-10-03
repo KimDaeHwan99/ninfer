@@ -230,23 +230,30 @@ private:
 
 } // namespace
 
-GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer)
+GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer,
+                                     DiagnosticObserver diagnostic_observer)
     : options_(std::move(options)) {
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.chat_template_path       = options_.chat_template_path;
+    engine_options.thinking_budget_message  = options_.thinking_budget_message;
     engine_options.device                   = options_.device;
     engine_options.tensor_parallel          = static_cast<std::uint32_t>(options_.devices.size());
     engine_options.devices                  = options_.devices;
     engine_options.max_context              = options_.max_context;
+    engine_options.rope_yarn_factor          = options_.rope_yarn_factor;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
-    engine_options.kv_cache                 = options_.kv_cache;
-    engine_options.enable_vision            = options_.enable_vision;
-    engine_options.use_cuda_graph           = options_.use_cuda_graph;
+    engine_options.original_int8_prefill_kernel = options_.original_int8_prefill_kernel;
+    engine_options.original_nvfp4_prefill_kernel = options_.original_nvfp4_prefill_kernel;
+    engine_options.kv_cache                  = options_.kv_cache;
+    engine_options.enable_vision             = options_.enable_vision;
+    engine_options.vision_offload            = options_.vision_offload;
+    engine_options.vision_max_merged_tokens  = options_.vision_max_merged_tokens;
+    engine_options.use_cuda_graph            = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
     engine_options.context_cost.preset_path = options_.context_cost_presets;
@@ -254,31 +261,40 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
+    engine_options.diagnostic_observer      = std::move(diagnostic_observer);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(
+        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    count_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
 
 std::shared_ptr<RequestLifetime>
 GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) const {
+    return acquire_lifetime(request_capacity_, deadline_policy, "inference request queue is full");
+}
+
+std::shared_ptr<RequestLifetime>
+GenerationService::acquire_lifetime(const std::shared_ptr<RequestCapacity>& capacity,
+                                    DeadlinePolicy deadline_policy,
+                                    const char* full_message) const {
     const auto started = Clock::now();
     {
-        std::lock_guard lock(request_capacity_->mutex);
-        if (request_capacity_->active >= request_capacity_->maximum) {
-            throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
-                                                     "inference request queue is full"));
+        std::lock_guard lock(capacity->mutex);
+        if (capacity->active >= capacity->maximum) {
+            throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded, full_message));
         }
-        ++request_capacity_->active;
+        ++capacity->active;
     }
     try {
         const Clock::time_point deadline =
             deadline_policy == DeadlinePolicy::UnboundedStartup
                 ? Clock::time_point::max()
                 : started + std::chrono::milliseconds(options_.pending_timeout_ms);
-        return std::make_shared<RequestLifetime>(request_capacity_, started, deadline);
+        return std::make_shared<RequestLifetime>(capacity, started, deadline);
     } catch (...) {
-        std::lock_guard lock(request_capacity_->mutex);
-        --request_capacity_->active;
+        std::lock_guard lock(capacity->mutex);
+        --capacity->active;
         throw;
     }
 }
@@ -305,10 +321,11 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
-    prepared.thinking_budget     = request_options.execution.thinking.budget;
-    prepared.reasoning_effort    = semantics.reasoning_effort;
-    prepared.preserve_thinking   = semantics.preserve_thinking;
-    const bool request_has_media = request.media_item_count() != 0;
+    request_options.ngram_session = request.ngram_session;
+    prepared.thinking_budget      = request_options.execution.thinking.budget;
+    prepared.reasoning_effort     = semantics.reasoning_effort;
+    prepared.preserve_thinking    = semantics.preserve_thinking;
+    const bool request_has_media  = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
@@ -373,8 +390,9 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    const Clock::time_point deadline =
-        Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
+    const std::shared_ptr<RequestLifetime> lifetime = acquire_lifetime(
+        count_capacity_, DeadlinePolicy::ClientPendingTimeout, "token count queue is full");
+    const Clock::time_point deadline        = lifetime->deadline;
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     try {
         std::size_t remaining_media_bytes =
@@ -431,23 +449,37 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
     outcome.metrics.vision_seconds          = result.timings.vision_seconds;
-    outcome.metrics.prefill_seconds         = result.timings.prefill_seconds;
-    outcome.metrics.decode_seconds          = result.timings.decode_seconds;
-    outcome.metrics.prompt_wall_seconds     = result.timings.prompt_wall_seconds;
-    outcome.metrics.generation_wall_seconds = result.timings.generation_wall_seconds;
+    outcome.metrics.prefill_seconds                = result.timings.prefill_seconds;
+    outcome.metrics.decode_seconds                 = result.timings.decode_seconds;
+    outcome.metrics.decode_share_seconds           = result.timings.decode_share_seconds;
+    outcome.metrics.prompt_wall_seconds            = result.timings.prompt_wall_seconds;
+    outcome.metrics.generation_wall_seconds        = result.timings.generation_wall_seconds;
+    outcome.metrics.vision_offload_window_seconds  = result.timings.vision_offload_window_seconds;
+    outcome.metrics.vision_offload_evict_seconds   = result.timings.vision_offload_evict_seconds;
+    outcome.metrics.vision_offload_restore_seconds = result.timings.vision_offload_restore_seconds;
+    outcome.metrics.vision_offload_evicted_bytes   = result.timings.vision_offload_evicted_bytes;
+    outcome.metrics.vision_offload_staged_bytes    = result.timings.vision_offload_staged_bytes;
     outcome.metrics.total_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
-    outcome.metrics.engine_timing               = result.engine_timing;
-    outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
-    outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
-    outcome.metrics.materialization             = result.materialization;
-    outcome.metrics.speculative_backend         = result.speculative.backend;
-    outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
-    outcome.metrics.speculative_rounds          = result.speculative.rounds;
-    outcome.metrics.speculative_draft_tokens    = result.speculative.drafted_tokens;
-    outcome.metrics.speculative_accepted_tokens = result.speculative.accepted_tokens;
-    outcome.metrics.speculative_fallback_steps  = result.speculative.fallback_steps;
+    outcome.metrics.engine_timing                = result.engine_timing;
+    outcome.metrics.prefix_cache_hit_tokens      = result.reused_prompt_tokens;
+    outcome.metrics.prefix_reuse_path            = result.prefix_reuse_path;
+    outcome.metrics.materialization              = result.materialization;
+    outcome.metrics.speculative_backend          = result.speculative.backend;
+    outcome.metrics.speculative_draft_window     = result.speculative.draft_window;
+    outcome.metrics.speculative_rounds           = result.speculative.rounds;
+    outcome.metrics.speculative_draft_tokens     = result.speculative.drafted_tokens;
+    outcome.metrics.speculative_accepted_tokens  = result.speculative.accepted_tokens;
+    outcome.metrics.speculative_fallback_steps   = result.speculative.fallback_steps;
+    outcome.metrics.ngram_rounds                 = result.speculative.ngram_rounds;
+    outcome.metrics.ngram_drafted_tokens         = result.speculative.ngram_drafted_tokens;
+    outcome.metrics.ngram_accepted_tokens        = result.speculative.ngram_accepted_tokens;
+    outcome.metrics.ngram_archive_rounds         = result.speculative.ngram_archive_rounds;
+    outcome.metrics.ngram_archive_drafted_tokens = result.speculative.ngram_archive_drafted_tokens;
+    outcome.metrics.ngram_archive_accepted_tokens =
+        result.speculative.ngram_archive_accepted_tokens;
+    outcome.metrics.ngram_archive = result.ngram_archive;
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 

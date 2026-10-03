@@ -1,5 +1,6 @@
 #pragma once
 
+#include "serve/console_stats.h"
 #include "serve/generation_service.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
@@ -34,15 +35,28 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 
+// Anthropic SDKs append /v1/<endpoint> to their base URL, so a client given the OpenAI-style base
+// URL that already ends in /v1 requests /v1/v1/<endpoint>. Every API route also answers there:
+// api_route_pattern("/messages") matches /v1/messages and /v1/v1/messages without adding a capture
+// group, and canonical_api_path maps the doubled form back to the /v1/<endpoint> it names.
+[[nodiscard]] std::string api_route_pattern(std::string_view endpoint);
+[[nodiscard]] std::string_view canonical_api_path(std::string_view path) noexcept;
+
 class HttpServer {
 public:
-    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);
+    // `panel` is the console panel for the session statistics; it is drawn only when enabled by
+    // the options and supported by the terminal, and may be null.
+    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
+               std::shared_ptr<product::TerminalPanel> panel = nullptr);
 
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
     void attach(GenerationService& service);
     bool listen();
+    // Closes the listening socket and stops the attached service's Engine, whose queued and
+    // running requests then fail, so listen() returns within about one unit of Engine work.
+    // Does not block; callable from any thread.
     void stop();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
@@ -105,9 +119,11 @@ private:
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
+    ninfer::ModelMetadata model_metadata_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
+    std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;

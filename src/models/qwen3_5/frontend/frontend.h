@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "models/qwen3_5/ngram.h"
 #include "models/qwen3_5/frontend/output_session.h"
 #include "models/registry.h"
 #include "runtime/contract/request.h"
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -25,6 +27,24 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    // Cap on merged tokens a single image/video item may contribute; 0 leaves the
+    // processor defaults untouched.
+    std::uint32_t vision_max_merged_tokens = 32768;
+    bool ngram_sources_enabled             = false;
+    bool ngram_archive_enabled             = false;
+    // End-of-thinking message injected when a request hits its thinking budget. Empty
+    // preserves the built-in canonical control suffix; a message lacking the canonical
+    // </think> close serialization gets it appended at startup.
+    std::string thinking_budget_message;
+    // Per-continuation long-anchor capacity L. When nonzero, preparation synthesizes
+    // engine-automatic PrivateLongAnchor opportunities at up to L message boundaries, walking back
+    // from the prompt end on a geometrically widening grid (`long_anchor_min_spacing_tokens`), so a
+    // later history rewrite diverging there resumes from the retained anchor instead of root.
+    // The Engine may raise it after startup through Frontend::publish_long_anchor_limit.
+    std::uint32_t max_long_anchors_per_continuation = 0;
+    // Minimum token gap between consecutive engine-automatic anchors (and between the deepest
+    // prompt-end grid point and the first anchor), doubling per anchor; 0 disables spacing.
+    std::uint32_t long_anchor_min_spacing_tokens = 0;
 };
 
 struct FrontendResources;
@@ -46,6 +66,8 @@ public:
     [[nodiscard]] PromptSummary summary() const;
     [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
+    [[nodiscard]] std::unique_ptr<NgramArchive::Request> bind_ngram(NgramArchive& archive,
+                                                                    const NgramSessionHints& hints);
 
 private:
     explicit PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept;
@@ -78,6 +100,10 @@ public:
                         const ThinkingControlOptions& thinking = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
+    // Publishes the resolved long-anchor count. Startup builds the frontend before the sequence
+    // plan exists, so the Engine hands the host-cache-resolved value to the grid the capture path
+    // will create checkpoints for, before any request is prepared.
+    void publish_long_anchor_limit(std::uint32_t anchors) noexcept;
 
 private:
     class Impl;

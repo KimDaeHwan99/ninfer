@@ -7,9 +7,14 @@
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
+#include "runtime/engine/context_cache/hybrid_resource_manager.h"
+#include "runtime/engine/diagnostics.h"
 #include "runtime/engine/model_instance.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -40,6 +45,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.thinking                = options.execution.thinking;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
+    resolved.ngram_session                     = std::move(options.ngram_session);
     return resolved;
 }
 
@@ -147,22 +153,35 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
-    using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
-    using Core =
-        std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>>;
+    using HybridGenerationCore =
+        runtime::EngineCore<runtime::ModelInstance,
+                            runtime::HybridResourceManager<runtime::ModelInstance::ModelContract>>;
+    using ScoringCore = runtime::CausalScoreCore<runtime::ModelInstance>;
+    using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
+                              std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         auto constructed  = runtime::construct_model(options, device);
+        // construct_model returns the resolved options for this instance. Anything the model had
+        // to derive (the single host RAM budget's Host split and long-anchor count) is only known
+        // after planning, so the Engine adopts the resolved copy here — before the core that
+        // sizes its admission capacity from it exists — and reports it through options().
+        options           = std::move(constructed.options);
         active            = std::move(constructed.instance);
         load              = std::move(constructed.load);
+        model_metadata    = std::move(constructed.model_metadata);
         load.cuda_sync_mode = device.sync_mode();
         sampling_defaults = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         if (options.purpose == EnginePurpose::CausalScoring) {
             core = std::make_unique<ScoringCore>(*active, device);
+        } else if (options.context_cache.enabled &&
+                   options.context_cache.mode == ContextCacheMode::Hybrid) {
+            core = std::make_unique<HybridGenerationCore>(*active, device, options,
+                                                          std::move(constructed.context_cost));
         } else {
             core = std::make_unique<GenerationCore>(*active, device, options,
                                                     std::move(constructed.context_cost));
@@ -172,9 +191,63 @@ public:
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
+        const bool persists = persists_prefix_cache();
+        stop();
+        // Joins the generation core's orderly stop, which saves the Host tier before dropping it.
         core.emplace<std::monostate>();
         try {
             device.synchronize();
+        } catch (...) {}
+        if (persists) { report_prefix_cache_save(); }
+    }
+
+    void stop() noexcept {
+        if (stop_requested.exchange(true)) { return; }
+        if (persists_prefix_cache()) {
+            runtime::publish_diagnostic(
+                options.diagnostic_observer, DiagnosticLevel::Info, "saving the prefix cache to %s",
+                options.context_cache.hybrid.persistent_file.string().c_str());
+        }
+        std::visit(
+            [](auto& state) {
+                using CoreState = std::remove_cvref_t<decltype(state)>;
+                if constexpr (!std::is_same_v<CoreState, std::monostate>) { state->stop(); }
+            },
+            core);
+    }
+
+    [[nodiscard]] bool persists_prefix_cache() const noexcept {
+        return std::holds_alternative<std::unique_ptr<HybridGenerationCore>>(core) &&
+               !options.context_cache.hybrid.persistent_file.empty();
+    }
+
+    void report_prefix_cache_save() const noexcept {
+        try {
+            const std::optional<models::qwen3_5::HybridCachePersistence> result =
+                active->program->hybrid_shutdown_save();
+            if (!result) {
+                runtime::publish_diagnostic(
+                    options.diagnostic_observer, DiagnosticLevel::Warning,
+                    "prefix cache not saved: the Engine did not stop cleanly");
+                return;
+            }
+            const models::qwen3_5::HybridCachePersistence& saved = *result;
+            if (saved.ok) {
+                runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                            "prefix cache saved: %llu blocks, %llu snapshots, "
+                                            "%.1f MiB in %.1f s",
+                                            static_cast<unsigned long long>(saved.blocks),
+                                            static_cast<unsigned long long>(saved.snapshots),
+                                            static_cast<double>(saved.bytes) / 1048576.0,
+                                            saved.seconds);
+            } else {
+                runtime::publish_diagnostic(options.diagnostic_observer,
+                                            DiagnosticLevel::Warning, "prefix cache not saved: %s",
+                                            saved.message.c_str());
+            }
+        } catch (const std::exception& error) {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                        "prefix cache not saved: %s", error.what());
         } catch (...) {}
     }
 
@@ -182,8 +255,10 @@ public:
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
     LoadSummary load;
+    ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
     Core core;
+    std::atomic<bool> stop_requested{false};
 };
 
 Engine::Engine(EngineOptions options) {
@@ -366,6 +441,11 @@ LoadSummary Engine::load_summary() const {
     return impl_->load;
 }
 
+ModelMetadata Engine::model_metadata() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->model_metadata;
+}
+
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
@@ -423,6 +503,10 @@ void Engine::reset_memory_peaks() noexcept {
             }
         },
         impl_->core);
+}
+
+void Engine::stop() noexcept {
+    if (impl_ != nullptr) { impl_->stop(); }
 }
 
 } // namespace ninfer

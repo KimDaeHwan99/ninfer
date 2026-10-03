@@ -42,6 +42,11 @@ std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }
 
+const ContextCacheOptions& SequencePlan::context_cache_options() const noexcept {
+    static const ContextCacheOptions empty;
+    return impl_ != nullptr ? impl_->context_cache : empty;
+}
+
 SequencePlanner::SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -140,6 +145,27 @@ PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) 
     return impl_->maximal_target(candidate);
 }
 
+PressureTargetHandle PressurePlanningSession::recency_maximal_target(
+    runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+    std::span<const std::uint32_t> spared_ranks, bool demote_kept) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->recency_maximal_target(candidate, sacrifice_oldest, spared_ranks, demote_kept);
+}
+
+std::uint32_t PressurePlanningSession::ranked_owner_count() const {
+    if (impl_ == nullptr) { return 0; }
+    return impl_->ranked_owner_count();
+}
+
+void PressurePlanningSession::set_eviction_licence(std::uint32_t oldest_licensed,
+                                                   std::span<const std::uint32_t> spared_ranks) {
+    if (impl_ != nullptr) { impl_->set_eviction_licence(oldest_licensed, spared_ranks); }
+}
+
+std::uint32_t PressurePlanningSession::optional_targets_remaining() const noexcept {
+    return impl_ != nullptr ? impl_->optional_targets_remaining() : 0;
+}
+
 PressureConstructionCursor PressurePlanningSession::begin_construction(PressureTargetHandle target,
                                                                        bool restore) {
     return impl_->begin_construction(target, restore);
@@ -205,6 +231,14 @@ std::optional<ResourcePlan> PressurePlanningSession::seal(AssessedPressureTarget
     return ResourcePlan(std::move(*sealed), impl_->resource_revision, needs_transfer);
 }
 
+bool PressurePlanningSession::try_claim_seal_window() noexcept {
+    return impl_ != nullptr && impl_->program->try_claim_seal_window();
+}
+
+void PressurePlanningSession::release_seal_window() noexcept {
+    if (impl_ != nullptr) { impl_->program->release_seal_window(); }
+}
+
 std::optional<CapturePressurePlan>
 PressurePlanningSession::seal_capture(AssessedPressureTarget&& assessed) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
@@ -225,6 +259,10 @@ CapturePressurePlanningSession::guidance(PressureTargetHandle target) {
 
 AssessedPressureTarget CapturePressurePlanningSession::assess(PressureTargetHandle target) {
     return session_.assess(target);
+}
+
+std::uint32_t CapturePressurePlanningSession::optional_targets_remaining() const noexcept {
+    return session_.optional_targets_remaining();
 }
 
 PreparedPressureExpansion
@@ -268,6 +306,14 @@ bool same_tokens(const PendingBatch& left, const PendingBatch& right) {
 }
 
 } // namespace
+
+bool CapturePressurePlanningSession::try_claim_seal_window() noexcept {
+    return session_.try_claim_seal_window();
+}
+
+void CapturePressurePlanningSession::release_seal_window() noexcept {
+    session_.release_seal_window();
+}
 
 Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std::move(impl)) {}
 
@@ -341,7 +387,7 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
     PreparedPromptData data = PreparedPromptAccess::take(std::move(prompt));
     if (!peer_) { return impl_->causal_score(std::move(data), first_target); }
-    PreparedPromptData peer_data = data;
+    PreparedPromptData peer_data = data.tensor_parallel_peer_copy();
     std::vector<float> local, peer;
     on_ranks([&] { peer = peer_->causal_score(std::move(peer_data), first_target); },
              [&] { local = impl_->causal_score(std::move(data), first_target); });
@@ -379,7 +425,8 @@ Program::begin_pressure_planning(std::span<const AdmissionCandidate* const> cand
                                  std::span<const ContinuationHandle* const> private_owners,
                                  std::span<const runtime::PlanningOwnerId> private_owner_ids,
                                  std::span<const SharedPrefixHandle* const> shared_owners,
-                                 std::span<const runtime::PlanningOwnerId> shared_owner_ids) {
+                                 std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+                                 std::span<const runtime::PlanningOwnerId> recency_order) {
     using SessionImpl = detail::PressurePlanningSessionImpl;
     std::vector<SessionImpl::PhysicalCandidateBinding> physical_candidates;
     physical_candidates.reserve(candidates.size());
@@ -394,7 +441,7 @@ Program::begin_pressure_planning(std::span<const AdmissionCandidate* const> cand
     }
     return PressurePlanningSession(std::make_unique<detail::PressurePlanningSessionImpl>(
         *impl_, physical_candidates, candidate_ids, private_owners, private_owner_ids,
-        shared_owners, shared_owner_ids));
+        shared_owners, shared_owner_ids, recency_order));
 }
 
 runtime::PrefillWork
@@ -420,7 +467,7 @@ Program::start_resource_transaction(ResourcePlan&& plan, PreparedPrompt&& prompt
     require_same(plan.revision_ == peer_->resource_revision(), "resource revision");
     AdmissionCandidate peer_admission(
         std::make_unique<detail::AdmissionCandidateImpl>(*plan.admission_.impl_));
-    PreparedPromptData peer_data = data;
+    PreparedPromptData peer_data = data.tensor_parallel_peer_copy();
     const auto fixed             = snapshot_cancellation(cancellation);
     runtime::ContextTransactionReserveStatus local{}, peer{};
     on_ranks(
@@ -473,6 +520,14 @@ void Program::finalize_context_transaction() noexcept {
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
+bool Program::wait_context_transfer() noexcept {
+    if (!peer_) { return impl_->wait_context_transfer(); }
+    bool local = false, peer = false;
+    on_ranks_noexcept([&] { peer = peer_->wait_context_transfer(); },
+                      [&] { local = impl_->wait_context_transfer(); });
+    return local || peer;
+}
+
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
                                          runtime::ExecutionTiming* failed_timing) {
     if (!peer_) { return impl_->advance_prefill(sequence, failed_timing); }
@@ -516,7 +571,8 @@ CapturePressurePlanningSession Program::begin_capture_pressure_planning(
     const CaptureAssessment& assessment, std::span<const ContinuationHandle* const> private_owners,
     std::span<const runtime::PlanningOwnerId> private_owner_ids,
     std::span<const SharedPrefixHandle* const> shared_owners,
-    std::span<const runtime::PlanningOwnerId> shared_owner_ids) {
+    std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+    std::span<const runtime::PlanningOwnerId> recency_order) {
     CapturePressureCandidate candidate(impl_->make_capture_physical_candidate(assessment));
     using SessionImpl = detail::PressurePlanningSessionImpl;
     const std::array physical_candidates{SessionImpl::PhysicalCandidateBinding{
@@ -526,7 +582,7 @@ CapturePressurePlanningSession Program::begin_capture_pressure_planning(
     const std::array candidate_ids{CapturePressurePlanningSession::candidate_id()};
     PressurePlanningSession session(std::make_unique<detail::PressurePlanningSessionImpl>(
         *impl_, physical_candidates, candidate_ids, private_owners, private_owner_ids,
-        shared_owners, shared_owner_ids));
+        shared_owners, shared_owner_ids, recency_order));
     return CapturePressurePlanningSession(std::move(candidate), std::move(session));
 }
 
@@ -718,10 +774,39 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept {
 AbortResult Program::abort(SequenceHandle sequence) noexcept {
     if (!peer_) { return impl_->abort(sequence); }
     const SequenceHandle peer_handle = peer_sequence(sequence);
-    AbortResult local{};
+    std::optional<AbortResult> local;
     on_ranks_noexcept([&] { (void)peer_->abort(peer_handle); },
-                      [&] { local = impl_->abort(sequence); });
+                      [&] { local.emplace(impl_->abort(sequence)); });
+    return std::move(*local);
+}
+
+std::optional<std::uint32_t> Program::device_kv_lease_settlement_tokens(
+    SequenceHandle sequence, std::uint32_t forced_span_tokens) const noexcept {
+    return impl_->device_kv_lease_settlement_tokens(sequence, forced_span_tokens);
+}
+
+std::optional<DeviceKVLeaseShortfall>
+Program::device_kv_lease_shortfall(SequenceHandle sequence) const noexcept {
+    return impl_->device_kv_lease_shortfall(sequence);
+}
+
+bool Program::resume_device_kv_lease(SequenceHandle sequence) noexcept {
+    if (!peer_) { return impl_->resume_device_kv_lease(sequence); }
+    const SequenceHandle peer_handle = peer_sequence(sequence);
+    bool local = false, peer = false;
+    on_ranks_noexcept([&] { peer = peer_->resume_device_kv_lease(peer_handle); },
+                      [&] { local = impl_->resume_device_kv_lease(sequence); });
+    if (local != peer) { ranks_diverged("device KV lease resumption"); }
     return local;
+}
+
+DeviceKVPages
+Program::retained_device_kv_pages(const ContinuationHandle& continuation) const noexcept {
+    return impl_->retained_device_kv_pages(continuation);
+}
+
+DeviceKVPages Program::retained_device_kv_pages(const SharedPrefixHandle& shared) const noexcept {
+    return impl_->retained_device_kv_pages(shared);
 }
 
 ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) noexcept {
@@ -743,17 +828,81 @@ ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexce
     return local;
 }
 
-void Program::fail_all_cleanup() noexcept {
-    if (!peer_) {
-        impl_->fail_all_cleanup();
-        return;
-    }
+std::optional<PhysicalUsageSnapshot> Program::fail_all_cleanup() noexcept {
+    return cleanup_ranks(detail::ProgramCleanup::Failure);
+}
+
+std::optional<PhysicalUsageSnapshot> Program::shutdown_cleanup() noexcept {
+    return cleanup_ranks(detail::ProgramCleanup::Shutdown);
+}
+
+std::optional<PhysicalUsageSnapshot>
+Program::cleanup_ranks(detail::ProgramCleanup cleanup) noexcept {
+    if (!peer_) { return impl_->fail_all_cleanup(cleanup); }
     peer_pending_.reset();
-    on_ranks_noexcept([&] { peer_->fail_all_cleanup(); }, [&] { impl_->fail_all_cleanup(); });
+    std::optional<PhysicalUsageSnapshot> usage;
+    on_ranks_noexcept([&] { (void)peer_->fail_all_cleanup(cleanup); },
+                      [&] { usage = impl_->fail_all_cleanup(cleanup); });
+    return usage;
 }
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     return impl_->isolated_request_feasible(base);
+}
+
+bool Program::hybrid_prefix_cache() const noexcept { return impl_->hybrid_prefix_cache(); }
+
+HybridAdmissionQuote Program::hybrid_quote(const PreparedPrompt& prompt,
+                                           const RequestBasePlan& base,
+                                           runtime::LaneId destination) {
+    return impl_->hybrid_quote(PreparedPromptAccess::view(prompt), base, destination);
+}
+
+runtime::ContextTransactionReserveStatus
+Program::hybrid_reserve_materialization(HybridAdmissionQuote&& quote, PreparedPrompt&& prompt,
+                                        runtime::CancellationFlagView cancellation) {
+    // The prompt is taken only once the reservation will succeed: a rejected quote leaves the
+    // waiting request intact for a later admission attempt.
+    if (!impl_->hybrid_reservable(quote, cancellation)) {
+        return runtime::ContextTransactionReserveStatus::Aborted;
+    }
+    return impl_->hybrid_reserve_materialization(
+        std::move(quote), PreparedPromptAccess::view(prompt),
+        [&prompt]() { return PreparedPromptAccess::take(std::move(prompt)); }, cancellation);
+}
+
+std::uint32_t Program::hybrid_reclaim_device_kv(std::uint32_t main_pages,
+                                                std::uint32_t backend_pages) {
+    return impl_->hybrid_reclaim_device_kv(main_pages, backend_pages);
+}
+
+std::optional<std::uint32_t> Program::hybrid_prefetch(const PreparedPrompt& prompt,
+                                                      const RequestBasePlan& base) {
+    return impl_->hybrid_prefetch(PreparedPromptAccess::view(prompt), base);
+}
+
+std::uint32_t Program::hybrid_prefetch_room() const noexcept {
+    return impl_->hybrid_prefetch_room();
+}
+
+HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->hybrid_stats(); }
+
+void Program::set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost) {
+    impl_->set_hybrid_cost(cost);
+}
+
+void Program::set_hybrid_coalesce_wait_limit(double seconds) {
+    impl_->set_hybrid_coalesce_wait_limit(seconds);
+}
+
+HybridCachePersistence Program::attach_hybrid_cache_file(const std::filesystem::path& path,
+                                                         std::string fingerprint,
+                                                         const StartupObserver& observer) {
+    return impl_->attach_hybrid_cache_file(path, std::move(fingerprint), observer);
+}
+
+std::optional<HybridCachePersistence> Program::hybrid_shutdown_save() const {
+    return impl_->hybrid_shutdown_save();
 }
 
 runtime::ProgramResourceRevision Program::resource_revision() const noexcept {

@@ -17,6 +17,14 @@ from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
 
 
+def _open_named_source(path: Path):
+    if path.suffix == ".gguf":
+        from .sources.gguf import GGUFSource
+
+        return GGUFSource(path)
+    return SafetensorsSource(path)
+
+
 class SourceInputs(Mapping):
     """Named optional sources are opened only when a recipe or component requests one."""
 
@@ -32,7 +40,7 @@ class SourceInputs(Mapping):
                     f"selected recipe requires source {name!r}; provide --source {name}=PATH"
                 )
             self._sources[name] = self._stack.enter_context(
-                SafetensorsSource(self._paths[name])
+                _open_named_source(self._paths[name])
             )
         return self._sources[name]
 
@@ -58,12 +66,22 @@ def _pairs(values, label):
     return result
 
 
+def _recipe_parts(value: str):
+    """Split a FILE[:function] recipe reference.
+
+    Only a colon followed by a bare identifier is the separator; any other colon -
+    such as a Windows drive letter, or one inside a POSIX path component - belongs
+    to the path."""
+    filename, separator, function = value.rpartition(":")
+    if not separator or not function.isidentifier():
+        return value, "configure"
+    return filename, function
+
+
 def _function(value: str):
     if value in RECIPES:
         return RECIPES[value]
-    filename, separator, function = value.rpartition(":")
-    if not separator:
-        filename, function = value, "configure"
+    filename, function = _recipe_parts(value)
     path = Path(filename).resolve()
     spec = importlib.util.spec_from_file_location("ninfer_user_recipe", path)
     if spec is None or spec.loader is None:

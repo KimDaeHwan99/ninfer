@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "runtime/prefix_cache/block_hash.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -34,6 +35,7 @@ namespace {
 
 using Frontend        = ninfer::models::qwen3_5::Frontend;
 using FrontendFactory = ninfer::models::qwen3_5::FrontendTestAccess;
+using FrontendOptions = ninfer::models::qwen3_5::FrontendOptions;
 
 struct FrontendResources {
     std::string tokenizer_json, tokenizer_config_json, chat_template_jinja, generation_config_json;
@@ -126,6 +128,18 @@ constexpr ninfer::TokenId kByte9FToken = fixture_byte_token(0x9f);
 constexpr ninfer::TokenId kByte98Token = fixture_byte_token(0x98);
 constexpr ninfer::TokenId kByteC2Token = fixture_byte_token(0xc2);
 constexpr ninfer::TokenId kByteA2Token = fixture_byte_token(0xa2);
+
+// The fixture's added token for the literal reasoning close marker.
+constexpr ninfer::TokenId kFixtureThinkCloseToken = 248069;
+
+std::vector<ninfer::TokenId> fixture_tokens(std::string_view text) {
+    std::vector<ninfer::TokenId> tokens;
+    tokens.reserve(text.size());
+    for (const char byte : text) {
+        tokens.push_back(fixture_byte_token(static_cast<std::uint8_t>(byte)));
+    }
+    return tokens;
+}
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -1017,6 +1031,77 @@ int test_literal_cache_boundary() {
     return failures;
 }
 
+int test_reasoning_effort_substitution() {
+    using ninfer::ReasoningEffort;
+    const std::vector<fi::ChatMessage> question{chat_message(ninfer::ChatRole::User, "question")};
+    const auto rendered_effort = [&](const fi::CompiledChatTemplate& compiled,
+                                     ReasoningEffort effort) {
+        return compiled.render(question, {.reasoning_effort = effort}).text;
+    };
+
+    // The official Qwen3.8 template accepts only low, medium and xhigh; the standard values it
+    // rejects render as the nearest one, a tie rounding up.
+    const auto qwen38    = fi::CompiledChatTemplate::resolve(reasoning_effort_template_source());
+    const auto effort_is = [](const std::string& text, std::string_view tier) {
+        return text.find("Reasoning effort is set to " + std::string(tier) + ".") !=
+               std::string::npos;
+    };
+    int failures = check(effort_is(rendered_effort(qwen38, ReasoningEffort::High), "xhigh") &&
+                             effort_is(rendered_effort(qwen38, ReasoningEffort::Max), "xhigh") &&
+                             effort_is(rendered_effort(qwen38, ReasoningEffort::XHigh), "xhigh"),
+                         "Qwen3.8 did not render high and max as its xhigh effort");
+    failures += check(effort_is(rendered_effort(qwen38, ReasoningEffort::Minimal), "low") &&
+                          effort_is(rendered_effort(qwen38, ReasoningEffort::Low), "low"),
+                      "Qwen3.8 did not render minimal as its low effort");
+    const std::string medium = rendered_effort(qwen38, ReasoningEffort::Medium);
+    failures += check(!effort_is(medium, "xhigh") && !effort_is(medium, "low"),
+                      "Qwen3.8 changed an effort it accepts");
+
+    // The nearest accepted effort wins in either direction; the substitute is what renders.
+    const auto sparse = fi::CompiledChatTemplate::resolve(
+        "{%- if reasoning_effort is defined and reasoning_effort not in ('medium', 'max') %}"
+        "{{- raise_exception('unsupported effort') }}{%- endif %}"
+        "<|im_start|>user\n{{ messages[0].content }}<|im_end|>\n<|im_start|>assistant\n"
+        "[{{ reasoning_effort | default('unset') }}]");
+    failures += check(
+        rendered_effort(sparse, ReasoningEffort::High).ends_with("[medium]") &&
+            rendered_effort(sparse, ReasoningEffort::XHigh).ends_with("[max]") &&
+            rendered_effort(sparse, ReasoningEffort::Minimal).ends_with("[medium]") &&
+            sparse.render(question).text.ends_with("[unset]"),
+        "a rejected effort did not render as the nearest accepted one");
+
+    // A template that cannot render the probe (a lone user message) reveals nothing about its
+    // efforts, so none is substituted: an effort it rejects keeps the request's value and raises,
+    // where a probed template would have rendered the nearest accepted one.
+    const auto unprobed = fi::CompiledChatTemplate::resolve(
+        "{%- if messages[0].role != 'system' %}{{- raise_exception('needs a system message') }}"
+        "{%- endif %}"
+        "{%- if reasoning_effort is defined and reasoning_effort not in ('medium', 'max') %}"
+        "{{- raise_exception('unsupported effort') }}{%- endif %}"
+        "<|im_start|>system\n{{ messages[0].content }}<|im_end|>\n"
+        "<|im_start|>user\n{{ messages[1].content }}<|im_end|>\n<|im_start|>assistant\n"
+        "[{{ reasoning_effort | default('unset') }}]");
+    const std::vector<fi::ChatMessage> instructed{
+        chat_message(ninfer::ChatRole::System, "instructions"),
+        chat_message(ninfer::ChatRole::User, "question")};
+    failures += check(
+        unprobed.render(instructed, {.reasoning_effort = ReasoningEffort::Medium})
+                .text.ends_with("[medium]") &&
+            throws_invalid_argument([&] {
+                (void)unprobed.render(instructed, {.reasoning_effort = ReasoningEffort::High});
+            }),
+        "a template that fails the probe had an effort substituted");
+
+    // A template that rejects every effort keeps the request's value and raises as before.
+    const auto none = fi::CompiledChatTemplate::resolve(
+        "{%- if reasoning_effort is defined %}{{- raise_exception('no effort') }}{%- endif %}"
+        "<|im_start|>user\n{{ messages[0].content }}<|im_end|>\n<|im_start|>assistant\n");
+    failures += check(
+        throws_invalid_argument([&] { (void)rendered_effort(none, ReasoningEffort::High); }),
+        "an effort was invented for a template that accepts none");
+    return failures;
+}
+
 int test_official_resource_guards() {
     FrontendResources stale_pad     = resources();
     nlohmann::json tokenizer_config = nlohmann::json::parse(stale_pad.tokenizer_config_json);
@@ -1386,6 +1471,190 @@ int test_explicit_leading_instruction_cache_boundary() {
                  "full-system marker");
 }
 
+int test_engine_automatic_long_anchor_opportunities() {
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled                    = false;
+    options.max_context                       = std::numeric_limits<std::uint32_t>::max();
+    options.max_long_anchors_per_continuation = 2;
+    const Frontend frontend = make_frontend(resources(), options);
+
+    const auto user_message = [](std::string_view text) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::string(text), .media = {}});
+        return message;
+    };
+    auto input = [&](std::initializer_list<std::string_view> turns) {
+        ninfer::PromptInput prompt;
+        for (std::string_view turn : turns) { prompt.messages.push_back(user_message(turn)); }
+        prompt.options.enable_thinking = false;
+        return prompt;
+    };
+    auto anchor_frontiers = [](const ninfer::models::qwen3_5::PreparedPromptData& data) {
+        std::vector<std::uint32_t> frontiers;
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            if (opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor) {
+                frontiers.push_back(opportunity.frontier);
+            }
+        }
+        // Synthesis visits the boundaries deepest first; compare as an ordered set.
+        std::sort(frontiers.begin(), frontiers.end());
+        return frontiers;
+    };
+
+    int failures = 0;
+    const auto prepared =
+        frontend.prepare(input({"first message body", "second message body", "third message body"}));
+    const auto& data = FrontendFactory::inspect(prepared);
+    const auto anchors = anchor_frontiers(data);
+    for (const auto& opportunity : data.context_cache.opportunities) {
+        if (opportunity.kind != ninfer::PromptCacheMarkerKind::PrivateLongAnchor) { continue; }
+        failures += check(
+            ninfer::has_shared_candidate_evidence(
+                opportunity.evidence, ninfer::SharedCandidateEvidence::EngineStructural) &&
+                !ninfer::has_shared_candidate_evidence(
+                    opportunity.evidence,
+                    ninfer::SharedCandidateEvidence::ExplicitBoundary) &&
+                opportunity.frontier > 0 && opportunity.frontier < data.token_ids.size(),
+            "engine automatic long anchor is not a structural interior message boundary");
+    }
+    failures += check(anchors.size() == 2 && anchors.front() < anchors.back(),
+                      "engine did not anchor the last two message boundaries in order");
+    if (anchors.size() == 2) {
+        // The first anchored boundary is after the second message: the full prompt and the
+        // two-message preparation share exactly that prefix.
+        const auto truncated =
+            frontend.prepare(input({"first message body", "second message body"}));
+        const auto& truncated_data = FrontendFactory::inspect(truncated);
+        const std::uint32_t boundary = anchors.front();
+        failures += check(
+            boundary < truncated_data.token_ids.size() &&
+                std::equal(data.token_ids.begin(),
+                           data.token_ids.begin() + std::ptrdiff_t(boundary),
+                           truncated_data.token_ids.begin()),
+            "first engine long anchor is not the second message boundary");
+        if (data.identity.rewrite_checkpoint) {
+            failures += check(anchors.back() == data.identity.rewrite_checkpoint->frontier,
+                              "last engine long anchor is not the final message boundary");
+        }
+    }
+
+    if (anchors.size() == 2) {
+        // An explicit marker at an engine boundary takes over that frontier instead of adding
+        // a duplicate; the remaining engine boundary is still synthesized.
+        auto marked =
+            input({"first message body", "second message body", "third message body"});
+        marked.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .after_message_count = 2,
+            .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+            .location             = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+        });
+        const auto marked_prepared = frontend.prepare(std::move(marked));
+        const auto& marked_data = FrontendFactory::inspect(marked_prepared);
+        const auto marked_anchors = anchor_frontiers(marked_data);
+        const auto explicit_at = std::find_if(
+            marked_data.context_cache.opportunities.begin(),
+            marked_data.context_cache.opportunities.end(),
+            [&](const auto& opportunity) {
+                return opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
+                       opportunity.frontier == anchors.front() &&
+                       ninfer::has_shared_candidate_evidence(
+                           opportunity.evidence,
+                           ninfer::SharedCandidateEvidence::ExplicitBoundary);
+            });
+        failures += check(
+            marked_anchors == anchors &&
+                explicit_at != marked_data.context_cache.opportunities.end(),
+            "an explicit marker at an engine boundary did not take over that frontier");
+    }
+
+    FrontendOptions disabled = options;
+    disabled.max_long_anchors_per_continuation = 0;
+    const Frontend plain_frontend = make_frontend(resources(), disabled);
+    const auto plain_prepared =
+        plain_frontend.prepare(input({"first message body", "second message body",
+                                      "third message body"}));
+    const auto& plain_data = FrontendFactory::inspect(plain_prepared);
+    failures += check(anchor_frontiers(plain_data).empty(),
+                      "long anchors were synthesized with a zero capacity");
+    return failures;
+}
+
+int test_engine_automatic_long_anchor_spacing() {
+    // With a spacing S, walking back from the prompt end a boundary joins the anchor grid only
+    // when it lies at least S * 2^k below the previous grid point (k = anchors already placed).
+    // Oracle: the unspaced run anchors every interior boundary; the spaced run must equal the
+    // greedy selection over those boundaries.
+    const auto make = [](std::uint32_t spacing) {
+        ninfer::models::qwen3_5::FrontendOptions options;
+        options.vision_enabled                    = false;
+        options.max_context                       = std::numeric_limits<std::uint32_t>::max();
+        options.max_long_anchors_per_continuation = 16;
+        options.long_anchor_min_spacing_tokens    = spacing;
+        return make_frontend(resources(), options);
+    };
+    const auto prompt = [] {
+        ninfer::PromptInput input;
+        std::string long_text;
+        for (int index = 0; index < 200; ++index) { long_text += "alpha "; }
+        const std::array<std::string, 9> turns{long_text, "short one", "short two",
+                                               std::string(120, 'b'), "short three",
+                                               "short four", "short five", "short six",
+                                               "final question"};
+        for (const std::string& text : turns) {
+            ninfer::ChatMessage message;
+            message.role = ninfer::ChatRole::User;
+            message.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = text, .media = {}});
+            input.messages.push_back(std::move(message));
+        }
+        input.options.enable_thinking = false;
+        return input;
+    };
+    const auto anchors_of = [](const ninfer::models::qwen3_5::PreparedPromptData& data) {
+        std::vector<std::uint32_t> frontiers;
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            if (opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor) {
+                frontiers.push_back(opportunity.frontier);
+            }
+        }
+        std::sort(frontiers.begin(), frontiers.end());
+        return frontiers;
+    };
+
+    int failures = 0;
+    const Frontend unspaced_frontend = make(0);
+    const auto unspaced              = unspaced_frontend.prepare(prompt());
+    const auto& unspaced_data        = FrontendFactory::inspect(unspaced);
+    const std::vector<std::uint32_t> boundaries = anchors_of(unspaced_data);
+    failures +=
+        check(boundaries.size() >= 8, "unspaced run did not anchor every interior boundary");
+
+    constexpr std::uint32_t kSpacing = 8;
+    std::vector<std::uint32_t> expected;
+    std::uint32_t grid_point = static_cast<std::uint32_t>(unspaced_data.token_ids.size());
+    std::uint64_t spacing    = kSpacing;
+    for (auto it = boundaries.rbegin(); it != boundaries.rend(); ++it) {
+        if (grid_point - *it < spacing) { continue; }
+        expected.push_back(*it);
+        grid_point = *it;
+        spacing *= 2U;
+    }
+    std::sort(expected.begin(), expected.end());
+
+    const Frontend spaced_frontend = make(kSpacing);
+    const auto spaced              = spaced_frontend.prepare(prompt());
+    const std::vector<std::uint32_t> anchors = anchors_of(FrontendFactory::inspect(spaced));
+    failures += check(anchors == expected,
+                      "spaced anchors do not follow the geometric grid from the prompt end");
+    // The prompt is a few hundred tokens and the spacing reaches 8 * 2^8 tokens within nine
+    // anchors, so the grid must skip some of the short tail messages.
+    failures += check(!anchors.empty() && anchors.size() < boundaries.size(),
+                      "spacing did not thin the anchor grid");
+    return failures;
+}
+
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
@@ -1514,6 +1783,82 @@ int test_video_prepare(const Frontend& frontend) {
             prepared_data.prepare.media_cache_misses == 1 &&
             prepared_data.prepare.media_cache_hits == 0 && prepared_data.identity.reusable,
         "video frontend did not duplicate the odd temporal frame correctly");
+    return failures;
+}
+
+// Preparation publishes the hybrid prefix cache's lookup keys, which the Program's quote and
+// admission read instead of hashing the prompt again: one chained hash per full 64-token block,
+// as the prefix index computes it, and with media one Vision key per block that is zero before the
+// first image and tells apart images that render to the same placeholder tokens.
+int test_prefix_block_keys(const Frontend& frontend) {
+    namespace pc = ninfer::runtime::prefix_cache;
+    std::vector<ninfer::TokenId> tokens(200);
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        tokens[index] = fixture_byte_token(static_cast<std::uint8_t>('a' + index % 26));
+    }
+    const auto text       = frontend.prepare_tokens(tokens);
+    const auto& text_data = FrontendFactory::inspect(text);
+    int failures =
+        check(text_data.block_hashes.size() == 200 / pc::kBlockTokens &&
+                  text_data.block_extras.empty() &&
+                  text_data.block_hashes == pc::block_lookup_hashes(text_data.token_ids, {}),
+              "prepare_tokens did not publish the text prompt's block keys");
+
+    std::string before, after;
+    for (int index = 0; index < 160; ++index) {
+        before.push_back(static_cast<char>('a' + index % 26));
+        after.push_back(static_cast<char>('A' + index % 26));
+    }
+    const auto prepare_image = [&](std::vector<std::uint8_t> bytes) {
+        ninfer::MessagePart image;
+        image.kind              = ninfer::MessagePartKind::Media;
+        image.media.kind        = ninfer::MediaKind::Image;
+        image.media.bytes       = std::move(bytes);
+        image.media.media_type  = "image/x-portable-pixmap";
+        image.media.source_name = "inline.ppm";
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = before, .media = {}});
+        message.parts.push_back(std::move(image));
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = after, .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        return frontend.prepare(std::move(input));
+    };
+    const auto gradient = prepare_image(gradient_ppm());
+    const auto flat     = prepare_image(block_ppm(64, 64, 17));
+    const auto& first   = FrontendFactory::inspect(gradient);
+    const auto& second  = FrontendFactory::inspect(flat);
+    const std::size_t blocks = first.token_ids.size() / pc::kBlockTokens;
+    if (first.vision_items.size() != 1 || first.vision_items.front().token_spans.empty() ||
+        first.token_ids != second.token_ids) {
+        return failures + check(false, "block-key fixture: two same-sized images must render "
+                                       "to one token sequence with one Vision item");
+    }
+    const std::size_t image_begin = first.vision_items.front().token_spans.front().begin;
+    failures += check(image_begin >= pc::kBlockTokens && blocks > image_begin / pc::kBlockTokens,
+                      "block-key fixture: the image must follow a full block and precede one");
+    failures += check(first.block_extras.size() == blocks && second.block_extras.size() == blocks &&
+                          first.block_hashes ==
+                              pc::block_lookup_hashes(first.token_ids, first.block_extras) &&
+                          second.block_hashes ==
+                              pc::block_lookup_hashes(second.token_ids, second.block_extras),
+                      "prepare did not publish the media prompt's block keys");
+    const std::size_t checked =
+        std::min({blocks, first.block_extras.size(), second.block_extras.size()});
+    for (std::size_t block = 0; block < checked; ++block) {
+        const bool before_image = (block + 1) * pc::kBlockTokens <= image_begin;
+        failures += check(before_image ? first.block_extras[block] == 0 &&
+                                             second.block_extras[block] == 0 &&
+                                             first.block_hashes[block] == second.block_hashes[block]
+                                       : first.block_extras[block] != 0 &&
+                                             first.block_extras[block] !=
+                                                 second.block_extras[block],
+                          before_image ? "a block before the image carried a Vision key"
+                                       : "a block from the image on did not identify the image");
+    }
     return failures;
 }
 
@@ -1688,6 +2033,141 @@ ninfer::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend
     return frontend.prepare(std::move(input));
 }
 
+int test_reasoning_close_requires_boundary(const Frontend& frontend) {
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(prompt, {});
+
+    std::vector<ninfer::TokenId> quoted = fixture_tokens("discussing ");
+    quoted.push_back(kFixtureThinkCloseToken);
+    const auto quoted_decision =
+        session.preview_model(quoted, 64, ninfer::FinishReason::OutputLimit);
+    const auto quoted_output = session.commit_preview();
+
+    int failures = 0;
+    failures +=
+        check(quoted_decision.accepted_tokens == quoted.size() && !quoted_decision.finished(),
+              "a close candidate at a round boundary ended its round early");
+    failures +=
+        check(channel_text(quoted_output, ninfer::OutputChannel::Reasoning) == "discussing " &&
+                  channel_text(quoted_output, ninfer::OutputChannel::Content).empty(),
+              "a close candidate at a round boundary was not held for its following byte");
+
+    const auto quoted_tail = fixture_tokens("'; then hidden\n");
+    const auto tail_decision =
+        session.preview_model(quoted_tail, 64, ninfer::FinishReason::OutputLimit);
+    const auto tail_output = session.commit_preview();
+    failures += check(channel_text(tail_output, ninfer::OutputChannel::Reasoning) ==
+                              "</think>'; then hidden\n" &&
+                          channel_text(tail_output, ninfer::OutputChannel::Content).empty(),
+                      "a marker followed by a quote was treated as a reasoning close");
+
+    std::vector<ninfer::TokenId> spaced = {kFixtureThinkCloseToken};
+    const auto prose                    = fixture_tokens(" tag ends reasoning.\n");
+    spaced.insert(spaced.end(), prose.begin(), prose.end());
+    const auto spaced_decision = session.preview_model(spaced, 64, ninfer::FinishReason::OutputLimit);
+    const auto spaced_output   = session.commit_preview();
+    failures += check(!spaced_decision.finished() &&
+                          channel_text(spaced_output, ninfer::OutputChannel::Reasoning) ==
+                              "</think> tag ends reasoning.\n" &&
+                          channel_text(spaced_output, ninfer::OutputChannel::Content).empty(),
+                      "a marker quoted in prose and followed by a space closed reasoning");
+
+    std::vector<ninfer::TokenId> close = {kFixtureThinkCloseToken};
+    const auto answer                  = fixture_tokens("\n\nreal answer");
+    close.insert(close.end(), answer.begin(), answer.end());
+    const auto close_decision = session.preview_model(close, 64, ninfer::FinishReason::OutputLimit);
+    const auto close_output   = session.commit_preview();
+    failures +=
+        check(channel_text(close_output, ninfer::OutputChannel::Reasoning).empty() &&
+                  channel_text(close_output, ninfer::OutputChannel::Content) == "real answer",
+              "the real close did not open the content channel");
+    return failures;
+}
+
+int test_reasoning_close_resolves_at_terminal(const Frontend& frontend) {
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(prompt, {});
+
+    std::vector<ninfer::TokenId> tokens = fixture_tokens("done thinking");
+    tokens.push_back(kFixtureThinkCloseToken);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    const auto output   = session.commit_preview();
+
+    int failures = 0;
+    failures += check(decision.accepted_tokens == tokens.size() &&
+                          decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "the implicit terminal close changed the round decision");
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "done thinking" &&
+                          channel_text(output, ninfer::OutputChannel::Content).empty(),
+                      "the implicit terminal close was published into reasoning");
+    return failures;
+}
+
+int test_thinking_budget_ignores_quoted_close(const Frontend& frontend) {
+    auto prompt = thinking_prompt(frontend);
+    auto session =
+        frontend.make_output_session(prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 3});
+
+    const std::vector<ninfer::TokenId> tokens{0, kFixtureThinkCloseToken, 0};
+    const auto decision = session.preview_model(tokens, 10, ninfer::FinishReason::OutputLimit);
+    const auto output   = session.commit_preview();
+
+    int failures = 0;
+    failures +=
+        check(!decision.finished() &&
+                  decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "a quoted close marker suppressed the thinking budget control");
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "x</think>x" &&
+                          channel_text(output, ninfer::OutputChannel::Content).empty(),
+                      "a quoted close marker was not preserved in the reasoning channel");
+    return failures;
+}
+
+int test_tool_marker_after_quoted_marker() {
+    const Frontend frontend = make_frontend(resources());
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    auto prompt = frontend.prepare(std::move(input));
+    auto session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+
+    const std::string quoted =
+        "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
+        "</function>\\n</tool_call>";
+    const std::string generated = "The failure looked like " + quoted +
+                                  "\nThen the real call:\n"
+                                  "<tool_call>\n<function=bash>\n<parameter=command>\necho ok\n"
+                                  "</parameter>\n</function>\n</tool_call>";
+    const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    const auto output   = session.commit_preview();
+    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+
+    int failures = 0;
+    failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                          calls.size() == 1 && calls.front().name == "bash",
+                      "a quoted malformed marker demoted the following real tool call");
+    if (calls.size() == 1) {
+        const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
+        failures += check(arguments.at("command") == "echo ok",
+                          "the recovered tool call lost its arguments");
+    }
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) ==
+                          "The failure looked like " + quoted + "\nThen the real call:",
+                      "the quoted marker was not preserved as ordinary content");
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -1697,6 +2177,13 @@ int test_thinking_budget_control(const Frontend& frontend) {
         frontend.make_output_session(prompt, stop, {}, ninfer::ThinkingControlOptions{.budget = 2});
     int failures = check(session.model_token_budget_remaining(20) == 2,
                          "thinking budget did not clamp the model round license");
+    // An output limit at or below the budget ends thinking first, so the budget takes no effect
+    // and needs no room for control.
+    failures += check(!throws_invalid_argument([&] {
+                          session.validate_generation_capacity(1);
+                          session.validate_generation_capacity(2);
+                      }),
+                      "planning rejected an output limit that the thinking budget never reaches");
 
     const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
     const auto boundary =
@@ -1796,6 +2283,69 @@ int test_thinking_budget_control(const Frontend& frontend) {
     const auto raw_output = raw_session.commit_preview();
     failures += check(channel_text(raw_output, ninfer::OutputChannel::Content) == kThinkingControl,
                       "raw output did not preserve the inserted control representation");
+    return failures;
+}
+
+int test_thinking_budget_message() {
+    ninfer::models::qwen3_5::FrontendOptions message_options;
+    message_options.vision_enabled = false;
+    message_options.thinking_budget_message = "Time to act now:";
+    const std::string expected_control =
+        "Time to act now:" + std::string(fi::kCanonicalReasoningCloseSerialization);
+    const Frontend message_frontend = make_frontend(resources(), message_options);
+    int failures                     = 0;
+    auto session = message_frontend.make_output_session(
+        thinking_prompt(message_frontend), {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
+    const auto boundary = session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(!boundary.finished() &&
+                  boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "custom message thinking boundary did not request target control");
+    (void)session.commit_preview();
+    const std::vector<ninfer::TokenId> control(session.pending_control_tokens().begin(),
+                                               session.pending_control_tokens().end());
+    const std::string control_text = fixture_tokenizer().decode(
+        control, fi::DecodeOptions{.skip_special_tokens = false});
+    failures += check(control_text == expected_control,
+                      "custom thinking budget message lost its canonical close");
+    const auto control_decision =
+        session.preview_control(control, static_cast<std::uint32_t>(control.size()) + 4U);
+    failures += check(control_decision.accepted_tokens == control.size() &&
+                          !control_decision.finished(),
+                      "custom thinking control was not accepted atomically");
+    const auto control_output = session.commit_preview();
+    // The reasoning channel keeps the message plus the leading newline of the canonical close
+    // (the serialization "\n</think>\n\n" starts with a newline); the trailing newlines after
+    // </think> are stripped from the content channel.
+    failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+                          "Time to act now:\n" &&
+                          channel_text(control_output, ninfer::OutputChannel::Content).empty(),
+                      "custom thinking control was truncated or published to content");
+    failures += check(session.thinking_stats().injected_tokens == control.size() &&
+                          session.thinking_stats().applied,
+                      "custom thinking control accounting is incorrect");
+
+    ninfer::models::qwen3_5::FrontendOptions exact_options = message_options;
+    exact_options.thinking_budget_message = expected_control;
+    const Frontend exact_frontend = make_frontend(resources(), exact_options);
+    auto exact_session = exact_frontend.make_output_session(
+        thinking_prompt(exact_frontend), {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    (void)exact_session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+    (void)exact_session.commit_preview();
+    const std::vector<ninfer::TokenId> exact_tokens(
+        exact_session.pending_control_tokens().begin(),
+        exact_session.pending_control_tokens().end());
+    const std::string exact_text = fixture_tokenizer().decode(
+        exact_tokens, fi::DecodeOptions{.skip_special_tokens = false});
+    failures += check(exact_text == expected_control,
+                      "canonical close was appended to a message that already had it");
+
+    ninfer::models::qwen3_5::FrontendOptions terminal_options = message_options;
+    terminal_options.thinking_budget_message = "<eos>";
+    failures += check(
+        throws_invalid_argument([&] { (void)make_frontend(resources(), terminal_options); }),
+        "thinking budget message containing a terminal token was accepted");
     return failures;
 }
 
@@ -2155,6 +2705,107 @@ int test_media_preparation_cancellation() {
     return check(false, "cancelled media preparation completed successfully");
 }
 
+int test_ngram_proposal_only_sources() {
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled        = false;
+    options.max_context           = 8192;
+    const Frontend plain          = make_frontend(resources(), options);
+    options.ngram_sources_enabled = true;
+    const Frontend enhanced       = make_frontend(resources(), options);
+    ninfer::PromptInput input;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back({.kind = ninfer::MessagePartKind::Text,
+                          .text = "1: user text\n2: must not\n3: become a shadow\n"});
+    input.messages.push_back(user);
+    ninfer::ChatMessage tool;
+    tool.role = ninfer::ChatRole::Tool;
+    tool.parts.push_back({.kind = ninfer::MessagePartKind::Text,
+                          .text = "40: def f():\n41:     x = 1\n42:     return x\n"});
+    input.messages.push_back(tool);
+    auto a             = plain.prepare(input);
+    auto b             = enhanced.prepare(input);
+    const auto& before = FrontendFactory::inspect(a);
+    const auto& after  = FrontendFactory::inspect(b);
+    int failures       = check(
+        before.token_ids == after.token_ids && before.positions == after.positions &&
+            before.token_types == after.token_types && before.rope_delta == after.rope_delta &&
+            before.starts_in_reasoning == after.starts_in_reasoning,
+        "ngram sources changed target input");
+    failures += check(before.ngram_sources.empty() && after.ngram_sources.size() == 1 &&
+                          after.ngram_sources[0] ==
+                              enhanced.tokenize_text("def f():\n    x = 1\n    return x\n"),
+                      "ngram tool sources lost provenance/indentation");
+    failures += check(!after.ngram_boundaries.empty(), "ngram special-token boundaries absent");
+    options.ngram_archive_enabled            = true;
+    const Frontend retaining                 = make_frontend(resources(), options);
+    auto retained_input                      = input;
+    retained_input.options.preserve_thinking = true;
+    ninfer::ChatMessage assistant;
+    assistant.role              = ninfer::ChatRole::Assistant;
+    assistant.reasoning_content = "Private reasoning about the edit.";
+    assistant.parts.push_back(
+        {.kind = ninfer::MessagePartKind::Text, .text = "Final code goes here."});
+    retained_input.messages.push_back(assistant);
+    auto retained_prompt = retaining.prepare(retained_input);
+    const auto& retained = FrontendFactory::inspect(retained_prompt);
+    using namespace ninfer::models::qwen3_5;
+    const auto has_source = [&](std::string_view text, NgramSourceKind kind) {
+        const auto expected = retaining.tokenize_text(text);
+        return std::any_of(retained.ngram_archive_sources.begin(),
+                           retained.ngram_archive_sources.end(), [&](const auto& source) {
+                               return source.kind == kind &&
+                                      std::search(source.tokens.begin(), source.tokens.end(),
+                                                  expected.begin(),
+                                                  expected.end()) != source.tokens.end();
+                           });
+    };
+    failures +=
+        check(has_source("40: def f():", NgramSourceKind::Tool) &&
+                  has_source("Private reasoning about the edit.", NgramSourceKind::Reasoning) &&
+                  has_source("Final code goes here.", NgramSourceKind::Generated),
+              "archive source roles or reasoning classification lost");
+    failures += check(!has_source("assistant\n", NgramSourceKind::Generated),
+                      "archive indexed role header");
+    const auto target_tokens = retained.token_ids;
+    NgramArchive archive;
+    auto lease = retained_prompt.bind_ngram(archive, {.key = "frontend-session"});
+    failures +=
+        check(lease && retained.token_ids == target_tokens && archive.publish(std::move(lease)),
+              "archive binding changed target tokens or failed to publish");
+    auto compacted_prompt =
+        retaining.prepare_tokens(retaining.tokenize_text("New compacted summary."));
+    auto compacted = compacted_prompt.bind_ngram(archive, {.key = "frontend-session"});
+    failures += check(compacted && compacted->snapshot()->source_count() >= 4,
+                      "prepared source views did not survive compaction");
+    compacted.reset();
+    failures += check(!compacted_prompt.bind_ngram(archive, {}) &&
+                          !FrontendTestAccess::inspect(compacted_prompt).ngram_snapshot,
+                      "unbound prepared prompt retained a previous archive view");
+    options.max_context    = 128;
+    const Frontend bounded = make_frontend(resources(), options);
+    std::string oversized;
+    for (unsigned i = 1; i <= 1024; ++i) {
+        oversized += std::to_string(i) + ": value = 123456789\n";
+    }
+    input.messages.back().parts[0].text = std::move(oversized);
+    failures += check(throws_context_length([&] { (void)bounded.prepare(input); }),
+                      "proposal sources bypassed the target context limit");
+    std::atomic<unsigned> checks{0};
+    ninfer::PreparationControl control{
+        .deadline     = {},
+        .cancellation = ninfer::CancellationView([&] { return checks.fetch_add(1) >= 3; }),
+    };
+    try {
+        (void)bounded.prepare(input, control);
+        failures += check(false, "cancelled shadow-source tokenization completed");
+    } catch (const ninfer::RequestError& error) {
+        failures += check(error.kind() == ninfer::RequestErrorKind::Cancelled && checks.load() == 4,
+                          "shadow-source cancellation lost priority to the target context error");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -2162,6 +2813,7 @@ int main() {
     const Frontend frontend       = make_frontend(owned);
     int failures                  = 0;
     failures += test_declared_frontend_semantics();
+    failures += test_ngram_proposal_only_sources();
     failures += test_tokenizer_config_merge();
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();
@@ -2175,6 +2827,7 @@ int main() {
     failures += test_adjacent_tool_message_boundary();
     failures += test_literal_cache_boundary();
     failures += test_selected_template_recovery_boundary();
+    failures += test_reasoning_effort_substitution();
     failures += test_official_resource_guards();
     failures += test_template_file_execution();
     failures += test_invalid_public_part_enums(frontend);
@@ -2183,16 +2836,24 @@ int main() {
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
+    failures += test_engine_automatic_long_anchor_opportunities();
+    failures += test_engine_automatic_long_anchor_spacing();
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);
+    failures += test_prefix_block_keys(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
+    failures += test_tool_marker_after_quoted_marker();
     failures += test_reasoning_split(frontend);
+    failures += test_reasoning_close_requires_boundary(frontend);
+    failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_budget_control(frontend);
+    failures += test_thinking_budget_message();
+    failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();

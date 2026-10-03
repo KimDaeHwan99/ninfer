@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <iostream>
 #include <utility>
 
 namespace {
@@ -31,6 +32,8 @@ bool active() { return trace.failure != Failure::None; }
 } // namespace
 
 // Link-time wrappers affect only this test executable. The production path has no fault hooks.
+// They rely on the GNU linker's --wrap symbol rewriting, which the MSVC linker does not provide.
+#ifndef _WIN32
 extern "C" {
 cudaError_t CUDARTAPI __real_cudaMalloc(void**, std::size_t);
 cudaError_t CUDARTAPI __real_cudaMallocHost(void**, std::size_t);
@@ -102,9 +105,18 @@ cudaError_t CUDARTAPI __wrap_cudaStreamSynchronize(cudaStream_t stream) {
     return status;
 }
 }
+#endif // _WIN32
 
 namespace ninfer::test {
 
+#ifdef _WIN32
+// Without the linker's --wrap rewriting the CUDA calls cannot be intercepted, so the fault
+// injection checks are skipped on Windows; the remaining materialization checks still run.
+void materialization_cuda_errors(DeviceContext&) {
+    std::cout << "SKIP: CUDA fault-injection materialization checks need GNU ld --wrap "
+                 "(they run in the Linux build)\n";
+}
+#else
 void materialization_cuda_errors(DeviceContext& device) {
     using namespace artifact;
     using namespace artifact_fixture;
@@ -141,5 +153,6 @@ void materialization_cuda_errors(DeviceContext& device) {
     require(std::equal(received.begin(), received.end(), fixture.payload.begin() + 256),
             "successful loading after CUDA failure changed weight bytes");
 }
+#endif // _WIN32
 
 } // namespace ninfer::test

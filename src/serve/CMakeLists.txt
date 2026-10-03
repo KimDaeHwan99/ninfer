@@ -15,13 +15,15 @@ add_library(ninfer_serve STATIC
   translate.cpp
   generation_service.cpp
   request_events.cpp
+  console_stats.cpp
   operational_log.cpp
   request_log.cpp
   http_server.cpp
   openai_responses_http.cpp
   serve_options.cpp
+  stop_control.cpp
 )
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve
   PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
-  PRIVATE ninfer_media_acquire ninfer_product_logging CUDA::cudart)
+  PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_cuda_runtime)

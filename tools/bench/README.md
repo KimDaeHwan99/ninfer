@@ -126,13 +126,15 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v15. The flattened summary and schema-v4 matrix
+Each raw report must be `ninfer_bench_report` schema v16. The flattened summary and schema-v5 matrix
 manifest carry native facts from the report: architecture, public name, actual formats, prefill signature, artifact,
 load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
 inside the unified workspace and CUDA Graph allowance, per-test planned logical and
 allocator-observed workspace peaks, KV capacity and
 payload, configured proposal head and graph mode, phase timings and throughput, and speculative
-rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the commands and
+rounds/drafts/acceptance/fallbacks. Ngram width, minimum match and its separate
+round/draft/accept counters are preserved when present in the current report.
+The matrix manifest is descriptive and records the commands and
 selected local inputs; it does not make repository state part of report validity.
 
 ## Serving corpus benchmark
@@ -158,7 +160,7 @@ The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-serve
 category summaries. The output directory is supplied explicitly with `--output`.
 
 Its schema-v8 result and flattened summaries retain the KV dtype, actual `prefill_signature`, request Host
-exposure, and decode Host/Device-wait time per round received from the schema-v21 serving records.
+exposure, and decode Host/Device-wait time per round received from the schema-v25 serving records.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
@@ -196,5 +198,19 @@ python3 tools/bench/run_serve_concurrency.py \
 ```
 
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
-pool. A point is intentionally not resumable: combining fragments from separate server processes
-would not preserve either a steady interval or one continuous makespan.
+pool, or when the device cannot hold that pool beside the weights. A point is intentionally not
+resumable: combining fragments from separate server processes would not preserve either a steady
+interval or one continuous makespan. `--serve-arg` appends one token to every point's server
+command; repeat it for a flag and its value, for example
+`--serve-arg=--ngram-draft-tokens --serve-arg=15` to measure n-gram drafting.
+
+Steady decode tok/s is rounds per second times accepted tokens per round, and acceptance depends on
+the sampled text: two builds sample different text from the same seeds, so one seed set can differ
+by several percent in acceptance alone. `--seed-set N` selects another set of saturation seeds (set
+0 is the published one); compare builds on the decode rounds per second of the same point, or
+average several seed sets. Run the builds under comparison back to back and alternate their order:
+the same build measured hours apart drifted by 2-3 % on the RTX 5090 used for this suite.
+
+After the last request of a point completes, the runner waits for the throughput record that covers
+its final stats interval before stopping the server, because a server ended by `terminate()` on
+Windows cannot flush that interval on shutdown.

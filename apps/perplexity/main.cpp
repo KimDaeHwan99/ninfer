@@ -1,10 +1,13 @@
+#include "ninfer_build_id.h"
 #include "corpus.h"
 #include "evaluation.h"
 
+#include "product/rope_yarn_options.h"
 #include "ninfer/engine.h"
 #include "product/device_placement_options.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
+#include "product/logging/engine_diagnostics.h"
 #include "product/logging/startup_log.h"
 
 #include <nlohmann/json.hpp>
@@ -45,12 +48,15 @@ struct Options {
     std::optional<std::filesystem::path> corpus;
     std::optional<std::filesystem::path> text;
     std::optional<std::filesystem::path> output;
+    float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     int device                          = 0;
     std::vector<int> devices{0};
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
+    bool original_int8_prefill_kernel   = false;
+    bool original_nvfp4_prefill_kernel  = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
 
@@ -58,7 +64,11 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N] [--tp 1|2] [--devices N,N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] (default fp8)\n"
+           "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
+           "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
+           "       [--output <directory>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -100,6 +110,8 @@ Options parse_options(int argc, char** argv) {
             out.text = std::filesystem::path(value("--text"));
         } else if (option == "--quick") {
             out.quick = true;
+        } else if (option == "--rope-yarn-factor") {
+            out.rope_yarn_factor = ninfer::product::parse_rope_yarn_factor(value("--rope-yarn-factor"));
         } else if (option == "--context") {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
@@ -110,6 +122,10 @@ Options parse_options(int argc, char** argv) {
             tensor_parallel = ninfer::product::parse_tensor_parallel(value("--tp"));
         } else if (option == "--devices") {
             rank_devices = ninfer::product::parse_device_list(value("--devices"));
+        } else if (option == "--use-original-int8-prefill-kernel") {
+            out.original_int8_prefill_kernel = true;
+        } else if (option == "--use-original-nvfp4-prefill-kernel") {
+            out.original_nvfp4_prefill_kernel = true;
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -175,7 +191,11 @@ std::string safe_component(std::string_view value) {
 std::string timestamp() {
     const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm utc{};
+#ifdef _WIN32
+    gmtime_s(&utc, &now);
+#else
     gmtime_r(&now, &utc);
+#endif
     std::ostringstream out;
     out << std::put_time(&utc, "%Y%m%d-%H%M%S");
     return out.str();
@@ -228,8 +248,12 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.tensor_parallel  = static_cast<std::uint32_t>(options.devices.size());
     engine_options.devices          = options.devices;
     engine_options.max_context      = options.context;
+    engine_options.rope_yarn_factor  = options.rope_yarn_factor;
     engine_options.kv_cache         = options.kv;
+    engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
+    engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
     engine_options.startup_observer = startup_log.observer();
+    engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
     startup_log.engine_ready(load);
@@ -380,7 +404,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
 
     json report{
-        {"schema_version", 2},
+        {"schema_version", 3},
         {"metric",
          {{"name", "fixed-window truncated-context causal perplexity"}, {"log_base", "natural"}}},
         {"artifact",
@@ -399,6 +423,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"device", options.device},
           {"devices", options.devices},
           {"context_tokens", options.context},
+          {"rope_yarn_factor", options.rope_yarn_factor},
+          {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
+          {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
@@ -468,6 +495,9 @@ int main(int argc, char** argv) {
          .level        = options.log_level,
          .presentation = ninfer::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
+#ifdef NINFER_BUILD_ID
+    logger->info("build {}", NINFER_BUILD_ID);
+#endif
     ninfer::product::StartupLogRenderer startup_log(logging);
     try {
         return run(options, logger, startup_log, logging.terminal_progress());

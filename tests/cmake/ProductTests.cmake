@@ -8,7 +8,12 @@ ninfer_add_test(ninfer_prompt_input_test
 
 ninfer_add_test(ninfer_pretty_logging_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_pretty_logging.cpp"
-  LIBRARIES ninfer_product_logging)
+  LIBRARIES ninfer_product_logging ninfer_media_decode)
+
+# Stable per-statistic console colouring (product/log_colour): family classification of the
+# operational line prefixes and clause-aware colouring of the pretty stats format.
+ninfer_add_test(ninfer_log_colour_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_log_colour.cpp")
 
 ninfer_add_test(ninfer_perplexity_evaluation_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_perplexity_evaluation.cpp"
@@ -48,8 +53,20 @@ ninfer_add_test(ninfer_request_log_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_request_log.cpp"
   LIBRARIES ninfer_serve)
 
+ninfer_add_test(ninfer_console_stats_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_console_stats.cpp"
+  LIBRARIES ninfer_serve ninfer_product_logging)
+
+ninfer_add_test(ninfer_stop_control_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_stop_control.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_error_handler.cpp"
+  LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_http_routes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_routes.cpp"
   LIBRARIES ninfer_serve)
 
 ninfer_add_test(ninfer_http_transport_test

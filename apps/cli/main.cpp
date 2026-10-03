@@ -1,16 +1,22 @@
+#include "ninfer_build_id.h"
 #include "options.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
+#include "product/logging/engine_diagnostics.h"
 #include "product/logging/startup_log.h"
+#include "product/log_colour/log_colour.h"
 #include "product/prompt_input/prompt_input.h"
 #include "product/speculative_options.h"
 
 #include "ninfer/engine.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -94,13 +100,41 @@ std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
     return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
+// Stats colouring (stderr only). Each statistic gets a stable 256-colour ANSI
+// colour keyed by its name (see product/log_colour), so it keeps the same
+// colour on every line and can be tracked across the log as its value
+// changes. Colours are on by default when stderr is a terminal, so logs
+// captured to files stay plain; --log-colours on|off overrides either way.
+std::optional<bool> log_colours_flag; // set from --log-colours before any output
+
+bool stats_color_enabled() {
+    static const bool enabled = [] {
+        if (log_colours_flag.has_value()) { return *log_colours_flag; }
+        return ninfer::product::log_colour::stderr_is_console();
+    }();
+    return enabled;
+}
+
+std::string colorize(std::string_view text, std::string_view key) {
+    return ninfer::product::log_colour::colourize(text, key, stats_color_enabled());
+}
+
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
-    std::cerr << std::left << std::setw(12) << group << std::setw(26) << detail << std::right
-              << std::setw(12) << format_seconds(seconds) << '\n';
+    const std::string elapsed = format_seconds(seconds);
+    std::cerr << std::left << std::setw(12) << group << colorize(detail, detail);
+    const std::size_t detail_width = std::max<std::size_t>(detail.size(), 26);
+    for (std::size_t i = detail.size(); i < detail_width; ++i) { std::cerr << ' '; }
+    for (std::size_t i = elapsed.size(); i < std::max<std::size_t>(elapsed.size(), 12); ++i) {
+        std::cerr << ' ';
+    }
+    std::cerr << colorize(elapsed, detail) << '\n';
 }
 
 void print_metric(std::string_view label, std::string_view value) {
-    std::cerr << std::left << std::setw(12) << "summary" << std::setw(26) << label << value << '\n';
+    std::cerr << std::left << std::setw(12) << "summary" << colorize(label, label);
+    const std::size_t label_width = std::max<std::size_t>(label.size(), 26);
+    for (std::size_t i = label.size(); i < label_width; ++i) { std::cerr << ' '; }
+    std::cerr << colorize(value, label) << '\n';
 }
 
 class StreamingSink final : public ninfer::OutputSink {
@@ -195,6 +229,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
+    print_metric("CUDA Graph memory used", format_bytes(memory.cuda_graph_measured_bytes));
     print_metric("planned device total", format_bytes(reserved));
 
     const ninfer::SpeculativeStats& speculative = result.speculative;
@@ -241,16 +276,19 @@ int main(int argc, char** argv) {
         std::cout << ninfer::cli::usage_text(argv[0]);
         return 0;
     }
+    log_colours_flag = cli.log_colours;
 
     ninfer::product::LoggingRuntime logging(
         {.logger_name  = "ninfer",
          .level        = cli.log_level,
          .presentation = ninfer::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
+#ifdef NINFER_BUILD_ID
+    logger->info("build {}", NINFER_BUILD_ID);
+#endif
     ninfer::product::StartupLogRenderer startup_log(logging);
 
     try {
-
         ninfer::PromptInput input =
             cli.messages_path.empty()
                 ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
@@ -269,22 +307,28 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path      = cli.artifact_path;
         engine_options.chat_template_path = cli.chat_template_path;
-        engine_options.device             = cli.device;
-        engine_options.tensor_parallel    = static_cast<std::uint32_t>(cli.devices.size());
-        engine_options.devices            = cli.devices;
-        engine_options.max_context        = cli.max_context;
-        engine_options.kv_capacity        = cli.kv_capacity;
-        engine_options.prefill_chunk      = cli.prefill_chunk;
-        engine_options.kv_cache           = cli.kv_cache;
-        engine_options.speculative        = cli.speculative;
-        engine_options.enable_vision      = cli.enable_vision;
-        engine_options.use_cuda_graph     = cli.use_cuda_graph;
+        engine_options.device                   = cli.device;
+        engine_options.tensor_parallel          = static_cast<std::uint32_t>(cli.devices.size());
+        engine_options.devices                  = cli.devices;
+        engine_options.max_context              = cli.max_context;
+        engine_options.rope_yarn_factor         = cli.rope_yarn_factor;
+        engine_options.kv_capacity              = cli.kv_capacity;
+        engine_options.prefill_chunk            = cli.prefill_chunk;
+        engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
+        engine_options.original_nvfp4_prefill_kernel = cli.original_nvfp4_prefill_kernel;
+        engine_options.speculative              = cli.speculative;
+        engine_options.enable_vision            = cli.enable_vision;
+        engine_options.vision_offload           = cli.vision_offload;
+        engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;
+        engine_options.use_cuda_graph           = cli.use_cuda_graph;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
         engine_options.context_cache.enabled                = false;
         engine_options.context_cache.host_state_slots       = 0;
         engine_options.context_cache.host_kv_capacity_bytes = 0;
         engine_options.startup_observer                     = startup_log.observer();
+        engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
 
         ninfer::Engine engine(std::move(engine_options));
         startup_log.engine_ready(engine.load_summary());

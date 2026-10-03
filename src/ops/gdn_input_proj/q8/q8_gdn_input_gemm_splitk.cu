@@ -36,6 +36,8 @@ struct Q8GdnSplitKConvEpilogue {
     GdnConvEpilogue<Publish> conv;
     __nv_bfloat16* z;
 
+    static constexpr bool kAppliesRows = true;
+
     template <class Output, int ActiveCols>
     __device__ __forceinline__ void apply_row(const Output&, int row, int,
                                               const float (&projected)[ActiveCols], int) const {

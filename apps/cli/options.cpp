@@ -89,27 +89,88 @@ std::string usage_text(const char* argv0) {
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
            "       [--lm-head-draft]\n"
+           "       [--ngram-draft-tokens 1..63] [--ngram-min-match 4..64]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
-           "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
+           "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max]\n"
+           "       [--vision] [--vision-offload on|off] [--vision-max-merged N]\n"
            "       [--no-cuda-graph]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
-           "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
-           "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
-           "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
-           "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
-           "toward --max-new.\n"
-           "--kv-capacity auto leaves " +
+           "Runs one generation: answer content streams to stdout, reasoning and\n"
+           "diagnostics to stderr. Sampling defaults come from the loaded model and\n"
+           "thinking mode; flags override individual fields.\n"
+           "\n"
+           "CONTEXT\n"
+           "  --max-context N          max context tokens (default 2048)\n"
+           "  --rope-yarn-factor F     startup-fixed YaRN, finite [1,4] (default 1);\n"
+           "                           extends allowed ceiling only, not --max-context\n"
+           "  --prefill-chunk N        prefill chunk size in tokens, multiple of 128\n"
+           "  --max-new N              cap on generated tokens\n"
+           "  --device N               CUDA device ordinal (default 0)\n"
+           "\n"
+           "KV CACHE\n"
+           "  --kv-capacity N|auto     KV-cache capacity in tokens\n"
+           "                           (default = --max-context; auto sizes to free\n"
+           "                           VRAM, leaving " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom.\n"
-           "Sampling defaults come from the loaded model and thinking mode; flags override "
-           "individual fields.\n"
-           "--tp 2 splits the model across two GPUs and requires --devices A,B.\n";
+           " MiB headroom; configurable\n"
+           "                           via --vram-headroom-mib)\n"
+           "  --vram-headroom-mib N    VRAM headroom in MiB left by --kv-capacity auto\n"
+           "                           (default " +
+           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
+           ")\n"
+           "  --tp 1|2                 split the model across two GPUs (requires --devices A,B)\n"
+           "  --devices A,B            the two CUDA devices of --tp 2\n"
+           "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4\n"
+           "  --use-original-int8-prefill-kernel\n"
+           "                           prefill INT8 KV with the original prompt kernel\n"
+           "                           (default: the fast kernel)\n"
+           "  --use-original-nvfp4-prefill-kernel\n"
+           "                           prefill NVFP4 KV with the original prompt kernel\n"
+           "                           (default: the fast kernel)\n"
+           "\n"
+           "SPECULATIVE DECODING (off by default)\n"
+           "  --spec mtp|dflash|dflash2 speculative backend\n"
+           "  --draft-tokens N         draft tokens per round (mtp 1-5; dflash 1-15)\n"
+           "  --lm-head-draft          use the optimized proposal head\n"
+           "  --no-cuda-graph          disable CUDA-graph decode rounds\n"
+           "\n"
+           "SAMPLING\n"
+           "  --temperature F          sampling temperature (0-2)\n"
+           "  --top-p F                nucleus probability (0-1)\n"
+           "  --top-k N                keep the top N tokens\n"
+           "  --min-p F                minimum token probability (0-1)\n"
+           "  --presence-penalty F     -2 to 2\n"
+           "  --frequency-penalty F    -2 to 2\n"
+           "  --seed N                 fixed random seed\n"
+           "  --greedy                 force temperature 0 (exact argmax)\n"
+           "  --stop-token-id N...     stop token ids\n"
+           "  --stop <text>...         stop on this text\n"
+           "  --reasoning-stop <text>  stop reasoning on this text\n"
+           "  --reasoning-effort E     none | minimal | low | medium | high | xhigh | max\n"
+           "  --no-thinking            disable the thinking mode\n"
+           "  --thinking-budget N      cap model-origin thinking tokens\n"
+           "  --raw-output             emit raw content without framing\n"
+           "  --print-token-ids        also print generated token ids\n"
+           "\n"
+           "VISION (off by default)\n"
+           "  --vision                 enable image/video input\n"
+           "  --vision-offload on|off  keep the vision tower in pinned system RAM instead of\n"
+           "                           VRAM (default off; on adds no steady-state VRAM)\n"
+           "  --vision-max-merged N    max merged vision tokens per item (default 32768);\n"
+           "                           oversized media downscales at preprocessing\n"
+           "\n"
+           "LOGGING\n"
+           "  --log-level L            trace|debug|info|warning|error|critical|off\n"
+           "  --log-colours on|off     colour the stats output on stderr (on by default when\n"
+           "                           stderr is a terminal; off forces plain output)\n"
+           "\n"
+           "Structured message content accepts text, image/image_url, and video/video_url\n"
+           "parts; media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -124,6 +185,7 @@ Options parse_options(int argc, char** argv) {
     std::optional<int> explicit_device;
     std::vector<int> rank_devices;
     std::uint32_t tensor_parallel = 1;
+    std::optional<std::size_t> vram_headroom_mib;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -140,11 +202,19 @@ Options parse_options(int argc, char** argv) {
             options.messages_path = value(arg);
         } else if (arg == "--max-new") {
             options.max_new = parse_u32(value(arg), "max-new");
+        } else if (arg == "--rope-yarn-factor") {
+            options.rope_yarn_factor = parse_float(value(arg), "rope-yarn-factor", 1.0F, 4.0F);
         } else if (arg == "--max-context") {
             options.max_context = parse_u32(value(arg), "max-context");
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--vram-headroom-mib") {
+            const std::uint64_t mib = parse_u64(value(arg), "vram-headroom-mib");
+            if (mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+                throw std::invalid_argument("--vram-headroom-mib is out of range");
+            }
+            vram_headroom_mib = static_cast<std::size_t>(mib);
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -159,12 +229,26 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--ngram-draft-tokens") {
+            options.speculative.ngram_draft_tokens =
+                parse_u32(value(arg), "ngram-draft-tokens", true);
+        } else if (arg == "--ngram-min-match") {
+            options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
             options.print_token_ids = true;
+        } else if (arg == "--log-colours") {
+            const std::string_view mode = value(arg);
+            if (mode == "on") {
+                options.log_colours = true;
+            } else if (mode == "off") {
+                options.log_colours = false;
+            } else {
+                throw std::invalid_argument("--log-colours accepts on or off");
+            }
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--thinking-budget") {
@@ -173,8 +257,27 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-offload") {
+            const std::string_view mode = value(arg);
+            if (mode == "on") {
+                options.vision_offload = true;
+            } else if (mode == "off") {
+                options.vision_offload = false;
+            } else {
+                throw std::invalid_argument("--vision-offload accepts on or off");
+            }
+        } else if (arg == "--vision-max-merged") {
+            const std::uint32_t merged = parse_u32(value(arg), "vision-max-merged");
+            if (merged < 64 || merged > 32768) {
+                throw std::invalid_argument("--vision-max-merged must be in [64, 32768]");
+            }
+            options.vision_max_merged_tokens = merged;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--use-original-int8-prefill-kernel") {
+            options.original_int8_prefill_kernel = true;
+        } else if (arg == "--use-original-nvfp4-prefill-kernel") {
+            options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -222,6 +325,12 @@ Options parse_options(int argc, char** argv) {
     }
     options.devices = product::resolve_rank_devices(tensor_parallel, rank_devices, explicit_device);
     options.device  = options.devices.front();
+    if (vram_headroom_mib.has_value()) {
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+            throw std::invalid_argument("--vram-headroom-mib requires --kv-capacity auto");
+        }
+        options.kv_capacity = KvCapacityPolicy::automatic(*vram_headroom_mib << 20);
+    }
 
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();

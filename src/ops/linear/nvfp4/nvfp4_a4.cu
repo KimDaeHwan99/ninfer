@@ -16,7 +16,7 @@ namespace {
 
 template <class ActivationGeometry>
 void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
-                           Nvfp4ScaleLayout layout, cudaStream_t stream) {
+                           Nvfp4ScaleLayout layout, cudaStream_t stream, bool reciprocal) {
     const std::int32_t tokens = x.ne[1];
     constexpr int kThreads    = 256;
     const auto* input         = static_cast<const __nv_bfloat16*>(x.data);
@@ -48,16 +48,27 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
     } else if (layout != Nvfp4ScaleLayout::RowMajor) {
         throw std::invalid_argument("nvfp4 A4 tiled scales need K groups in whole tiles");
     }
-    nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>
-        <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
-                                          written_tokens, weight.input_scale_divisor);
-    CUDA_CHECK(cudaGetLastError());
+    // The row-major plane feeds the MMA routes, the decode widths a CUDA Graph captures.
+    if (reciprocal) {
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(blocks), dim3(kThreads), 0, stream},
+            nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor,
+                                     true>,
+            input, workspace.codes, workspace.scales, tokens, written_tokens,
+            weight.input_scale_divisor));
+        return;
+    }
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(blocks), dim3(kThreads), 0, stream},
+        nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>, input,
+        workspace.codes, workspace.scales, tokens, written_tokens, weight.input_scale_divisor));
 }
 
 } // namespace
 
 void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
-                              Nvfp4ScaleLayout layout, cudaStream_t stream) {
+                              Nvfp4ScaleLayout layout, cudaStream_t stream,
+                              bool reciprocal_quotient) {
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("nvfp4 A4 requires caller workspace");
     }
@@ -75,16 +86,20 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
     }
     switch (weight.k) {
     case Nvfp4Activation5120Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, layout, stream);
+        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, layout, stream,
+                                                           reciprocal_quotient);
         return;
     case Nvfp4Activation6144Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, layout, stream);
+        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, layout, stream,
+                                                           reciprocal_quotient);
         return;
     case Nvfp4Activation17408Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, layout, stream);
+        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, layout, stream,
+                                                            reciprocal_quotient);
         return;
     case Nvfp4Activation8704Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation8704Geometry>(x, weight, workspace, layout, stream);
+        launch_quantize_exact<Nvfp4Activation8704Geometry>(x, weight, workspace, layout, stream,
+                                                           reciprocal_quotient);
         return;
     default:
         throw std::invalid_argument("nvfp4 A4 quantize: unsupported K");

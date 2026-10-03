@@ -20,6 +20,7 @@ struct Options {
     std::filesystem::path messages_path;
 
     std::uint32_t max_new        = 128;
+    float rope_yarn_factor       = 1.0F;
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t prefill_chunk  = 1024;
@@ -28,12 +29,18 @@ struct Options {
     std::vector<int> devices{0};
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.
+    bool original_int8_prefill_kernel = false;
+    bool original_nvfp4_prefill_kernel = false;
     SpeculativeOptions speculative;
-    bool enable_vision  = false;
-    bool use_cuda_graph = true;
+    bool enable_vision                     = false;
+    bool vision_offload                    = false;
+    std::uint32_t vision_max_merged_tokens = 32768;
+    bool use_cuda_graph                    = true;
 
     bool raw_output      = false;
     bool print_token_ids = false;
+    std::optional<bool> log_colours; // --log-colours on|off (unset = on when stderr is a terminal)
     std::optional<bool> enable_thinking;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ReasoningEffort> reasoning_effort;

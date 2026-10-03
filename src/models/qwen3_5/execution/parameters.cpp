@@ -124,6 +124,26 @@ public:
         return {weight.qdata, static_cast<std::size_t>(row_bytes * weight.n)};
     }
 
+    // True when the four attention projections address one contiguous parent region, which
+    // the fused packed / attn_input_proj path requires. Mixed-format banks (e.g. Q8 K/V with
+    // bf16 Q/gate) are separate parents and must use the per-projection row path.
+    static bool contiguous_bank(const std::array<ops::WeightInput, 4>& inputs) {
+        const auto& first = inputs.front().weight;
+        if (first.parts.empty()) { return false; }
+        const auto* parent = first.parts.front().parent;
+        std::uint64_t end  = first.parts.front().begin;
+        for (const auto& input : inputs) {
+            for (const auto& part : input.weight.parts) {
+                if (!parent || part.parent != parent || part.begin != end ||
+                    part.end <= part.begin) {
+                    return false;
+                }
+                end = part.end;
+            }
+        }
+        return true;
+    }
+
     MtpParameters mtp(const MtpWeights& w) const {
         const auto& a = std::get<AttentionWeights>(w.layer.mixer);
         const std::array inputs{model_.input(a.query), model_.input(a.key), model_.input(a.gate),
@@ -135,7 +155,9 @@ public:
         out.input_norm          = tensor(w.layer.input_norm);
         out.post_attention_norm = tensor(w.layer.post_attention_norm);
         out.final_norm          = tensor(w.final_norm);
-        out.projection.packed   = ops::prepare_linear_weight(inputs);
+        if (contiguous_bank(inputs)) {
+            out.projection.packed = ops::prepare_linear_weight(inputs);
+        }
         if (model_.config().text.architecture == Architecture::Qwen3_5) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
         }
@@ -213,6 +235,9 @@ public:
 
     DraftParameters draft(const DraftWeights& w) const {
         DraftParameters out;
+        const auto& config = *model_.config().draft;
+        out.rope = ops::prepare_rope(dimension(config.attention.head_dim), config.rope_theta,
+                                    {config.yarn_factor, config.max_position_embeddings});
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);
         out.final_norm         = tensor(w.final_norm);
@@ -260,6 +285,12 @@ private:
 Parameters::Parameters(const Model& source) : model(source) {
     const Prepare prepare(model);
     const auto& w        = model.weights();
+    const auto& config   = model.config().text;
+    if (config.rope_parameters) {
+        const auto& rope = *config.rope_parameters;
+        text.rope = ops::prepare_rope(dimension(rope.rotary_dim), rope.rope_theta,
+                                     {rope.yarn_factor, config.max_position_embeddings});
+    }
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
     text.final_norm      = prepare.tensor(w.text.final_norm);

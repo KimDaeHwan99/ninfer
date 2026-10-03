@@ -97,9 +97,15 @@ public:
         prefill_split_frontier_ = position;
     }
 
+    // Route prefill prompt attention through the fast INT8-KV prompt kernel.
+    void set_fast_prefill_kernel(bool enabled) noexcept { fast_prefill_kernel_ = enabled; }
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
         rewrite_checkpoint_hidden_output_ = output;
     }
+
+    // One event per model layer: the next pass over the layer stack waits for each layer's event
+    // before that layer's work (the layer's cached state is still being copied in).
+    void set_layer_ready(std::span<const cudaEvent_t> events) noexcept { layer_ready_ = events; }
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
@@ -171,7 +177,8 @@ private:
                   const ops::SparseMoeHints& hints);
     // x += output(input) for a mixer. A tensor-parallel prefill leaves the all-reduces of its
     // column slices in flight for mlp_tail, which waits each slice before reading it.
-    void mixer_output(const Tensor& input, const LinearParameters& output, Tensor& x);
+    void mixer_output(const Tensor& input, const LinearParameters& output, Tensor& x,
+                      bool wide_verification = false);
     // FFN all-reduces mlp_tail leaves in flight for the next layer's column-wise prologue.
     // Takes them, or waits them all when the caller cannot consume them slice by slice.
     [[nodiscard]] TensorParallelSlices take_pending_ffn(std::int32_t columns, bool sliced);
@@ -232,6 +239,7 @@ private:
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
+    bool fast_prefill_kernel_ = false;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;
@@ -251,6 +259,7 @@ private:
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
+    std::span<const cudaEvent_t> layer_ready_;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

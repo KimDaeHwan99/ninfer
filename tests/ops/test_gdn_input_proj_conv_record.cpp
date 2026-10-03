@@ -11,8 +11,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -24,6 +26,36 @@ namespace {
 // Query/key rows of the exercised profile; a tensor-parallel rank's shard halves them.
 std::int32_t kQueryRows = 2048;
 std::int32_t kKeyRows   = 2048;
+
+int test_record_capacity_domain() {
+    int failures       = 0;
+    const auto rejects = [&](auto&& query) {
+        try {
+            (void)query();
+        } catch (const std::invalid_argument& error) {
+            if (std::string_view(error.what()).find("B/T domain") != std::string_view::npos) {
+                return;
+            }
+        }
+        std::cerr << "record workspace did not reject unsupported B/T domain\n";
+        ++failures;
+    };
+    for (const auto [batch, width] : {std::pair{2, 17}, {8, 32}, {2, 64}, {1, 65}, {1, 1}}) {
+        for (int values : {4096, 6144}) {
+            rejects([&] {
+                return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                    kQueryRows, kKeyRows, values, batch, width, width);
+            });
+        }
+        for (auto qtype : {QType::NVFP4, QType::FP8_E4M3FN_ROW_BF16}) {
+            rejects([&] {
+                return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                    qtype, 16384, 5120, ops::LinearPolicy::A16Only, batch, width, width);
+            });
+        }
+    }
+    return failures;
+}
 
 std::vector<std::uint16_t> make_bf16_bits(std::size_t elements, std::uint32_t seed, float low,
                                           float high) {
@@ -302,6 +334,10 @@ int run_q4_q5() {
     // invalid tail in the second request, so the boundary is checked next to a zeroed column.
     failures += run(4, 2, {}, 1493U);
     failures += run(4, 2, {4, 2}, 1494U);
+    for (int width = 17; width <= 64; ++width) {
+        failures += run(width, 1, {}, 2400U + width);
+        failures += run(width, 1, {width / 2}, 2450U + width);
+    }
     failures += qk.verify_preserved("Q4 record qk weight");
     failures += value_z.verify_preserved("Q5 record value/z weight");
     return failures;
@@ -343,6 +379,10 @@ int run_q8() {
     failures += run(2, 1, {1}, 1511U);
     failures += run(16, 1, {}, 1521U);
     failures += run(16, 8, {16, 13, 9, 7, 5, 3, 2, 1}, 1531U);
+    for (int width = 17; width <= 64; ++width) {
+        failures += run(width, 1, {}, 2500U + width);
+        failures += run(width, 1, {width / 2}, 2550U + width);
+    }
     failures += parent.verify_preserved("Q8 record parent weight");
     return failures;
 }
@@ -392,6 +432,10 @@ int run_nvfp4() {
             failures += run(width, 1, {}, policy, 1600U + width);
             failures += run(width, 8, ragged(width, 8), policy, 1650U + width);
         }
+        for (int width = 17; width <= 64; ++width) {
+            failures += run(width, 1, {}, policy, 2600U + width);
+            failures += run(width, 1, {width / 2}, policy, 2650U + width);
+        }
     }
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
@@ -439,6 +483,10 @@ int run_fp8() {
         for (int batch : {2, 3, 4}) {
             failures += run_fp8_case(parent, 4, batch, ragged(4, batch), policy, 1810U + batch);
         }
+        for (int width = 17; width <= 64; ++width) {
+            failures += run_fp8_case(parent, width, 1, {}, policy, 2700U + width);
+            failures += run_fp8_case(parent, width, 1, {width / 2}, policy, 2750U + width);
+        }
     }
     failures += parent.verify_preserved("FP8 record parent weight");
     return failures;
@@ -479,7 +527,7 @@ int main(int argc, char** argv) {
         return shard_failures == 0 ? 0 : 1;
     }
 
-    int failures = 0;
+    int failures = test_record_capacity_domain();
     failures += run_q4_q5();
     failures += run_q8();
     failures += run_nvfp4();

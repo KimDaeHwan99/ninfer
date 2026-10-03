@@ -9,12 +9,15 @@
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen3_5/frontend/ngram_sources.h"
+#include "models/qwen3_5/program/prefix/block_keys.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstddef>
@@ -321,6 +324,16 @@ std::uint32_t checked_token_count(std::size_t count) {
     return static_cast<std::uint32_t>(count);
 }
 
+// The request's live ngram index over its final prompt tokens and tool sources, built on the
+// preparing thread so the Engine worker only moves it into the admitted request.
+void build_ngram_index(PreparedPromptData& prompt) {
+    auto index = std::make_unique<detail::NgramProposer>();
+    index->set_boundaries(prompt.ngram_boundaries);
+    index->ingest(prompt.token_ids);
+    for (const auto& source : prompt.ngram_sources) { index->ingest(source); }
+    prompt.ngram_index = std::move(index);
+}
+
 void assign_text_positions(PreparedPromptData& prompt) {
     const std::size_t count = prompt.token_ids.size();
     prompt.token_types.assign(count, 0);
@@ -411,7 +424,8 @@ PreparedContextCache prepare_context_cache(
     std::span<const PromptCacheMarker> rendered_markers,
     std::span<const std::optional<std::uint32_t>> cache_boundaries,
     std::span<const VisionItem> vision_items, std::optional<std::size_t> engine_tool_marker_index,
-    std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier) {
+    std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier,
+    std::uint32_t max_long_anchors, std::uint32_t long_anchor_min_spacing) {
     if (hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
@@ -542,6 +556,86 @@ PreparedContextCache prepare_context_cache(
                         SharedCandidateEvidence::EngineObserved, full_prompt_frontier,
                         engine_order);
     }
+    // Engine-automatic private long anchors: message boundaries are the sparse grid where history
+    // rewrites diverge. A request matching an earlier boundary resumes from the retained anchor
+    // instead of root. Walking back from the prompt end, a boundary joins the grid only when it
+    // lies at least the current spacing below the previous grid point (the prompt end first), and
+    // the spacing doubles with every grid point: tool-loop turns of a few hundred tokens would
+    // otherwise put every anchor next to the endpoint, each costing a prefill split and a full
+    // StateImage for almost no coverage, while deep history stayed unanchored. A boundary already
+    // carried as an opportunity (explicit marker or engine shared candidate) keeps its existing
+    // opportunity and still occupies its grid position, so a marker never displaces a deeper
+    // engine anchor; a boundary at the full prompt frontier is redundant with the session
+    // endpoint.
+    std::size_t grid_positions   = 0;
+    std::uint32_t grid_point     = full_prompt_frontier;
+    std::uint64_t anchor_spacing = long_anchor_min_spacing;
+    for (std::size_t index = message_boundaries.size(); index > 0 &&
+                      grid_positions < max_long_anchors;
+         --index) {
+        const auto boundary = message_boundaries[index - 1];
+        if (!boundary || *boundary == 0 || *boundary >= full_prompt_frontier) { continue; }
+        if (static_cast<std::uint64_t>(grid_point - *boundary) < anchor_spacing) { continue; }
+        ++grid_positions;
+        grid_point     = *boundary;
+        anchor_spacing = std::min<std::uint64_t>(anchor_spacing * 2U,
+                                                 std::numeric_limits<std::uint32_t>::max());
+        if (std::any_of(out.opportunities.begin(), out.opportunities.end(),
+                        [&](const auto& existing) { return existing.frontier == *boundary; })) {
+            continue;
+        }
+        add_opportunity(PromptCacheMarkerKind::PrivateLongAnchor,
+                        SharedCandidateEvidence::EngineStructural, *boundary, engine_order++);
+    }
+    return out;
+}
+
+// Boundary facts for hybrid prefix-cache taps. The Program floors each frontier to a page
+// boundary and applies its own priority, spacing and budget rules; this only reports where the
+// rendered prompt has reusable structure.
+PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
+                                   std::span<const std::optional<std::uint32_t>> message_boundaries,
+                                   std::span<const std::optional<std::uint32_t>> cache_boundaries,
+                                   std::optional<std::size_t> engine_tool_marker_index,
+                                   std::optional<std::uint32_t> leading_boundary,
+                                   const std::optional<RewriteCheckpointSpec>& rewrite_checkpoint) {
+    using runtime::prefix_cache::TapHint;
+    using runtime::prefix_cache::TapHintKind;
+    // Protocol write-policy hints (OpenAI explicit mode, Anthropic cache_control) govern Legacy
+    // shared-prefix publication. Hybrid taps are cheap and content-deduplicated, so explicit
+    // markers only add taps; automatic placement is never suppressed.
+    PreparedTapHints out;
+    out.hints.reserve(message_boundaries.size() + hints.markers.size() + 3U);
+    const auto add = [&](std::optional<std::uint32_t> frontier, TapHintKind kind) {
+        if (frontier && *frontier != 0) { out.hints.push_back(TapHint{*frontier, kind}); }
+    };
+    for (std::size_t index = 0; index < hints.markers.size(); ++index) {
+        const PromptCacheMarker& marker = hints.markers[index];
+        // Only a client-named breakpoint is honored unconditionally; protocol-automatic markers
+        // (OpenAI default caching, Anthropic automatic cache_control) compete with the Engine's
+        // structural boundaries and mark the conversation's latest turn.
+        const TapHintKind kind = has_shared_candidate_evidence(
+                                     marker.evidence, SharedCandidateEvidence::ExplicitBoundary)
+                                     ? TapHintKind::Explicit
+                                     : TapHintKind::Automatic;
+        if (marker.location == PromptCacheMarkerLocation::MessageBoundary) {
+            if (marker.after_message_count < message_boundaries.size()) {
+                add(message_boundaries[marker.after_message_count], kind);
+            }
+        } else if (index < cache_boundaries.size()) {
+            add(cache_boundaries[index], kind);
+        }
+    }
+    if (engine_tool_marker_index && *engine_tool_marker_index < cache_boundaries.size()) {
+        add(cache_boundaries[*engine_tool_marker_index], TapHintKind::Structural);
+    }
+    if (leading_boundary && *leading_boundary < message_boundaries.size()) {
+        add(message_boundaries[*leading_boundary], TapHintKind::Structural);
+    }
+    if (rewrite_checkpoint) { add(rewrite_checkpoint->frontier, TapHintKind::GenerationOpener); }
+    for (const std::optional<std::uint32_t> boundary : message_boundaries) {
+        add(boundary, TapHintKind::MessageBoundary);
+    }
     return out;
 }
 
@@ -570,7 +664,9 @@ public:
         : chat_template(compile_chat_template(resources, options.chat_template_path)),
           tokenizer(resources.tokenizer),
           processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
-          vision_enabled(options.vision_enabled), max_context(options.max_context) {
+          vision_enabled(options.vision_enabled), max_context(options.max_context),
+          max_long_anchors_per_continuation(options.max_long_anchors_per_continuation),
+          long_anchor_min_spacing_tokens(options.long_anchor_min_spacing_tokens) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
@@ -578,6 +674,14 @@ public:
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        if (options.vision_max_merged_tokens != 0) {
+            processor.image_max_pixels = std::min(
+                processor.image_max_pixels,
+                std::uint64_t(options.vision_max_merged_tokens) * fi::merged_token_image_pixels());
+            processor.video_max_pixels = std::min(
+                processor.video_max_pixels,
+                std::uint64_t(options.vision_max_merged_tokens) * fi::merged_token_video_pixels());
+        }
         if (vision_enabled) {
             const std::uint64_t minimum_live =
                 processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);
@@ -593,6 +697,17 @@ public:
             throw std::invalid_argument(
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
+        ngram_sources_enabled = options.ngram_sources_enabled;
+        ngram_archive_enabled = options.ngram_archive_enabled;
+        if (ngram_archive_enabled) {
+            ngram_think_open  = tokenizer->encode("<think>");
+            ngram_think_close = tokenizer->encode("</think>");
+        }
+        if (ngram_sources_enabled) {
+            for (int id = 0; id < static_cast<int>(tokenizer->vocab_size()); ++id) {
+                if (tokenizer->is_special_token(id)) { ngram_boundaries.push_back(id); }
+            }
+        }
         sampling = default_sampling(options.architecture);
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
@@ -601,24 +716,33 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
-        std::vector<TokenId> encoded = tokenizer->encode(kThinkingControl);
+        std::string control_suffix(kThinkingControl);
+        const char* control_name = "canonical thinking control suffix";
+        if (!options.thinking_budget_message.empty()) {
+            control_name = "thinking budget message";
+            control_suffix = options.thinking_budget_message;
+            if (!control_suffix.ends_with(fi::kCanonicalReasoningCloseSerialization)) {
+                control_suffix += fi::kCanonicalReasoningCloseSerialization;
+            }
+        }
+        std::vector<TokenId> encoded = tokenizer->encode(control_suffix);
         if (encoded.empty()) {
-            throw std::invalid_argument(
-                "Qwen tokenizer cannot encode the canonical thinking control suffix");
+            throw std::invalid_argument(std::string("Qwen tokenizer cannot encode the ") +
+                                        control_name);
         }
         const std::string exact =
             tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = false});
         const std::string presented =
             tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = true});
-        if (exact != kThinkingControl || presented.find(kThinkClose) == std::string::npos) {
-            throw std::invalid_argument(
-                "Qwen tokenizer cannot present the canonical thinking control suffix");
+        if (exact != control_suffix || presented.find(kThinkClose) == std::string::npos) {
+            throw std::invalid_argument(std::string("Qwen tokenizer cannot present the ") +
+                                        control_name);
         }
         for (const TokenId token : encoded) {
             if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
                 defaults.token_ids.end()) {
-                throw std::invalid_argument(
-                    "canonical thinking control suffix contains a default terminal token");
+                throw std::invalid_argument(std::string(control_name) +
+                                            " contains a default terminal token");
             }
         }
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
@@ -631,8 +755,17 @@ public:
     StopPolicy defaults;
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
+    bool ngram_sources_enabled = false;
+    bool ngram_archive_enabled = false;
+    std::vector<TokenId> ngram_think_open, ngram_think_close;
+    std::vector<TokenId> ngram_boundaries;
     bool vision_enabled       = true;
     std::uint32_t max_context = 0;
+    // Startup-fixed, published once through Frontend::publish_long_anchor_limit while the Engine
+    // is still single-threaded; atomic so the request threads that read it see the published value
+    // without a data race on a const shared implementation.
+    mutable std::atomic<std::uint32_t> max_long_anchors_per_continuation{0};
+    std::uint32_t long_anchor_min_spacing_tokens = 0;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -694,6 +827,10 @@ const ModelSamplingDefaults& Frontend::sampling_defaults() const noexcept {
     return impl_->sampling;
 }
 
+void Frontend::publish_long_anchor_limit(std::uint32_t anchors) noexcept {
+    impl_->max_long_anchors_per_continuation.store(anchors, std::memory_order_relaxed);
+}
+
 Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, options));
 }
@@ -701,6 +838,34 @@ Frontend make_frontend(const FrontendResources& resources, FrontendOptions optio
 const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     return *prompt.data_;
+}
+
+std::unique_ptr<NgramArchive::Request> PreparedPrompt::bind_ngram(NgramArchive& archive,
+                                                                  const NgramSessionHints& hints) {
+    if (!data_) { return {}; }
+    data_->ngram_snapshot.reset();
+    if (hints.key.empty()) { return {}; }
+    if (hints.reset) { archive.clear(hints.key); }
+    // Bounded proposal-only views. The archive owns copied/indexed spans; it never
+    // changes this prompt, its token positions, or its prefix-cache identity.
+    std::array<NgramSourceView, kNgramRequestSourceCapacity> sources;
+    std::size_t count = 0;
+    for (int priority = static_cast<int>(NgramSourceKind::Tool); priority >= 0; --priority) {
+        if (priority == static_cast<int>(NgramSourceKind::Tool)) {
+            for (const auto& source : data_->ngram_sources) {
+                if (count == sources.size()) { break; }
+                sources[count++] = {source, NgramSourceKind::Tool};
+            }
+        }
+        for (const auto& source : data_->ngram_archive_sources) {
+            if (count == sources.size()) { break; }
+            if (static_cast<int>(source.kind) == priority) { sources[count++] = source; }
+        }
+    }
+    auto request          = archive.begin(hints.key, std::span(sources).first(count),
+                                          data_->ngram_boundaries, hints.parent, hints.parent_generation);
+    data_->ngram_snapshot = request ? request->snapshot() : nullptr;
+    return request;
 }
 
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
@@ -751,6 +916,27 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
+    if (impl_->ngram_sources_enabled) {
+        result.ngram_boundaries = impl_->ngram_boundaries;
+        std::size_t remaining   = impl_->max_context;
+        for (const auto& message : messages) {
+            if (remaining == 0) { break; }
+            if (message.role != ChatRole::Tool) { continue; }
+            for (const auto& part : message.parts) {
+                if (remaining == 0) { break; }
+                if (part.kind != fi::ChatPartKind::Text) { continue; }
+                fi::check_preparation_control(control, "ngram proposal sources");
+                for (const auto& source : fi::ngram_numbered_sources(part.text)) {
+                    fi::check_preparation_control(control, "ngram proposal sources");
+                    if (remaining == 0) { break; }
+                    auto tokens = impl_->tokenizer->encode(source, {.max_tokens = remaining});
+                    fi::check_preparation_control(control, "ngram proposal sources");
+                    remaining -= tokens.size();
+                    result.ngram_sources.push_back(std::move(tokens));
+                }
+            }
+        }
+    }
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
     if (has_media) {
@@ -814,11 +1000,73 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
+    if (impl_->ngram_archive_enabled) {
+        const std::span<const TokenId> tokens(result.token_ids);
+        auto add = [&](std::span<const TokenId> span, NgramSourceKind kind, int priority) {
+            if (static_cast<int>(kind) == priority && span.size() >= 4 &&
+                result.ngram_archive_sources.size() < kNgramRequestSourceCapacity) {
+                result.ngram_archive_sources.push_back({span, kind});
+            }
+        };
+        // Use already-encoded message frontiers, not re-tokenized rendered text.
+        // Views move with the owning token vector and never participate in KV identity.
+        for (int priority = static_cast<int>(NgramSourceKind::Tool); priority >= 0; --priority) {
+            for (std::size_t i = 0; i < message_roles.size() && i + 1 < message_boundaries.size();
+                 ++i) {
+                fi::check_preparation_control(control, "ngram archive sources");
+                const auto role = message_roles[i];
+                const auto kind = role == ChatRole::Tool        ? NgramSourceKind::Tool
+                                  : role == ChatRole::Assistant ? NgramSourceKind::Generated
+                                                                : NgramSourceKind::Text;
+                if ((static_cast<int>(kind) != priority &&
+                     !(role == ChatRole::Assistant && priority == 0)) ||
+                    !message_boundaries[i + 1] || (!message_boundaries[i] && i != 0)) {
+                    continue;
+                }
+                auto begin     = message_boundaries[i].value_or(0);
+                const auto end = *message_boundaries[i + 1];
+                if (begin >= end || end > tokens.size()) { continue; }
+                if (impl_->tokenizer->decode_token_bytes(tokens[begin]) == "<|im_start|>") {
+                    while (begin < end) {
+                        const auto bytes = impl_->tokenizer->decode_token_bytes(tokens[begin++]);
+                        if (bytes.find('\n') != std::string_view::npos) { break; }
+                    }
+                }
+                auto body = tokens.subspan(begin, end - begin);
+                if (role == ChatRole::Assistant && !impl_->ngram_think_open.empty() &&
+                    !impl_->ngram_think_close.empty()) {
+                    const auto& open  = impl_->ngram_think_open;
+                    const auto& close = impl_->ngram_think_close;
+                    const auto marker =
+                        std::search(body.begin(), body.end(), open.begin(), open.end());
+                    if (marker != body.end() && marker - body.begin() <= 4) {
+                        const auto reasoning = marker + open.size();
+                        const auto closure =
+                            std::search(reasoning, body.end(), close.begin(), close.end());
+                        add({reasoning, closure}, NgramSourceKind::Reasoning, priority);
+                        if (closure == body.end()) { continue; }
+                        body = {closure + close.size(), body.end()};
+                    }
+                }
+                add(body, kind, priority);
+            }
+        }
+    }
     result.identity.reusable = true;
+    result.tap_hints         = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries,
+                                                 engine_tool_marker_index, leading_boundary,
+                                                 result.identity.rewrite_checkpoint);
     result.context_cache     = prepare_context_cache(
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
-        checked_token_count(result.token_ids.size()));
+        checked_token_count(result.token_ids.size()),
+        impl_->max_long_anchors_per_continuation.load(std::memory_order_relaxed),
+        impl_->long_anchor_min_spacing_tokens);
+    if (impl_->ngram_sources_enabled) {
+        fi::check_preparation_control(control, "ngram index");
+        build_ngram_index(result);
+    }
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -887,7 +1135,15 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
+    if (impl_->ngram_sources_enabled) {
+        result.ngram_boundaries = impl_->ngram_boundaries;
+        build_ngram_index(result);
+    }
+    if (impl_->ngram_archive_enabled) {
+        result.ngram_archive_sources.push_back({result.token_ids, NgramSourceKind::Text});
+    }
     assign_text_positions(result);
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     result.identity.reusable                  = allow_prefix_identity;
     result.context_cache.retention            = runtime::RetentionClass::RecentPrivate;
     result.context_cache.update_session_index = false;

@@ -48,6 +48,11 @@ ninfer_add_op_test(ninfer_softmax_attention_test
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
   LIBRARIES ninfer_ops)
 
+# Beyond the native 262,144 visible keys that --rope-yarn-factor opens (up to 1,048,576).
+add_test(NAME ninfer_softmax_attention_extended_test
+  COMMAND ninfer_softmax_attention_test --extended)
+set_tests_properties(ninfer_softmax_attention_extended_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_op_test(ninfer_sliding_window_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sliding_window_attention.cpp"
   LIBRARIES ninfer_ops)
@@ -99,6 +104,11 @@ ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_attn_input_proj_fused_rmsnorm_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj_fused_rmsnorm.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_attn_input_proj_fused_rmsnorm_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
   LIBRARIES ninfer_ops)
@@ -131,3 +141,28 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
+
+add_test(NAME ninfer_softmax_attention_wide_test
+  COMMAND ninfer_softmax_attention_test --wide-only)
+set_tests_properties(ninfer_softmax_attention_wide_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 RUN_SERIAL TRUE)
+
+add_test(NAME ninfer_sparse_moe_wide_test
+  COMMAND ninfer_sparse_moe_test --wide-only)
+set_tests_properties(ninfer_sparse_moe_wide_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+
+foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution ngram-negative-penalties wide-accept wide-distribution)
+  string(REPLACE "-" "_" test_suffix "${mode}")
+  add_test(NAME ninfer_speculative_${test_suffix}_test
+    COMMAND ninfer_speculative_round_test --${mode})
+  set_tests_properties(ninfer_speculative_${test_suffix}_test
+    PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
+endforeach()
+set_tests_properties(ninfer_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
+set_tests_properties(ninfer_speculative_wide_distribution_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
+
+add_test(NAME ninfer_gdn_replay_fold_wide_test
+  COMMAND ninfer_gdn_replay_fold_test --wide-only)
+set_tests_properties(ninfer_gdn_replay_fold_wide_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)

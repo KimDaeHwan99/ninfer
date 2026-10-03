@@ -343,6 +343,16 @@ int test_tool_history() {
                           truncated.messages[1].role == ninfer::ChatRole::User,
                       "leading tool_result from a truncated history was rejected or reordered");
 
+    // A final Assistant message is a prefill, and a prefill cannot end in an unanswered tool_use.
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "first"}},
+         Json{{"role", "assistant"},
+              {"content", Json::array({Json{{"type", "text"}, {"text", "calling"}},
+                                       tool_use("toolu_trailing")})}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history" &&
+                          api_param([&] { (void)parse(body); }) == "messages",
+                      "trailing assistant tool_use was accepted as a prefill");
+
     body["messages"] = Json::array(
         {Json{{"role", "user"}, {"content", "first"}},
          Json{{"role", "assistant"}, {"content", "ordinary"}},
@@ -382,9 +392,11 @@ int test_tools() {
                              rendered["function"]["input_examples"].is_array(),
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
 
-    body["tools"] = Json::array({ordinary_tool(true)});
-    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported",
-                      "active strict tool was accepted without constrained decoding");
+    // strict=true is advisory, as on the OpenAI endpoints: the tool is served unconstrained.
+    body["tools"]                        = Json::array({ordinary_tool(true)});
+    const GenerationRequest strict_tools = parse(body).generation;
+    failures += check(strict_tools.uses_tools() && strict_tools.tools.size() == 1,
+                      "an advisory strict tool was rejected or dropped");
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
     body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
@@ -392,17 +404,31 @@ int test_tools() {
     failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.empty(),
                       "tool_choice:none did not neutralize inactive tool guarantees");
 
-    body                = base_request();
-    body["tools"]       = Json::array({ordinary_tool()});
+    // Forced, named and single-call choices are advisory: the Engine cannot force a call, so the
+    // tools stay offered under automatic selection. Qwen Code sends any for its JSON side queries.
+    body          = base_request();
+    body["tools"] = Json::array({ordinary_tool()});
+    for (const Json& choice : {Json{{"type", "any"}}, Json{{"type", "tool"}, {"name", "weather"}},
+                               Json{{"type", "auto"}, {"disable_parallel_tool_use", true}},
+                               Json{{"type", "any"}, {"disable_parallel_tool_use", true}}}) {
+        body["tool_choice"]              = choice;
+        const GenerationRequest advisory = parse(body).generation;
+        failures += check(advisory.uses_tools() &&
+                              advisory.tool_choice.mode == ToolChoiceMode::Auto &&
+                              prompt(advisory).options.tool_jsons.size() == 1,
+                          "an advisory tool choice was rejected or did not keep the tools offered");
+    }
+    body["tool_choice"] = Json{{"type", "tool"}, {"name", "forecast"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "tool_choice",
+                      "a named choice of an undeclared tool was accepted");
+    body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"},
+                               {"disable_parallel_tool_use", "yes"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "disable_parallel_tool_use",
+                      "a non-boolean disable_parallel_tool_use was accepted");
+    body          = base_request();
     body["tool_choice"] = Json{{"type", "any"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "forced any-tool choice was silently downgraded");
-    body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "named tool choice was silently downgraded");
-    body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", true}};
-    failures += check(api_code([&] { (void)parse(body); }) == "parallel_tool_use_not_supported",
-                      "active single-tool-call guarantee was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "tool_choice",
+                      "tool_choice any without tools was accepted");
 
     body          = base_request();
     body["tools"] = Json::array({Json{{"type", "web_search_20250305"}, {"name", "web_search"}}});
@@ -468,9 +494,18 @@ int test_thinking_and_count_tokens() {
                              options.execution.thinking.budget == 1024,
                          "request Thinking budget did not reach Engine options");
 
-    body["thinking"]["budget_tokens"] = 4096;
+    // A budget at or above max_tokens is accepted and passed on; the output limit ends thinking
+    // first. Qwen Code sends a fixed budget while shrinking max_tokens to the context left.
+    for (const int budget : {4096, 128000}) {
+        body["thinking"]["budget_tokens"] = budget;
+        const GenerationRequest over      = parse(body).generation;
+        failures += check(over.enable_thinking == true && over.max_tokens == 4096 &&
+                              over.thinking_budget == static_cast<std::uint32_t>(budget),
+                          "Thinking budget at or above max_tokens was rejected or altered");
+    }
+    body["thinking"]["budget_tokens"] = 1023;
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
-                      "Thinking budget equal to max_tokens was accepted");
+                      "Thinking budget below 1024 was accepted");
     body["thinking"] = Json{{"type", "future"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking mode defaulted to enabled");
@@ -491,9 +526,8 @@ int test_thinking_and_count_tokens() {
     failures += check(api_code([&] { (void)semantics(parse(body).generation); }).empty(),
                       "disabled-Thinking assistant prefill was rejected");
     body.erase("thinking");
-    failures += check(api_code([&] { (void)semantics(parse(body).generation); }) ==
-                          "assistant_prefill_not_supported",
-                      "Thinking-on assistant prefill was not rejected at capability resolution");
+    failures += check(api_code([&] { (void)semantics(parse(body).generation); }).empty(),
+                      "Thinking-on assistant prefill was rejected at capability resolution");
     return failures;
 }
 

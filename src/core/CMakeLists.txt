@@ -1,5 +1,13 @@
+if(WIN32)
+  set(NINFER_READ_ONLY_FILE_SOURCE read_only_file_win32.cpp)
+else()
+  set(NINFER_READ_ONLY_FILE_SOURCE read_only_file_posix.cpp)
+endif()
+
 add_library(ninfer_core STATIC
+  ${NINFER_READ_ONLY_FILE_SOURCE}
   arena.cu
+  evictable_weight_pool.cu
   device.cu
   dtype.cpp
   host_worker_pool.cpp
@@ -16,4 +24,4 @@ add_library(ninfer_core STATIC
 )
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_link_libraries(ninfer_core PUBLIC ninfer_cuda_runtime CUDA::nvtx3 CUDA::cuda_driver Threads::Threads)

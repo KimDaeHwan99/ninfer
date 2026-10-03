@@ -29,6 +29,13 @@ void validate_long_anchor_ordinals(std::span<const LongAnchorCheckpoint> anchors
 void advance_rebuild_work(SequenceState& sequence, std::uint32_t frontier,
                           std::uint32_t prefill_chunk);
 
+// Exact root rebuild work for a frontier: full prefill from root to the frontier with the
+// prompt's fully consumed vision features and the capture/rewrite segment boundaries.
+runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
+                                              std::uint32_t frontier, std::uint32_t prefill_chunk,
+                                              std::span<const CaptureGroup> captures,
+                                              std::span<const std::uint32_t> rewrite_frontiers);
+
 std::optional<qwen3_5::TargetKVRequirement>
 retained_requirement_after_drops(const qwen3_5::ContinuationSummary& summary,
                                  std::span<const runtime::CheckpointRef> dropped) noexcept;
@@ -54,16 +61,20 @@ std::optional<StateImageHandle> pressure_state_source(qwen3_5::detail::PressureS
 detail::PhysicalResources checked_resource_sum(detail::PhysicalResources left,
                                                detail::PhysicalResources right);
 
+// `site` names the accounting step in the underflow error, with both operands, so a violated
+// resource invariant can be traced from the console alone.
 detail::PhysicalResources checked_resource_difference(detail::PhysicalResources value,
-                                                      detail::PhysicalResources removed);
+                                                      detail::PhysicalResources removed,
+                                                      const char* site);
 
 detail::PhysicalResources positive_resource_difference(detail::PhysicalResources value,
                                                        detail::PhysicalResources removed) noexcept;
 
-execution::MtpCausalAttentionEnvelopes
-mtp_causal_attention_envelopes(std::uint32_t max_frontier, std::uint32_t k, std::uint32_t capacity);
+execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
+                                                                      std::uint32_t k,
+                                                                      std::uint32_t capacity,
+                                                                      std::uint32_t next_k);
 
-execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
-                                            std::uint32_t k);
+execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier);
 
 } // namespace ninfer::models::qwen3_5::detail

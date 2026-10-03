@@ -156,6 +156,8 @@ struct RequestRecord {
     const std::uint64_t id;
     const std::uint64_t publication_order;
     PreparedPrompt prompt;
+    std::unique_ptr<typename ModelContract::NgramArchive::Request> ngram_archive;
+    bool ngram_admission_checked = false;
     OutputSession output;
     PromptSummary prompt_summary;
     double prepare_seconds = 0.0;
@@ -179,6 +181,8 @@ struct RequestRecord {
     std::atomic<bool> cancelled{false};
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
+    // A Device KV lease that stayed short after retained-cache reclaim was reported once.
+    bool lease_shortfall_reported         = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;
 

@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <iterator>
 #include <optional>
 #include <string>
@@ -19,7 +18,10 @@ namespace {
 
 using Json = RequestJson;
 
-constexpr std::size_t kMaxToolNameLength = 128;
+// Shares the protocol-wide limit (serve/request.h). Anthropic's own boundary is
+// narrower, but agent hosts send longer names — VS Code Copilot wraps MCP tools
+// as "activate_fallback_mcp_<server>_<tool>", past 64 bytes.
+constexpr std::size_t kMaxToolNameLength = kMaximumToolNameLength;
 
 enum class ParsePurpose {
     Messages,
@@ -87,7 +89,9 @@ std::string require_tool_name(const Json& object, const char* param) {
     }
     std::string name = object.at("name").get<std::string>();
     if (!valid_tool_name(name, kMaxToolNameLength)) {
-        bad_request("tool name must match [A-Za-z0-9_-]{1,128}", param);
+        bad_request("tool name must match [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaxToolNameLength) + "}",
+                    param);
     }
     return name;
 }
@@ -630,14 +634,6 @@ void parse_messages(const Json& body, GenerationRequest& request) {
     lower_messages(std::move(parsed), request);
 
     if (!request.messages.empty() && request.messages.back().role == ChatRole::Assistant) {
-        const ChatTurn& final = request.messages.back();
-        if (final.content.empty() || !final.reasoning_content.empty() ||
-            !final.tool_calls.empty() ||
-            std::any_of(final.content.begin(), final.content.end(),
-                        [](const ContentPart& part) { return part.kind != ContentKind::Text; })) {
-            bad_request("a final assistant prefill must contain only text", "messages",
-                        "assistant_prefill_not_supported");
-        }
         request.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
     }
 }
@@ -652,7 +648,6 @@ enum class ToolSelectionKind {
 struct ToolSelection {
     ToolSelectionKind kind = ToolSelectionKind::Auto;
     std::string name;
-    bool disable_parallel = false;
 };
 
 ToolSelection parse_tool_choice(const Json& body) {
@@ -675,7 +670,7 @@ ToolSelection parse_tool_choice(const Json& body) {
     } else {
         bad_request("unsupported tool_choice type: " + type, "tool_choice");
     }
-    result.disable_parallel = optional_bool(choice, "disable_parallel_tool_use", false);
+    (void)optional_bool(choice, "disable_parallel_tool_use", false);
     return result;
 }
 
@@ -689,7 +684,6 @@ struct ParsedTool {
     ToolDefinition definition;
     ToolSource source = ToolSource::UserDefined;
     std::string source_type;
-    bool strict        = false;
     bool defer_loading = false;
     std::optional<std::vector<std::string>> allowed_callers;
 };
@@ -748,7 +742,6 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("tool strict must be a boolean", "tools");
             }
-            parsed.strict = item.at("strict").get<bool>();
         }
         if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
             if (!item.at("defer_loading").is_boolean()) {
@@ -784,19 +777,15 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         return tool.definition.name == selection.name;
     };
 
-    if (selection.kind == ToolSelectionKind::Named) {
-        if (std::none_of(definitions.begin(), definitions.end(), named)) {
-            bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
-        }
-        bad_request("tool_choice.type='tool' requires that exact tool to be called, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+    // Forced choices are advisory, as on the OpenAI endpoints: the Engine cannot force a call, so a
+    // named choice is checked against the declared tools and automatic selection proceeds. Qwen
+    // Code, for one, sends tool_choice any for every JSON side query (docs/serving.md).
+    if (selection.kind == ToolSelectionKind::Named &&
+        std::none_of(definitions.begin(), definitions.end(), named)) {
+        bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
     }
-    if (selection.kind == ToolSelectionKind::Any) {
-        if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
-        bad_request("tool_choice.type='any' requires at least one tool call, which NInfer cannot "
-                    "guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+    if (selection.kind == ToolSelectionKind::Any && definitions.empty()) {
+        bad_request("tool_choice requires tools", "tool_choice");
     }
 
     request.tool_choice.mode =
@@ -821,11 +810,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.strict) {
-            bad_request("strict=true requires generated tool input to satisfy the declared JSON "
-                        "Schema, which NInfer cannot guarantee",
-                        "tools", "strict_tools_not_supported");
-        }
+        // strict=true is advisory: generation is not constrained to the declared JSON Schema.
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -840,15 +825,10 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         }
         request.tools.push_back(std::move(tool.definition));
     }
-    if (selection.disable_parallel && !request.tools.empty()) {
-        bad_request("disable_parallel_tool_use=true requires at most one tool call, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "parallel_tool_use_not_supported");
-    }
+    // disable_parallel_tool_use=true is advisory: the model may still emit several calls.
 }
 
-void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                    int effective_max_tokens) {
+void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
     if (!body.contains("thinking") || body.at("thinking").is_null()) { return; }
     const Json& thinking = body.at("thinking");
     if (!thinking.is_object() || !thinking.contains("type") || !thinking.at("type").is_string()) {
@@ -865,9 +845,9 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
         if (!budget || *budget < 1024) {
             bad_request("thinking.budget_tokens must be an integer of at least 1024", "thinking");
         }
-        if (purpose == ParsePurpose::Messages && *budget >= effective_max_tokens) {
-            bad_request("thinking.budget_tokens must be less than max_tokens", "thinking");
-        }
+        // Unlike the Anthropic API, a budget at or above max_tokens is accepted: the output limit
+        // is reached before the budget, so it never takes effect. Clients such as Qwen Code send
+        // a fixed budget while shrinking max_tokens to the context window left.
         request.thinking_budget = static_cast<std::uint32_t>(*budget);
     } else {
         bad_request("thinking.type must be 'disabled', 'adaptive', or 'enabled'", "thinking");
@@ -1015,12 +995,11 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
                       .ttl      = *automatic_ttl};
 }
 
-void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens) {
+void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
     lower_tools(body, request);
     parse_system(body, request);
     parse_messages(body, request);
-    parse_thinking(body, request, purpose, effective_max_tokens);
+    parse_thinking(body, request, purpose);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
@@ -1065,8 +1044,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
         result.generation.max_tokens = limits.default_max_tokens;
     }
 
-    parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens);
+    parse_common_prompt(body, result.generation, ParsePurpose::Messages);
     parse_generation_fields(body, result.generation);
     return result;
 }
@@ -1076,8 +1054,7 @@ AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& bod
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
-    parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max());
+    parse_common_prompt(body, result.generation, ParsePurpose::CountTokens);
     return result;
 }
 

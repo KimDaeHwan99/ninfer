@@ -15,31 +15,32 @@ namespace ninfer::models::qwen3_5::execution {
 
 std::size_t row_parallel_output_workspace_bytes(const LinearParameters& output,
                                                 std::int32_t first, std::int32_t last,
-                                                bool split) {
-    const auto& w = output.weight;
+                                                bool split, bool wide_verification) {
+    const auto& w      = output.weight;
+    const auto policy  = residual_projection_policy(output, wide_verification);
     if (!split) {
-        return ops::linear_add_workspace_capacity_bytes(w.qtype, w.n, w.k, output.policy, first,
-                                                        last);
+        return ops::linear_add_workspace_capacity_bytes(w.qtype, w.n, w.k, policy, first, last);
     }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {w.n, last});
     (void)layout.alloc_bytes(
-        ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, output.policy, first, last));
+        ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, policy, first, last));
     return layout.peak_bytes(1);
 }
 
 void row_parallel_output(const Tensor& input, const LinearParameters& output, Tensor& residual,
                          const TensorParallelDeviceView* tp, WorkspaceArena& workspace,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, bool wide_verification) {
+    const auto policy = residual_projection_policy(output, wide_verification);
     if (tp == nullptr) {
-        ops::linear_add(input, output.weight, residual, output.policy, workspace, stream);
+        ops::linear_add(input, output.weight, residual, policy, workspace, stream);
         return;
     }
     auto scope    = workspace.scope();
     Tensor delta  = workspace.alloc(DType::BF16, {residual.ne[0], residual.ne[1]});
     {
         auto call = workspace.scope();
-        ops::linear(input, output.weight, delta, output.policy, workspace, stream);
+        ops::linear(input, output.weight, delta, policy, workspace, stream);
     }
     ops::tp_residual_allreduce(delta, residual, *tp, stream);
 }

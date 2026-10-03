@@ -27,9 +27,9 @@ public:
     DeviceBuffer(DeviceBuffer&& other) noexcept;
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
 
-    void fill(int byte_value = 0);
-    // Completes the upload before returning. Callers must first order any prior device
+    // Both complete on the device before returning. Callers must first order any prior device
     // accesses to the destination range.
+    void fill(int byte_value = 0);
     void copy_from_host(const void* source, std::size_t count, std::size_t byte_offset = 0);
     void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0) const;
 
@@ -57,8 +57,11 @@ public:
 
         explicit Scope(DeviceArena& arena) noexcept;
 
-        DeviceArena* arena_       = nullptr;
-        std::size_t saved_offset_ = 0;
+        DeviceArena* arena_          = nullptr;
+        std::size_t saved_offset_    = 0;
+        // The arena state the scope was opened in: after a reset() the saved offset names
+        // another generation's layout, so the scope no longer rolls back.
+        std::uint64_t saved_generation_ = 0;
     };
 
     explicit DeviceArena(std::size_t capacity_bytes);
@@ -87,6 +90,7 @@ private:
     std::size_t cap_  = 0;
     std::size_t off_  = 0;
     std::size_t peak_ = 0;
+    std::uint64_t generation_ = 0;
     bool owns_        = true;
 };
 

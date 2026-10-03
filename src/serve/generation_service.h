@@ -22,14 +22,20 @@ struct RequestLifetime;
 struct RequestCapacity;
 
 struct GenerationMetrics {
-    double prepare_seconds         = 0.0;
-    double ttft_seconds            = 0.0;
-    double vision_seconds          = 0.0;
-    double prefill_seconds         = 0.0;
-    double decode_seconds          = 0.0;
-    double prompt_wall_seconds     = 0.0;
-    double generation_wall_seconds = 0.0;
-    double total_seconds           = 0.0;
+    double prepare_seconds                     = 0.0;
+    double ttft_seconds                        = 0.0;
+    double vision_seconds                      = 0.0;
+    double prefill_seconds                     = 0.0;
+    double decode_seconds                      = 0.0;
+    double decode_share_seconds                = 0.0;
+    double prompt_wall_seconds                 = 0.0;
+    double generation_wall_seconds             = 0.0;
+    double total_seconds                       = 0.0;
+    double vision_offload_window_seconds       = 0.0;
+    double vision_offload_evict_seconds        = 0.0;
+    double vision_offload_restore_seconds      = 0.0;
+    std::uint64_t vision_offload_evicted_bytes = 0;
+    std::uint64_t vision_offload_staged_bytes  = 0;
     ninfer::GenerationEngineTiming engine_timing;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
@@ -39,6 +45,13 @@ struct GenerationMetrics {
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
+    std::uint64_t ngram_rounds                  = 0;
+    std::uint64_t ngram_drafted_tokens          = 0;
+    std::uint64_t ngram_accepted_tokens         = 0;
+    std::uint64_t ngram_archive_rounds          = 0;
+    std::uint64_t ngram_archive_drafted_tokens  = 0;
+    std::uint64_t ngram_archive_accepted_tokens = 0;
+    NgramArchiveStats ngram_archive;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
     ninfer::MaterializationDiagnostics materialization;
@@ -94,7 +107,8 @@ struct PreparedRequest {
 
 class GenerationService {
 public:
-    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
+    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {},
+                               DiagnosticObserver diagnostic_observer = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
@@ -103,6 +117,10 @@ public:
     [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
 
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
+
+    [[nodiscard]] ninfer::ModelMetadata model_metadata() const {
+        return engine_->model_metadata();
+    }
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
@@ -132,6 +150,9 @@ public:
 
     void warmup();
 
+    // Begins the Engine's orderly stop: running and queued generations fail as Unavailable.
+    void stop() noexcept { engine_->stop(); }
+
 private:
     enum class CacheParticipation : std::uint8_t {
         Disabled,
@@ -150,10 +171,16 @@ private:
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
+    [[nodiscard]] std::shared_ptr<RequestLifetime>
+    acquire_lifetime(const std::shared_ptr<RequestCapacity>& capacity,
+                     DeadlinePolicy deadline_policy, const char* full_message) const;
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    // Token counting runs the whole preparation path on handler threads, so it has its own bound:
+    // a flood of counts is rejected before it can occupy the threads generation prepares on.
+    std::shared_ptr<RequestCapacity> count_capacity_;
 };
 
 } // namespace ninfer::serve

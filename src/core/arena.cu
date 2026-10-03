@@ -89,6 +89,12 @@ void DeviceBuffer::fill(int byte_value) {
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
     }
+    // A device memset may return before it completes; settle the default stream as
+    // copy_from_host does.
+    const cudaError_t settled = cudaStreamSynchronize(nullptr);
+    if (settled != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("device fill synchronization failed", settled));
+    }
 }
 
 void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
@@ -127,14 +133,18 @@ void DeviceBuffer::require_range(std::size_t byte_offset, std::size_t count,
 }
 
 DeviceArena::Scope::Scope(DeviceArena& arena) noexcept
-    : arena_(&arena), saved_offset_(arena.off_) {}
+    : arena_(&arena), saved_offset_(arena.off_), saved_generation_(arena.generation_) {}
 
 DeviceArena::Scope::~Scope() noexcept {
-    if (arena_ != nullptr && saved_offset_ <= arena_->off_) { arena_->off_ = saved_offset_; }
+    if (arena_ != nullptr && arena_->generation_ == saved_generation_ &&
+        saved_offset_ <= arena_->off_) {
+        arena_->off_ = saved_offset_;
+    }
 }
 
 DeviceArena::Scope::Scope(Scope&& other) noexcept
-    : arena_(other.arena_), saved_offset_(other.saved_offset_) {
+    : arena_(other.arena_), saved_offset_(other.saved_offset_),
+      saved_generation_(other.saved_generation_) {
     other.arena_ = nullptr;
 }
 
@@ -167,6 +177,7 @@ DeviceArena::~DeviceArena() {
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
     : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
+      generation_(other.generation_),
       owns_(other.owns_) {
     other.base_ = nullptr;
     other.cap_  = 0;
@@ -183,6 +194,7 @@ DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     cap_  = other.cap_;
     off_  = other.off_;
     peak_ = other.peak_;
+    generation_ = other.generation_;
     owns_ = other.owns_;
 
     other.base_ = nullptr;
@@ -229,7 +241,10 @@ Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape
 
 DeviceArena::Scope DeviceArena::scope() noexcept { return Scope(*this); }
 
-void DeviceArena::reset() noexcept { off_ = 0; }
+void DeviceArena::reset() noexcept {
+    off_ = 0;
+    ++generation_;
+}
 
 void* DeviceArena::base() const noexcept { return base_; }
 

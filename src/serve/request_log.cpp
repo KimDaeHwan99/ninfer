@@ -17,7 +17,11 @@
 #include <system_error>
 #include <utility>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::serve {
 namespace {
@@ -38,7 +42,12 @@ std::uint64_t unix_time_ms() {
 std::string new_server_instance_id() {
     const auto now    = std::chrono::system_clock::now().time_since_epoch();
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-    return "serve-" + std::to_string(static_cast<long long>(::getpid())) + '-' +
+#ifdef _WIN32
+    const auto process_id = ::_getpid();
+#else
+    const auto process_id = ::getpid();
+#endif
+    return "serve-" + std::to_string(static_cast<long long>(process_id)) + '-' +
            std::to_string(micros);
 }
 
@@ -89,6 +98,7 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                 {"structured_call_count", diagnostics.structured_call_count},
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
+                {"duplicate_parameters_repaired", diagnostics.duplicate_parameters_repaired},
                 {"fallback_reason",
                  ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
 }
@@ -291,7 +301,24 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"drafted_tokens", metrics.speculative_draft_tokens},
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
-                {"accepted_per_position", metrics.speculative_accepted_per_position}};
+                {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"ngram_rounds", metrics.ngram_rounds},
+                {"ngram_drafted_tokens", metrics.ngram_drafted_tokens},
+                {"ngram_accepted_tokens", metrics.ngram_accepted_tokens},
+                {"ngram_archive_rounds", metrics.ngram_archive_rounds},
+                {"ngram_archive_drafted_tokens", metrics.ngram_archive_drafted_tokens},
+                {"ngram_archive_accepted_tokens", metrics.ngram_archive_accepted_tokens},
+                {"ngram_archive",
+                 {{"enabled", metrics.ngram_archive.enabled},
+                  {"bound", metrics.ngram_archive.bound},
+                  {"published", metrics.ngram_archive.published},
+                  {"generation", metrics.ngram_archive.generation},
+                  {"sources", metrics.ngram_archive.sources},
+                  {"session_bytes", metrics.ngram_archive.session_bytes},
+                  {"total_bytes", metrics.ngram_archive.total_bytes},
+                  {"sampling_seed", metrics.ngram_archive.sampling_seed
+                                        ? Json(*metrics.ngram_archive.sampling_seed)
+                                        : Json(nullptr)}}}};
 }
 
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
@@ -320,6 +347,8 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"search_stop_phase",
          ninfer::materialization_search_phase_name(diagnostics.search_stop_phase)},
         {"search_boundary_limited", diagnostics.search_boundary_limited},
+        {"cached_prefix_tokens", diagnostics.cached_prefix_tokens},
+        {"restored_host_bytes", diagnostics.restored_host_bytes},
     };
 }
 
@@ -466,6 +495,8 @@ std::string format_server_start_json(
              {"max_pending_requests", engine_options.max_pending_requests},
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},
+             {"original_int8_prefill_kernel", engine_options.original_int8_prefill_kernel},
+             {"original_nvfp4_prefill_kernel", engine_options.original_nvfp4_prefill_kernel},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
@@ -474,6 +505,11 @@ std::string format_server_start_json(
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
+             {"ngram_draft_window", engine_options.speculative.ngram_draft_tokens},
+             {"ngram_min_match", engine_options.speculative.ngram_min_match},
+             {"ngram_archive_bytes", engine_options.speculative.ngram_archive_bytes},
+             {"ngram_session_bytes", engine_options.speculative.ngram_session_bytes},
+             {"ngram_native_sessions", options.ngram_native_sessions},
              {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
              {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
                                                            context_cost.transfer_source)},
@@ -511,9 +547,13 @@ std::string format_server_start_json(
              {"kv_capacity_headroom_bytes", memory.kv_capacity_headroom_bytes},
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
+             {"cuda_graph_measured_bytes", memory.cuda_graph_measured_bytes},
              {"kv_payload_bytes", memory.kv_payload_bytes},
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
+             {"host_state_image_bytes", memory.host_state_image_bytes},
+             {"host_kv_page_group_bytes", memory.host_kv_page_group_bytes},
+             {"host_cache_budget_bytes", memory.host_cache_budget_bytes},
              {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
     record["environment"] =
@@ -667,7 +707,11 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
         {"captures", Json{{"completed", monotonic_delta(previous.active_captures_completed,
                                                         current.active_captures_completed)},
                           {"aborted", monotonic_delta(previous.active_captures_aborted,
-                                                      current.active_captures_aborted)}}},
+                                                      current.active_captures_aborted)},
+                          {"skipped", monotonic_delta(previous.active_captures_skipped,
+                                                      current.active_captures_skipped)}}},
+        {"salvage", Json{{"published", monotonic_delta(previous.salvaged_continuations,
+                                                       current.salvaged_continuations)}}},
         {"selections",
          Json{{"root", monotonic_delta(previous.root_selections, current.root_selections)},
               {"private_endpoint", monotonic_delta(previous.private_endpoint_selections,
@@ -771,11 +815,46 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
         {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},
                            {"host_state_slots", current.host_state_occupied_slots},
                            {"device_main_kv_pages", current.device_main_kv_occupied_pages},
+                           {"device_main_kv_lease_pages", current.device_main_kv_lease_pages},
                            {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
+                           {"device_backend_kv_lease_pages",
+                            current.device_backend_kv_lease_pages},
                            {"host_kv_bytes", current.host_kv_occupied_bytes},
                            {"shared_active_references", current.shared_active_references}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
+    // Hybrid prefix cache (the serving default): absolute occupancy, per-interval events.
+    if (current.hybrid_snapshots != 0 || current.hybrid_tree_blocks != 0 ||
+        current.hybrid_blocks_inserted != 0) {
+        const auto delta = [&](std::uint64_t RuntimeStats::* field) {
+            return monotonic_delta(previous.*field, current.*field);
+        };
+        record["context_cache"]["hybrid"] =
+            Json{{"device_blocks", current.hybrid_cached_blocks},
+                 {"evictable_blocks", current.hybrid_evictable_blocks},
+                 {"tree_blocks", current.hybrid_tree_blocks},
+                 {"snapshots", current.hybrid_snapshots},
+                 {"host_capacity_bytes", current.hybrid_host_capacity_bytes},
+                 {"host_used_bytes", current.hybrid_host_used_bytes},
+                 {"snapshot_hits", delta(&RuntimeStats::hybrid_snapshot_hits)},
+                 {"reused_tokens", delta(&RuntimeStats::hybrid_reused_tokens)},
+                 {"blocks_inserted", delta(&RuntimeStats::hybrid_blocks_inserted)},
+                 {"blocks_reattached", delta(&RuntimeStats::hybrid_blocks_reattached)},
+                 {"blocks_duplicate", delta(&RuntimeStats::hybrid_blocks_duplicate)},
+                 {"taps_created", delta(&RuntimeStats::hybrid_taps_created)},
+                 {"taps_skipped", delta(&RuntimeStats::hybrid_taps_skipped)},
+                 {"endpoints_created", delta(&RuntimeStats::hybrid_endpoints_created)},
+                 {"host_image_writes", delta(&RuntimeStats::hybrid_host_image_writes)},
+                 {"host_block_writes", delta(&RuntimeStats::hybrid_host_block_writes)},
+                 {"host_image_restores", delta(&RuntimeStats::hybrid_host_image_restores)},
+                 {"host_block_restores", delta(&RuntimeStats::hybrid_host_block_restores)},
+                 {"host_write_bytes", delta(&RuntimeStats::hybrid_host_write_bytes)},
+                 {"host_restore_bytes", delta(&RuntimeStats::hybrid_host_restore_bytes)},
+                 {"evicted_blocks", delta(&RuntimeStats::hybrid_evicted_blocks)},
+                 {"host_snapshot_evictions", delta(&RuntimeStats::hybrid_host_snapshot_evictions)},
+                 {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},
+                 {"unbacked_node_losses", delta(&RuntimeStats::hybrid_unbacked_node_losses)}};
+    }
     return record.dump();
 }
 

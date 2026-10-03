@@ -2,6 +2,8 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 
+#include "models/qwen3_5/execution/vision_overlay.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -314,12 +316,13 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
         if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
 
         materialization_ledger_.assign(prompt.token_ids.begin(), prompt.token_ids.end());
+        if (ngram_draft_window != 0) { take_ngram_index(request, prompt); }
         materialization_identity_.assign(prompt);
         materialization_prefix_digests_.assign(prompt);
 
         const std::uint32_t initial_mtp_extent =
             speculative_backend == SpeculativeBackend::Mtp
-                ? std::min({draft_window,
+                ? std::min({neural_draft_window,
                             request_plan.summary.effective_output_tokens > 1
                                 ? request_plan.summary.effective_output_tokens - 2
                                 : 0U,
@@ -349,6 +352,13 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
                 DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
                 *workspace_plan.vision, request.prefill->prompt, *request.prefill->vision_plan,
                 vision_handoff_peak_bytes);
+            if (parameters.model.overlay_vision() && request.prefill->vision_plan->control) {
+                // Offload: the tower is absent from VRAM, so the suffix items are encoded through
+                // the evictable window here.
+                execution::encode_overlay_suffix(device, parameters, request.prefill->prompt,
+                                                 *request.prefill->vision_plan,
+                                                 request.prefill->base, *request.prefill->vision);
+            }
         }
         request.prefill->elapsed_seconds =
             std::chrono::duration<double>(Clock::now() - host_started).count();
@@ -595,8 +605,10 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     refresh_state_views(source);
 
     const detail::PhysicalResources after   = owner_exclusive_resources(source);
-    const detail::PhysicalResources removed = checked_resource_difference(before, after);
-    (void)checked_resource_difference(details.demand.final_removed, removed);
+    const detail::PhysicalResources removed = checked_resource_difference(
+        before, after, "materialization source truncation");
+    (void)checked_resource_difference(details.demand.final_removed, removed,
+                                      "materialization source truncation against plan");
 }
 
 void ProgramImpl::prepare_materialization(MaterializationTransaction& transaction) {
@@ -1919,8 +1931,10 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     }
 
     const auto complete_pressure_delta = [&](MaterializationTransaction::PressureWork& work) {
-        (void)checked_resource_difference(work.option.effect.removed, work.committed_delta.removed);
-        (void)checked_resource_difference(work.option.effect.added, work.committed_delta.added);
+        (void)checked_resource_difference(work.option.effect.removed, work.committed_delta.removed,
+                                          "materialization pressure removed");
+        (void)checked_resource_difference(work.option.effect.added, work.committed_delta.added,
+                                          "materialization pressure added");
         work.committed_delta = work.option.effect;
     };
 
@@ -2190,6 +2204,8 @@ ProgramImpl::progress_context_transaction(runtime::CancellationFlagView cancella
                 throw std::logic_error("Program has no progressable context transaction");
             } else if constexpr (std::is_same_v<Transaction, MaterializationTransaction>) {
                 return terminal_or_pending(progress_materialization_transaction(cancellation));
+            } else if constexpr (std::is_same_v<Transaction, HybridMaterializationTransaction>) {
+                return terminal_or_pending(progress_hybrid_materialization(cancellation));
             } else {
                 return terminal_or_pending(progress_active_capture_transaction(cancellation));
             }
@@ -2215,6 +2231,22 @@ void ProgramImpl::finalize_context_transaction() noexcept {
 
 bool ProgramImpl::has_context_transaction() const noexcept {
     return !std::holds_alternative<std::monostate>(context_transaction_);
+}
+
+bool ProgramImpl::wait_context_transfer() noexcept {
+    bool submitted = false;
+    if (const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_)) {
+        submitted = transaction->transfer_submitted;
+    } else if (const auto* capture = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
+        submitted = capture->transfer_submitted;
+    }
+    // A Legacy transaction may stay in progress after its copy landed; only a wait that was
+    // actually needed resumes the worker at once, so such a transaction never spins it.
+    try {
+        if (!submitted || context_completion_.ready()) { return false; }
+        context_completion_.synchronize();
+    } catch (...) {}
+    return true;
 }
 
 

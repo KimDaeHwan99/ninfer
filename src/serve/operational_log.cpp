@@ -1,11 +1,13 @@
 #include "serve/operational_log.h"
 
+#include "product/log_colour/log_colour.h"
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
 
 #include <algorithm>
+#include <atomic>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -13,6 +15,11 @@
 
 namespace ninfer::serve {
 namespace {
+
+std::atomic<bool>& colours_enabled() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
 
 const char* phase_name(RequestFailurePhase phase) noexcept {
     switch (phase) {
@@ -178,6 +185,10 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
 
 } // namespace
 
+void set_operational_log_colours(bool enabled) { colours_enabled().store(enabled); }
+
+bool operational_log_colours_enabled() { return colours_enabled().load(); }
+
 OperationalRecord render_request_start(const RequestLogContext& context) {
     std::ostringstream out;
     out << "req#" << context.id << " started | " << protocol_name(context.protocol) << ' '
@@ -275,10 +286,27 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     if (metrics.speculative_draft_tokens != 0) {
         const double acceptance = static_cast<double>(metrics.speculative_accepted_tokens) /
                                   static_cast<double>(metrics.speculative_draft_tokens);
-        out << " | " << product::speculative_backend_name(metrics.speculative_backend)
+        out << " | "
+            << (metrics.ngram_rounds != 0
+                    ? "mixed speculation"
+                    : product::speculative_backend_name(metrics.speculative_backend))
             << " accepted " << product::format_pretty_count(metrics.speculative_accepted_tokens)
             << '/' << product::format_pretty_count(metrics.speculative_draft_tokens) << " ("
             << product::format_pretty_percent(acceptance) << ')';
+    }
+    if (metrics.ngram_rounds != 0) {
+        out << " | ngram " << product::format_pretty_count(metrics.ngram_accepted_tokens) << '/'
+            << product::format_pretty_count(metrics.ngram_drafted_tokens) << " accepted, "
+            << product::format_pretty_count(metrics.ngram_rounds) << " rounds";
+    }
+    if (metrics.ngram_archive.enabled) {
+        out << " | archive " << (metrics.ngram_archive.bound ? "bound" : "unbound");
+        if (metrics.ngram_archive.bound) {
+            out << " " << product::format_pretty_count(metrics.ngram_archive_accepted_tokens) << '/'
+                << product::format_pretty_count(metrics.ngram_archive_drafted_tokens)
+                << " accepted, gen " << metrics.ngram_archive.generation << ", "
+                << product::format_pretty_count(metrics.ngram_archive.sources) << " sources";
+        }
     }
     if (outcome.thinking.configured_budget) {
         out << " | thinking "
@@ -287,6 +315,14 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         if (outcome.thinking.injected_tokens != 0) {
             out << ", control " << product::format_pretty_count(outcome.thinking.injected_tokens);
         }
+    }
+    if (metrics.vision_offload_window_seconds > 0.0) {
+        out << " vision_offload_ms=" << metrics.vision_offload_window_seconds * 1000.0
+            << " vision_offload_evicted_mib="
+            << metrics.vision_offload_evicted_bytes / (1024 * 1024)
+            << " vision_offload_evict_ms=" << metrics.vision_offload_evict_seconds * 1000.0
+            << " vision_offload_restore_ms=" << metrics.vision_offload_restore_seconds * 1000.0
+            << " vision_offload_staged_mib=" << metrics.vision_offload_staged_bytes / (1024 * 1024);
     }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
@@ -298,10 +334,38 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;
     }
+    // Tolerant recovery retained structured calls after discarding a trailing suffix, or after
+    // keeping a call whose closing tags were cut off at the region end. That is a successful
+    // parse, not a fallback-to-text failure; note it as informational transparency. When the
+    // tail truncation kept no calls, the region was returned as text and falls through to the
+    // warning record below.
+    if (reason == ninfer::ToolCallParseFallbackReason::TruncatedTail &&
+        outcome.tool_call_parse.structured_call_count > 0) {
+        return OperationalRecord{
+            .severity = OperationalSeverity::Info,
+            .message  = "req#" + std::to_string(context.id) +
+                        " tolerated tool-call suffix discarded | " +
+                        pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
+        };
+    }
+    // The reason names the verdict; a bounded, single-line snippet of the returned markup shows
+    // what earned it. Text before the first marker never appears.
+    constexpr std::size_t kMarkupSnippetBytes = 240;
+    std::string snippet;
+    if (const std::size_t marker = outcome.text.find("<tool_call>");
+        marker != std::string::npos) {
+        snippet = outcome.text.substr(marker, kMarkupSnippetBytes);
+        if (outcome.text.size() - marker > kMarkupSnippetBytes) { snippet += "..."; }
+        for (char& byte : snippet) {
+            if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
+        }
+    }
+
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
         .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
-                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
+                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)) +
+                   (snippet.empty() ? std::string{} : " | " + snippet),
     };
 }
 
@@ -385,15 +449,21 @@ OperationalLog::OperationalLog(std::shared_ptr<spdlog::logger> logger)
     : logger_(std::move(logger)) {}
 
 void OperationalLog::write(OperationalRecord record) const {
+    // Colour the message's key=value tokens when the serve was started with
+    // --log-colours on; the [timestamp] [level] prefix from the sink pattern
+    // stays plain.
+    const std::string message =
+        ninfer::product::log_colour::colourise_stats_line(record.message,
+                                                          operational_log_colours_enabled());
     switch (record.severity) {
     case OperationalSeverity::Info:
-        logger_->info("{}", record.message);
+        logger_->info("{}", message);
         return;
     case OperationalSeverity::Warning:
-        logger_->warn("{}", record.message);
+        logger_->warn("{}", message);
         return;
     case OperationalSeverity::Error:
-        logger_->error("{}", record.message);
+        logger_->error("{}", message);
         return;
     }
 }
@@ -453,13 +523,27 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
 
     if (cache.enabled) {
+        // Every capacity here is a resolved value: the Host tier is read back from the Program and
+        // the catalog and anchor counts from the Engine's options, which an engaged host-cache
+        // budget has already resolved, so nothing names a default the process is not using.
         logger_->info(
             "context cache | {} active + {} cached device states | host {} states, {} KV | "
             "private {} | shared {} | anchors {}",
-            engine.max_concurrency, *cache.device_state_slots, cache.host_state_slots,
-            product::format_pretty_bytes(cache.host_kv_capacity_bytes),
+            engine.max_concurrency, *cache.device_state_slots,
+            product::format_pretty_count(memory.host_state_capacity_slots),
+            product::format_pretty_bytes(memory.host_kv_capacity_bytes),
             *cache.max_private_continuations, *cache.max_shared_prefixes,
             *cache.max_long_anchors_per_continuation);
+        if (memory.host_cache_budget_bytes != 0) {
+            // Both unit costs and the count the budget bought, so an operator can check the split
+            // against the RAM they granted rather than reconstruct it from the slot count.
+            logger_->info("host cache budget | {} total | {} per state image | {} per host KV "
+                          "page group | {} anchors per continuation | state capped at half",
+                          product::format_pretty_bytes(memory.host_cache_budget_bytes),
+                          product::format_pretty_bytes(memory.host_state_image_bytes),
+                          product::format_pretty_bytes(memory.host_kv_page_group_bytes),
+                          *cache.max_long_anchors_per_continuation);
+        }
     } else {
         logger_->info("context cache | root only");
     }
@@ -472,12 +556,21 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     }
 
     logger_->debug("memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
-                   "CUDA graphs {}",
+                   "CUDA graphs {} allowed, {} used",
                    product::format_pretty_bytes(memory.available_after_weights_bytes),
                    product::format_pretty_bytes(memory.available_after_startup_bytes),
                    product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
                    product::format_pretty_bytes(memory.planned_slack_bytes),
-                   product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
+                   product::format_pretty_bytes(memory.cuda_graph_allowance_bytes),
+                   product::format_pretty_bytes(memory.cuda_graph_measured_bytes));
+    if (memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+        // The KV pool was sized against the allowance, so the excess came out of the slack left
+        // beside it; with no headroom the next allocation can fail.
+        logger_->warn("CUDA graphs used {} but the KV sizing allowed {}; leave more room with "
+                      "--vram-headroom-mib or a smaller --kv-capacity",
+                      product::format_pretty_bytes(memory.cuda_graph_measured_bytes),
+                      product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
+    }
     logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",
                    ninfer::context_cost_preset_source_name(context_cost.transfer_source),
                    ninfer::context_cost_preset_source_name(context_cost.prefill_source),

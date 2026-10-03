@@ -40,6 +40,7 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    bool fast_prefill_kernel;
 };
 
 struct PrefillContext {
@@ -57,6 +58,11 @@ struct PrefillContext {
     std::uint32_t mtp_proposal_extent                          = 0;
     std::int32_t dflash_kv_table_row                           = 0;
     qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
+    // Takes the per-model-layer events of a Host restore still landing, which the chunk's first
+    // pass over the layer stack waits on; empty once taken or landed. The events are a view into
+    // the landing batch, which the cache's next poll() frees, so each chunk function calls this
+    // immediately before its pass and nothing outside the chunk call can hold the view.
+    std::function<std::span<const cudaEvent_t>()> take_layer_ready;
 };
 
 struct OrdinaryBatchContext {
@@ -76,6 +82,7 @@ struct MtpBatchContext {
     const qwen3_5::MtpDecodeIngress& host_ingress;
     qwen3_5::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    std::uint32_t neural_proposal_drafts = 0;
 };
 
 struct DFlashBatchContext {
@@ -86,6 +93,8 @@ struct DFlashBatchContext {
     const qwen3_5::DFlashDecodeIngress& host_ingress;
     qwen3_5::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    bool ngram                           = false;
+    std::uint32_t neural_proposal_drafts = 0;
 };
 
 struct DFlashAppendContext {
@@ -102,7 +111,6 @@ struct MtpCausalAttentionEnvelopes {
 struct DFlashEnvelopes {
     ops::SlidingWindowAttentionExecutionEnvelope local;
     ops::ContextAttentionExecutionEnvelope full;
-    ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
 struct TargetVerifyFrameView {

@@ -5,8 +5,12 @@
 
 #include <spdlog/logger.h>
 
-#include <sys/ioctl.h>
-#include <unistd.h>
+#ifdef _WIN32
+#    include <windows.h>
+#else
+#    include <sys/ioctl.h>
+#    include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -68,6 +72,10 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
         return {"pinning host KV", "host KV pinned", PhaseVisibility::Info, true, false};
     case StartupPhase::CudaGraphPrepare:
         return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Info, false, false};
+    case StartupPhase::PrefixCacheLoad:
+        // "read", not "loaded": a file damaged part way through still completes the phase, and
+        // the engine-ready summary reports whether the tier was restored.
+        return {"loading prefix cache", "prefix cache read", PhaseVisibility::Info, true, true};
     case StartupPhase::EngineFinalize:
         return {"finalizing engine", "engine finalized", PhaseVisibility::Debug, false, false};
     }
@@ -76,9 +84,22 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
 }
 
 std::size_t terminal_columns() noexcept {
+#ifdef _WIN32
+    const HANDLE handle = ::GetStdHandle(STD_ERROR_HANDLE);
+    if (handle != INVALID_HANDLE_VALUE && handle != 0) {
+        CONSOLE_SCREEN_BUFFER_INFO info{};
+        if (::GetConsoleScreenBufferInfo(handle, &info)) {
+            const std::size_t columns =
+                static_cast<std::size_t>(info.srWindow.Right - info.srWindow.Left + 1);
+            if (columns != 0) { return columns; }
+        }
+    }
+    return 120;
+#else
     winsize size{};
     if (::ioctl(STDERR_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col != 0) { return size.ws_col; }
     return 120;
+#endif
 }
 
 std::string progress_bar(double ratio, std::size_t width) {
@@ -300,6 +321,32 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
                          context_cost_preset_source_name(load.context_cost.transfer_source),
                          context_cost_preset_source_name(load.context_cost.prefill_source),
                          load.prefill_signature);
+    const LoadSummary::PrefixCacheRestore& cache = load.prefix_cache;
+    if (cache.restored && cache.required_host_bytes > cache.host_bytes && cache.snapshots == 0) {
+        // Nothing resumes without a snapshot, and a restore keeps only the blocks its snapshots
+        // resume through: say so, since the save at shutdown then replaces the whole file.
+        impl_->logger->warn(
+            "prefix cache not restored | none of the file's {} snapshots fits: it needs {} of Host "
+            "tier and --host-cache-mib gives {} | the save at shutdown replaces the file",
+            format_pretty_count(cache.saved_snapshots),
+            format_pretty_bytes(cache.required_host_bytes), format_pretty_bytes(cache.host_bytes));
+    } else if (cache.restored && cache.required_host_bytes > cache.host_bytes) {
+        impl_->logger->warn(
+            "prefix cache partly restored | {} of {} snapshots | {} of {} blocks | {} | {} | the "
+            "file needs {} of Host tier; --host-cache-mib gives {}, so the most valuable "
+            "snapshots were kept",
+            format_pretty_count(cache.snapshots), format_pretty_count(cache.saved_snapshots),
+            format_pretty_count(cache.blocks), format_pretty_count(cache.saved_blocks),
+            format_pretty_bytes(cache.bytes), format_pretty_duration(cache.seconds),
+            format_pretty_bytes(cache.required_host_bytes), format_pretty_bytes(cache.host_bytes));
+    } else if (cache.restored) {
+        impl_->logger->info("prefix cache restored | {} blocks | {} snapshots | {} | {}",
+                            format_pretty_count(cache.blocks), format_pretty_count(cache.snapshots),
+                            format_pretty_bytes(cache.bytes),
+                            format_pretty_duration(cache.seconds));
+    } else if (load.prefix_cache.attempted) {
+        impl_->logger->info("prefix cache not restored | {}", load.prefix_cache.message);
+    }
 }
 
 } // namespace ninfer::product

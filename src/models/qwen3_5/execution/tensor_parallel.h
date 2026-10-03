@@ -19,12 +19,14 @@
 namespace ninfer::models::qwen3_5::execution {
 
 // residual += output(input), summing both ranks' partial products when split.
+// `wide_verification` selects residual_projection_policy's wide copy-verification precision.
 [[nodiscard]] std::size_t row_parallel_output_workspace_bytes(const LinearParameters& output,
                                                               std::int32_t first,
-                                                              std::int32_t last, bool split);
+                                                              std::int32_t last, bool split,
+                                                              bool wide_verification = false);
 void row_parallel_output(const Tensor& input, const LinearParameters& output, Tensor& residual,
                          const TensorParallelDeviceView* tp, WorkspaceArena& workspace,
-                         cudaStream_t stream);
+                         cudaStream_t stream, bool wide_verification = false);
 
 // Column slices of a prefill-width row-parallel stage. Each slice's all-reduce runs on the link's
 // copy channel while the stream computes the next slice; `count == 0` keeps the synchronous

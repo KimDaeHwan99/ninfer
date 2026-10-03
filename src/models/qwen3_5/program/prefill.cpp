@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/vision_overlay.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
@@ -59,6 +60,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
+    card.set_fast_prefill_kernel(execution.fast_prefill_kernel);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -81,6 +83,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -104,6 +107,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
@@ -211,6 +215,13 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     const std::uint32_t base               = staged.base;
     const std::uint32_t initial_mtp_extent = staged.initial_mtp_extent;
     request.lifecycle                      = Lifecycle::Empty;
+    // The sequence's own token ceiling: the last frontier its Device KV lease may cover, so
+    // on-demand growth never leases pages the request cannot reach.
+    request.lease_ceiling = std::min(
+        capacity, request_plan.summary.prompt_tokens +
+                      (request_plan.summary.effective_output_tokens == 0
+                           ? 0U
+                           : request_plan.summary.effective_output_tokens - 1U));
     try {
         const std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
         const bool preserving_source =
@@ -761,6 +772,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
     bool needs_hidden_correction = false;
+    // One speculative round produced every pending row, at one verify width.
+    const std::uint32_t verify_drafts =
+        lanes.front() < max_concurrency ? requests[lanes.front()].pending.verify_drafts : 0U;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||
@@ -768,6 +782,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             throw std::logic_error("speculative pending batch no longer matches Program state");
         }
         const PendingCandidate& pending = requests[lane].pending;
+        if (pending.verify_drafts == 0 || pending.verify_drafts != verify_drafts) {
+            throw std::logic_error("speculative pending batch mixes verify widths");
+        }
         const SequenceState& sequence   = active_sequence(lane);
         if (sequence.execution_frontier != pending.base_E ||
             sequence.ledger_frontier != pending.base_S ||
@@ -802,8 +819,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     const auto tail_started = Clock::now();
     try {
         timing.resume_submit();
-        replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             device.stream);
+        round_replay_fold(verify_drafts)
+            .execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+                     device.stream);
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
@@ -813,7 +831,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 }
                 const auto count = static_cast<std::int32_t>(accepted_tokens[row]);
                 Tensor ids =
-                    io.dflash_decode->licensed_tokens.slice(1, static_cast<std::int32_t>(row), 1)
+                    io.dflash_decode->narrowed(verify_drafts)
+                        .licensed_tokens.slice(1, static_cast<std::int32_t>(row), 1)
                         .slice(0, 0, count)
                         .view({count});
                 Tensor counts =
@@ -836,7 +855,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
                 destinations = frame.state_destination_slots.slice(0, 0, batch);
             } else if (is_masked_draft_backend(speculative_backend) && io.dflash_decode) {
-                qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
+                const qwen3_5::DFlashDecodeState frame = io.dflash_decode->narrowed(verify_drafts);
                 selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
                 hidden                            = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
@@ -853,6 +872,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                          device.stream);
         }
 
+        // A terminal DFlash row appends its context through the pinned DFlash ingress, which the
+        // next round's submission rewrites; only that path needs the host to wait here.
+        bool host_ingress_in_flight = false;
         if (is_masked_draft_backend(speculative_backend)) {
             std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
@@ -871,12 +893,20 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     std::span<const std::uint32_t>(append_lanes.data(), append_size),
                     std::span<const std::uint32_t>(append_starts.data(), append_size),
                     std::span<const std::uint32_t>(append_counts.data(), append_size));
+                host_ingress_in_flight = true;
             }
         }
 
-        timing.begin_wait();
-        device.synchronize();
-        timing.end_wait();
+        if (host_ingress_in_flight) {
+            timing.begin_wait();
+            device.synchronize();
+            timing.end_wait();
+        } else {
+            // Every later consumer of the folded state is ordered behind the fold on this stream,
+            // and the host reads nothing the fold writes. Submit it now so it overlaps the next
+            // round's host preparation instead of waiting for that submission.
+            device.flush();
+        }
         work.reset();
     } catch (...) {
         try {
@@ -888,7 +918,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     }
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
-    const std::uint32_t width = draft_window + 1U;
+    const double tail_share   = tail_seconds / static_cast<double>(lanes.size());
+    const std::uint32_t width = verify_drafts + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = active_sequence(lanes[row]);
@@ -943,6 +974,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             }
             request.pending = {};
             request.timings.decode_seconds += tail_seconds;
+            request.timings.decode_share_seconds += tail_share;
         }
     } catch (...) {
         clear_execution_failure_lanes(lanes);
@@ -984,17 +1016,41 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 .timing  = timing.finish(),
             };
         }
+        // Prefill attention addresses its KV through the shared step table-row scalars. Another
+        // lane's staging or capture can rebind them between this lane's steps, so every step
+        // binds its own rows before any Prefill or MTP-bridge work.
+        bind_sequence_kv(sequence);
         StateImageSelectors selectors = state_selectors(sequence);
+        // Hybrid prefix cache taps (docs/maintainer/hybrid-prefix-cache-spec.md §7.1): an exact tap
+        // splits the chunk at its frontier; any chunk boundary may realize a flexible tap, so the
+        // continuation hidden is kept while the lane has taps left.
+        const HybridLaneState* hybrid_lane =
+            hybrid_ && sequence.lane < max_concurrency ? &hybrid_lanes_[sequence.lane] : nullptr;
+        const auto hybrid_taps_left = [&]() {
+            return hybrid_lane != nullptr && hybrid_lane->active && hybrid_lane->publish &&
+                   hybrid_lane->next_tap < hybrid_lane->taps.size();
+        };
+        const auto next_hybrid_split = [&]() -> std::optional<std::uint32_t> {
+            if (!hybrid_taps_left()) { return std::nullopt; }
+            for (std::size_t tap = hybrid_lane->next_tap; tap < hybrid_lane->taps.size(); ++tap) {
+                const runtime::prefix_cache::PlannedTap& planned = hybrid_lane->taps[tap];
+                if (planned.placement == runtime::prefix_cache::TapPlacement::Exact &&
+                    planned.position > staged.cursor) {
+                    return planned.position;
+                }
+            }
+            return std::nullopt;
+        };
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
-        if (staged.next_capture < staged.capture_groups.size()) {
+        if (staged.next_capture < staged.capture_groups.size() || hybrid_taps_left()) {
             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
         execution::PrefillContext schedule_state{
             {device, tensor_parallel, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, fast_prefill_kernel},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1009,6 +1065,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.initial_mtp_extent,
             0,
             dflash_prefill_host_ingress};
+        // The first pass after a Host restore waits for each layer's copies (hybrid spec §6.5).
+        // The chunk function takes the events itself: they are a view into the landing batch, and
+        // the KV commits between chunks (the MTP bridge's among them) poll the cache, which frees
+        // a batch that has landed. A landed batch yields no events; its copies are complete.
+        schedule_state.take_layer_ready = [this, lane = sequence.lane] {
+            return hybrid_take_restore_layers(lane);
+        };
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1057,7 +1120,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 schedule_state.dflash_kv_table_row =
                     sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
                                          : 0;
-                if (staged.next_capture < staged.capture_groups.size()) {
+                const std::optional<std::uint32_t> hybrid_split = next_hybrid_split();
+                if (staged.next_capture < staged.capture_groups.size() || hybrid_taps_left()) {
                     rewrite_capture_hidden =
                         state_images->continuation_hidden_slot(selectors.destination);
                     schedule_state.rewrite_checkpoint_hidden = &rewrite_capture_hidden;
@@ -1072,12 +1136,22 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                               staged.capture_groups[staged.next_capture].frontier)
                         : std::nullopt;
                 std::optional<std::uint32_t> split_frontier = capture_frontier;
-                const auto rewrite_split                    = std::upper_bound(
-                    staged.prompt.identity.rewrite_execution_frontiers.begin(),
-                    staged.prompt.identity.rewrite_execution_frontiers.end(), staged.cursor);
-                if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
+                // Rewrite execution frontiers split prefill for the Legacy catalog's rewrite
+                // checkpoints and execution provenance. The hybrid cache captures nothing there:
+                // it keys resume points by content and splits only at its own exact taps, so
+                // each split would be a whole extra pass over the model for nothing.
+                const auto& rewrite_frontiers = staged.prompt.identity.rewrite_execution_frontiers;
+                const auto rewrite_split =
+                    hybrid_lane != nullptr && hybrid_lane->active
+                        ? rewrite_frontiers.end()
+                        : std::upper_bound(rewrite_frontiers.begin(), rewrite_frontiers.end(),
+                                           staged.cursor);
+                if (rewrite_split != rewrite_frontiers.end() &&
                     (!split_frontier || *rewrite_split < *split_frontier)) {
                     split_frontier = *rewrite_split;
+                }
+                if (hybrid_split && (!split_frontier || *hybrid_split < *split_frontier)) {
+                    split_frontier = *hybrid_split;
                 }
                 execution::PrefillChunkResult result;
                 timing.pause();
@@ -1114,6 +1188,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
+                if (hybrid_lane != nullptr && !result.finalized) {
+                    hybrid_after_prefill_chunk(sequence, staged.cursor, staged.prompt_tokens);
+                }
                 const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
                 if (reached_capture) {
                     if (result.finalized) {
@@ -1215,8 +1292,18 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                    sequence.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }
-        sequence.tail_hidden_valid      = true;
-        request.timings.vision_seconds  = vision_seconds;
+        sequence.tail_hidden_valid     = true;
+        request.timings.vision_seconds = vision_seconds;
+        if (staged.vision) {
+            const auto& overlay = staged.vision->overlay_stats();
+            if (overlay.has_value()) {
+                request.timings.vision_offload_window_seconds  = overlay->window_seconds;
+                request.timings.vision_offload_evict_seconds   = overlay->evict_seconds;
+                request.timings.vision_offload_restore_seconds = overlay->restore_seconds;
+                request.timings.vision_offload_evicted_bytes   = overlay->evicted_bytes;
+                request.timings.vision_offload_staged_bytes    = overlay->staged_bytes;
+            }
+        }
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
         staged.prompt.release_all_media_payloads();
         if (staged.vision) { staged.vision->retire_handoff(); }

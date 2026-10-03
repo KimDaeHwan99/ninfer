@@ -1,8 +1,10 @@
 #pragma once
 
 #include "runtime/contract/resources.h"
+#include "runtime/prefix_cache/tap_planner.h"
 
 #include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/program/ngram_proposer.h"
 
 #include <array>
 #include <cstddef>
@@ -139,7 +141,25 @@ struct PrepareStats {
     std::size_t reused_patch_bytes       = 0;
 };
 
+// Prompt boundary facts for hybrid prefix-cache tap placement
+// (docs/maintainer/hybrid-prefix-cache-spec.md §7.1). Frontiers are exact token positions.
+struct PreparedTapHints {
+    std::vector<runtime::prefix_cache::TapHint> hints;
+};
+
 struct PreparedPromptData {
+    // Proposal-only sources, never part of target tokens, positions or cache identity.
+    std::vector<std::vector<TokenId>> ngram_sources;
+    std::vector<TokenId> ngram_boundaries;
+    std::vector<NgramSourceView> ngram_archive_sources;
+    std::shared_ptr<const NgramSnapshot> ngram_snapshot;
+    // The request's live ngram index over token_ids and ngram_sources, present whenever ngram
+    // drafting is enabled. Preparation builds it so admission only moves it into the request.
+    std::unique_ptr<detail::NgramProposer> ngram_index;
+    // Hybrid prefix-cache lookup keys over token_ids (program/prefix/block_keys.h): one chained
+    // hash per full 64-token block and, with media, one cumulative Vision key per block.
+    std::vector<std::uint64_t> block_hashes;
+    std::vector<std::uint64_t> block_extras;
     std::vector<TokenId> token_ids;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
@@ -149,6 +169,7 @@ struct PreparedPromptData {
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
     PreparedContextCache context_cache;
+    PreparedTapHints tap_hints;
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
@@ -156,6 +177,31 @@ struct PreparedPromptData {
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
 
     [[nodiscard]] bool has_media() const noexcept { return !vision_items.empty(); }
+
+    // The tensor-parallel peer rank's copy. The peer never drafts ngram copies (the split rejects
+    // ngram drafting), so the live ngram index, the only uncopyable member, stays with the primary.
+    [[nodiscard]] PreparedPromptData tensor_parallel_peer_copy() const {
+        PreparedPromptData out;
+        out.ngram_sources         = ngram_sources;
+        out.ngram_boundaries      = ngram_boundaries;
+        out.ngram_archive_sources = ngram_archive_sources;
+        out.ngram_snapshot        = ngram_snapshot;
+        out.block_hashes          = block_hashes;
+        out.block_extras          = block_extras;
+        out.token_ids             = token_ids;
+        out.token_types           = token_types;
+        out.positions             = positions;
+        out.rope_delta            = rope_delta;
+        out.media_payloads        = media_payloads;
+        out.vision_items          = vision_items;
+        out.identity              = identity;
+        out.context_cache         = context_cache;
+        out.tap_hints             = tap_hints;
+        out.tool_call_output      = tool_call_output;
+        out.starts_in_reasoning   = starts_in_reasoning;
+        out.prepare               = prepare;
+        return out;
+    }
 
     // Payload slots remain indexed one-to-one with vision_items for the lifetime of the prompt.
     // Releasing host storage must not destroy that structural identity while a Vision prefill

@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/planning/rebuild_work.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
 
@@ -108,11 +109,15 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         }
 
         const detail::PhysicalResources active = details.demand.active_entitlement;
+        // Consuming or recycling the source (truncating it in place, releasing it after its COW)
+        // can leave pages it shared with another active sequence referenced by that sequence alone.
+        const ActiveExclusiveBaseline baseline = active_exclusive_baseline();
         active_continuations[lane]             = *continuation_index;
         SequenceState& sequence                = continuation_states[*continuation_index];
         sequence.lane                          = lane;
         transaction.root_continuation_index.reset();
         start_sequence(lane, sequence, transaction);
+        credit_active_ownership_transfers(baseline);
         detail::PhysicalResources actual         = owner_exclusive_resources(sequence);
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
@@ -319,6 +324,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             }
 
             ensure_sequence_kv_mapped(sequence, end, backend_kv_cache() ? end : 0U);
+            // Forced tokens run through Prefill, which reads the shared step table-row scalars.
+            bind_sequence_kv(sequence);
 
             sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
             if (sequence.ledger.size() != static_cast<std::size_t>(end) + 1U) {
@@ -339,7 +346,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 execution::PrefillContext schedule_state{
                     {device, tensor_parallel, parameters, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head},
+                     proposal_head, fast_prefill_kernel},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,
@@ -398,8 +405,10 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 throw std::logic_error("forced-token commit did not establish a valid frontier");
             }
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
-            request.timings.decode_seconds +=
-                std::chrono::duration<double>(Clock::now() - started).count();
+            // Forced tokens run one request at a time, so the request owns the whole interval.
+            const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+            request.timings.decode_seconds += seconds;
+            request.timings.decode_share_seconds += seconds;
         }
         return timing.finish();
     } catch (...) {
@@ -583,6 +592,17 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     SequenceState& state                   = active_sequence(lane);
     const std::uint32_t continuation_index = active_continuations[lane];
     if (request.lifecycle != Lifecycle::Finishable) { return out; }
+    if (hybrid_) {
+        // Hybrid mode retains context in the prefix index, never as a catalogued continuation.
+        out.timings     = request.timings;
+        out.speculative = std::move(request.speculative_stats);
+        if (!hybrid_finish_lane(state, request, lane, true)) { return out; }
+        out.disposition = runtime::FinishDisposition::Released;
+        invalidate_lane(lane);
+        advance_resource_revision();
+        out.status = runtime::ConsumeStatus::Consumed;
+        return out;
+    }
     if (!request.publish_continuation) {
         if (!clear_lane_strict(state, request)) { return out; }
         out.disposition = runtime::FinishDisposition::Released;
@@ -598,9 +618,6 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     // discard if that publication invariant was not established.
     if (state.state.fork_pending && state.state.borrows_read()) { return out; }
     try {
-        out.summary.long_anchors.reserve(state.long_anchors.size());
-    } catch (...) { return out; }
-    try {
         if (state.state.fork_pending) {
             const StateImageHandle source      = state.state.read;
             const StateImageHandle destination = state.state.write;
@@ -611,12 +628,32 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
             // still prevent exclusive attribution and release.
             state.state = ActiveStateBinding{.read = source, .write = source};
         }
+    } catch (...) { return out; }
+    if (!publish_active_continuation(state, request, lane, continuation_index, out.summary)) {
+        return out;
+    }
+    out.continuation.emplace(ContractAccess::make_continuation(
+        this, continuation_index, continuation_slots[continuation_index].generation));
+    out.timings     = request.timings;
+    out.speculative = std::move(request.speculative_stats);
+    out.disposition = runtime::FinishDisposition::Catalogued;
+    out.status      = runtime::ConsumeStatus::Consumed;
+    return out;
+}
+
+bool ProgramImpl::publish_active_continuation(SequenceState& state, RequestControl& request,
+                                              std::uint32_t lane, std::uint32_t continuation_index,
+                                              qwen3_5::ContinuationSummary& summary) noexcept {
+    try {
+        summary.long_anchors.reserve(state.long_anchors.size());
+    } catch (...) { return false; }
+    try {
         if (state.reserved_state) {
-            if (!state_store->release(*state.reserved_state)) { return out; }
+            if (!state_store->release(*state.reserved_state)) { return false; }
             state.reserved_state.reset();
         }
         if (state.rewrite_state && *state.rewrite_state == state.state.read) {
-            if (state_store->checkpoint_references(*state.rewrite_state) == 0) { return out; }
+            if (state_store->checkpoint_references(*state.rewrite_state) == 0) { return false; }
             state_store->release_checkpoint_reference(*state.rewrite_state);
             state.rewrite_state.reset();
             state.rewrite_checkpoint = {};
@@ -624,7 +661,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
         if (state_store->role(state.state.read) == StateImageRole::ActiveMutable) {
             state_store->freeze(state.state.read);
         } else if (state_store->role(state.state.read) != StateImageRole::CheckpointImmutable) {
-            return out;
+            return false;
         }
         state.endpoint_valid = true;
         refresh_state_views(state);
@@ -633,27 +670,90 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
             backend_kv_addresses->set_checkpoint_requirement(*state.kv->backend,
                                                              backend_kv_valid(state));
         }
-        populate_continuation_summary(state, out.summary);
-        out.summary.active_references = 0;
-    } catch (...) { return out; }
+        populate_continuation_summary(state, summary);
+        summary.active_references = 0;
+    } catch (...) { return false; }
     release_active_shared_references(state);
     release_sequence_growth_entitlement(state);
     unbind_sequence_kv(state);
     request.active_resources                    = {};
     request.optional_resources                  = {};
+    // A published lane is free: any staged prefill bookkeeping belongs to the
+    // finished request. The abort/salvage path publishes without going through
+    // the commit decision loop that clears it on normal completion, so the
+    // release itself must leave none behind.
+    request.prefill.reset();
     request.lifecycle                           = Lifecycle::Empty;
     request.pending                             = {};
     continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
     active_continuations[lane]                  = continuation_capacity;
     invalidate_lane(lane);
+    advance_resource_revision();
+    return true;
+}
+
+bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& request,
+                                       std::uint32_t lane, std::uint32_t continuation_index,
+                                       qwen3_5::AbortResult& out) noexcept {
+    // Salvage publishes the in-place active state as the continuation endpoint. A pending
+    // materialization Fork is skipped: its read source belongs to an external owner and the
+    // destination copy duplicates a checkpoint the catalog already holds.
+    if (!request.publish_continuation || state.state.fork_pending ||
+        state.state.read != state.state.write || !state.kv) {
+        return false;
+    }
+    const Lifecycle lifecycle = request.lifecycle;
+    std::uint32_t frontier    = 0;
+    if (lifecycle == Lifecycle::Prefilling) {
+        if (!request.prefill || request.prefill->pending_capture_offer != 0) { return false; }
+        frontier = request.prefill->cursor;
+        if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier ||
+            frontier > request.prefill->prompt_tokens) {
+            return false;
+        }
+        // Staged prefill keeps the committed frontier and rebuild work at the materialization
+        // base; bring both to the salvaged cursor before publishing.
+        try {
+            state.rebuild_work = rebuild_work_at_frontier(
+                request.prefill->prompt, frontier, prefill_chunk, request.prefill->capture_groups,
+                request.prefill->prompt.identity.rewrite_execution_frontiers);
+            std::uint32_t tail_begin = 0;
+            for (const CaptureGroup& group : request.prefill->capture_groups) {
+                runtime_support::include_rebuild_boundary(tail_begin, group.frontier, frontier);
+            }
+            for (const std::uint32_t boundary :
+                 request.prefill->prompt.identity.rewrite_execution_frontiers) {
+                runtime_support::include_rebuild_boundary(tail_begin, boundary, frontier);
+            }
+            state.rebuild_tail_begin = tail_begin;
+            state.execution_frontier = frontier;
+        } catch (...) { return false; }
+        // A DFlash draft context that lags the salvaged frontier cannot be truncated to it on
+        // materialization, so only a caught-up backend can be published.
+        if (speculative_backend == SpeculativeBackend::DFlash &&
+            state.dflash_context_frontier < frontier) {
+            return false;
+        }
+    } else if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Finishable) {
+        frontier = state.execution_frontier;
+        if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier) { return false; }
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            if (state.mtp_kv_valid + 1 < frontier) { return false; }
+        } else if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (state.dflash_context_frontier < frontier) { return false; }
+        }
+    } else {
+        return false;
+    }
+    if (!publish_active_continuation(state, request, lane, continuation_index, out.summary)) {
+        return false;
+    }
     out.continuation.emplace(ContractAccess::make_continuation(
         this, continuation_index, continuation_slots[continuation_index].generation));
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);
-    out.disposition = runtime::FinishDisposition::Catalogued;
-    advance_resource_revision();
-    out.status = runtime::ConsumeStatus::Consumed;
-    return out;
+    out.salvaged    = true;
+    return true;
 }
 
 AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
@@ -662,11 +762,31 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         return out;
     }
     const std::uint32_t lane = ContractAccess::lane(sequence).value;
-    RequestControl& request  = requests[lane];
+    RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Pending || request.lifecycle == Lifecycle::Empty) {
         return out;
     }
     SequenceState& state = active_sequence(lane);
+    const std::uint32_t continuation_index = active_continuations[lane];
+    if (hybrid_) {
+        // The committed state is publishable as an endpoint when no model unit is in flight.
+        out.timings     = request.timings;
+        out.speculative = std::move(request.speculative_stats);
+        const bool consistent =
+            (request.lifecycle == Lifecycle::Active || request.lifecycle == Lifecycle::Finishable ||
+             (request.lifecycle == Lifecycle::Prefilling && request.prefill &&
+              state.text_kv_valid == request.prefill->cursor)) &&
+            !state.state.fork_pending;
+        if (!hybrid_finish_lane(state, request, lane, consistent)) { return out; }
+        invalidate_lane(lane);
+        advance_resource_revision();
+        out.status = runtime::ConsumeStatus::Consumed;
+        return out;
+    }
+    if (salvage_continuation(state, request, lane, continuation_index, out)) {
+        out.status = runtime::ConsumeStatus::Consumed;
+        return out;
+    }
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);
@@ -720,6 +840,7 @@ ProgramImpl::release_shared_prefix_state_strict(std::uint32_t index,
         SharedPrefixState& shared               = shared_prefix_states[index];
         SharedPrefixSlot& slot                  = shared_prefix_slots[index];
         const detail::PhysicalResources removed = owner_exclusive_resources(shared);
+        const ActiveExclusiveBaseline baseline  = active_exclusive_baseline();
         const bool last_state_reference = state_store->checkpoint_references(shared.state) == 1;
         if (shared.kv->backend && !backend_kv_addresses->release(*shared.kv->backend)) {
             std::terminate();
@@ -732,6 +853,7 @@ ProgramImpl::release_shared_prefix_state_strict(std::uint32_t index,
         slot.role = SharedPrefixSlotRole::Free;
         if (++slot.generation == 0) { ++slot.generation; }
         if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+        credit_active_ownership_transfers(baseline);
         return removed;
     } catch (...) { std::terminate(); }
 }
@@ -758,7 +880,8 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
     return out;
 }
 
-void ProgramImpl::fail_all_cleanup() noexcept {
+std::optional<qwen3_5::PhysicalUsageSnapshot>
+ProgramImpl::fail_all_cleanup(ProgramCleanup cleanup) noexcept {
     pending_transaction_.reset();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
         if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
@@ -772,12 +895,22 @@ void ProgramImpl::fail_all_cleanup() noexcept {
         }
         release_materialization_staging(*transaction);
     }
+    if (auto* transaction = std::get_if<HybridMaterializationTransaction>(&context_transaction_)) {
+        hybrid_abort_materialization(*transaction);
+    }
     context_transaction_.emplace<std::monostate>();
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (active_continuations[lane] < continuation_capacity) {
             clear_lane_best_effort(active_sequence(lane), requests[lane]);
         }
         invalidate_lane(lane);
+    }
+    if (hybrid_) {
+        if (cleanup == ProgramCleanup::Shutdown) { save_hybrid_cache_for_shutdown(); }
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        hybrid_->clear();
     }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         if (continuation_slots[index].role != ContinuationSlotRole::Free) {
@@ -791,6 +924,103 @@ void ProgramImpl::fail_all_cleanup() noexcept {
             ContractAccess::make_shared_prefix(this, index, shared_prefix_slots[index].generation);
         (void)release_shared_prefix(std::move(handle));
     }
+
+    // Every owner is gone now, so anything a store still holds is unreachable: a best-effort
+    // release declined an object whose state a thrown invariant left inconsistent. Left in place,
+    // it would keep an idle Engine from admitting the next request.
+    if (context_stores_idle()) { return std::nullopt; }
+    const qwen3_5::PhysicalUsageSnapshot leaked = physical_usage();
+    (void)rebuild_context_stores();
+    return leaked;
+}
+
+bool ProgramImpl::context_stores_idle() const noexcept {
+    const auto empty = [](const auto& store) { return store == nullptr || store->occupied() == 0; };
+    return physical_occupancy() == detail::PhysicalResources{} && empty(text_kv_pages) &&
+           empty(text_kv_addresses) && empty(backend_kv_pages) && empty(backend_kv_addresses) &&
+           empty(state_store);
+}
+
+// Replaces the context stores with empty ones of the same capacity. Destroying the old stores
+// returns their Device page leases and reservations, execution rows and Host KV allocations to the
+// pools through RAII; the Host StateImage pool, whose slots the store tracks by handle, is reset
+// explicitly. Only valid once no owner, lane or context transaction remains.
+bool ProgramImpl::rebuild_context_stores() noexcept {
+    std::unique_ptr<LogicalKVPageStore> text_pages;
+    std::unique_ptr<KVAddressSpaceStore> text_addresses;
+    std::unique_ptr<LogicalKVPageStore> backend_pages;
+    std::unique_ptr<KVAddressSpaceStore> backend_addresses;
+    std::unique_ptr<HostKVExtentStore> extents;
+    std::unique_ptr<StateImageStore> states;
+    try {
+        text_pages = std::make_unique<LogicalKVPageStore>(decoder->text_kv.page_pool(),
+                                                          text_kv_pages->capacity());
+        text_addresses = std::make_unique<KVAddressSpaceStore>(
+            *text_pages, decoder->text_kv.execution_tables(), text_kv_addresses->capacity(),
+            decoder->text_kv.execution_tables().logical_page_capacity());
+        if (qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
+            backend_pages = std::make_unique<LogicalKVPageStore>(backend->page_pool(),
+                                                                 backend_kv_pages->capacity());
+            backend_addresses = std::make_unique<KVAddressSpaceStore>(
+                *backend_pages, backend->execution_tables(), backend_kv_addresses->capacity(),
+                backend->execution_tables().logical_page_capacity());
+        }
+        if (host_kv_extents) {
+            extents = std::make_unique<HostKVExtentStore>(*host_kv_arena,
+                                                          host_kv_extents->descriptor_capacity());
+        }
+        states = std::make_unique<StateImageStore>(*state_images, host_state_images.get(),
+                                                   state_store->capacity());
+    } catch (...) { return false; }
+
+    // Copies still in flight may target pages about to return to the pools.
+    (void)cudaStreamSynchronize(device.stream);
+    if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
+
+    // Handles into the old stores must not alias objects of the new ones.
+    for (SequenceState& sequence : continuation_states) {
+        sequence.kv.reset();
+        sequence.state = {};
+        sequence.rewrite_state.reset();
+        sequence.reserved_state.reset();
+        sequence.tail_hidden               = {};
+        sequence.rewrite_checkpoint_hidden = {};
+        sequence.long_anchors.clear();
+        sequence.shared_prefix_references.clear();
+    }
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        if (continuation_slots[index].role != ContinuationSlotRole::Free) {
+            retire_continuation_slot(index);
+        }
+    }
+    for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
+        shared_prefix_states[index] = SharedPrefixState{};
+        SharedPrefixSlot& slot      = shared_prefix_slots[index];
+        if (slot.role != SharedPrefixSlotRole::Free) {
+            slot.role = SharedPrefixSlotRole::Free;
+            if (++slot.generation == 0) { ++slot.generation; }
+        }
+    }
+
+    // Addresses hold reservations against the page pools, so they go before the pages.
+    backend_kv_addresses = std::move(backend_addresses);
+    text_kv_addresses    = std::move(text_addresses);
+    host_kv_extents      = std::move(extents);
+    backend_kv_pages     = std::move(backend_pages);
+    text_kv_pages        = std::move(text_pages);
+    state_store          = std::move(states);
+    if (host_state_images) { host_state_images->release_all(); }
+    // The hybrid prefix cache binds the stores by pointer; fail_all_cleanup already released
+    // every reference it held, so it is recreated empty against the new stores.
+    hybrid_lanes_.fill(HybridLaneState{});
+    if (hybrid_) {
+        hybrid_.reset();
+        try {
+            create_hybrid_prefix_cache(StartupObserver{});
+        } catch (...) { return false; }
+    }
+    advance_resource_revision();
+    return true;
 }
 
 

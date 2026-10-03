@@ -144,14 +144,15 @@ void run(const char* artifact, SpeculativeBackend backend) {
     require(source && other, "fixture state allocation failed");
     const auto source_slot = states.physical_slot(*source);
     const auto other_slot  = states.physical_slot(*other);
-    const auto text        = program.text_kv_addresses->create_active(pages, 1);
+    const auto text        = program.text_kv_addresses->create_active(pages, 1, device.stream);
     require(text.has_value(), "fixture text KV allocation failed");
     AddressOwner text_owner{program.text_kv_addresses.get(), *text};
     program.text_kv_addresses->ensure_mapped_to_tokens(*text, capacity, device.stream);
     std::array<AddressOwner, 2> full_owners;
     if (program.backend_kv_addresses) {
         for (const auto row : {0, 1}) {
-            const auto address = program.backend_kv_addresses->create_active(pages, row);
+            const auto address =
+                program.backend_kv_addresses->create_active(pages, row, device.stream);
             require(address.has_value(), "fixture full KV allocation failed");
             full_owners[row].store  = program.backend_kv_addresses.get();
             full_owners[row].handle = *address;

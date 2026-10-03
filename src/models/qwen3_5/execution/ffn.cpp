@@ -13,15 +13,16 @@
 namespace ninfer::models::qwen3_5::execution {
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
-                                std::int32_t last, bool mtp, bool split) {
+                                std::int32_t last, bool mtp, bool split, bool wide_verification) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
                                                         moe->routed_down.qtype, first, last);
     }
-    const auto& p    = std::get<DenseParameters>(parameters);
-    const auto& gu   = p.gate_up.weight;
-    const auto& down = p.down.weight;
+    const auto& p          = std::get<DenseParameters>(parameters);
+    const auto& gu         = p.gate_up.weight;
+    const auto& down       = p.down.weight;
+    const auto down_policy = residual_projection_policy(p.down, wide_verification && !mtp);
     WorkspaceLayoutBuilder layout;
     // A split rank holds a gate/up shard the fused SwiGLU routes do not register; it composes the
     // projection and activation like the MTP layer.
@@ -36,7 +37,18 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         }
         (void)layout.alloc(DType::BF16, {gu.n / 2, last});
         (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(down.qtype, down.n, down.k,
-                                                                      p.down.policy, first, last));
+                                                                      down_policy, first, last));
+    } else if (gu.qtype == QType::Q6_G64_FP16) {
+        (void)layout.alloc(DType::BF16, {gu.n, last});
+        {
+            auto scope = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+                gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last));
+        }
+        (void)layout.alloc(DType::BF16, {gu.n / 2, last});
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
+            down.qtype, down.n, down.k, p.down.policy, first, last));
     } else {
         (void)layout.alloc(DType::BF16, {gu.n / 2, last});
         {
@@ -46,17 +58,19 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         }
         {
             auto scope = layout.scope();
-            (void)layout.alloc_bytes(row_parallel_output_workspace_bytes(p.down, first, last, split));
+            (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
+                down.qtype, down.n, down.k, down_policy, first, last));
         }
     }
     return layout.peak_bytes(1);
 }
 
 void dense_ffn_product(const Tensor& hidden, const DenseParameters& p, Tensor& delta,
-                       WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope         = workspace.scope();
-    const auto columns = hidden.ne[1];
-    const auto& gu     = p.gate_up.weight;
+                       WorkspaceArena& workspace, cudaStream_t stream, bool wide_verification) {
+    auto scope             = workspace.scope();
+    const auto columns     = hidden.ne[1];
+    const auto& gu         = p.gate_up.weight;
+    const auto down_policy = residual_projection_policy(p.down, wide_verification);
     if (ops::linear_swiglu_admits(gu.qtype, gu.n, gu.k, p.gate_up.policy, columns)) {
         // A rank shard at prefill width: the fused route never stores the gate/up product.
         Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
@@ -64,10 +78,10 @@ void dense_ffn_product(const Tensor& hidden, const DenseParameters& p, Tensor& d
             auto call = workspace.scope();
             ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
         }
-        ops::linear(activation, p.down.weight, delta, p.down.policy, workspace, stream);
+        ops::linear(activation, p.down.weight, delta, down_policy, workspace, stream);
         return;
     }
-    Tensor gate_up     = workspace.alloc(DType::BF16, {gu.n, columns});
+    Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
     {
         auto call = workspace.scope();
         ops::linear(hidden, gu, gate_up, p.gate_up.policy, workspace, stream);
@@ -75,12 +89,12 @@ void dense_ffn_product(const Tensor& hidden, const DenseParameters& p, Tensor& d
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
     ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2), activation,
                   stream);
-    ops::linear(activation, p.down.weight, delta, p.down.policy, workspace, stream);
+    ops::linear(activation, p.down.weight, delta, down_policy, workspace, stream);
 }
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream,
-         bool mtp, const TensorParallelDeviceView* tp) {
+         bool mtp, const TensorParallelDeviceView* tp, bool wide_verification) {
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
@@ -97,8 +111,20 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     const auto& down = p.down.weight;
     if (mtp || tp != nullptr) {
         Tensor delta = workspace.alloc(DType::BF16, {down.n, columns});
-        dense_ffn_product(hidden, p, delta, workspace, stream);
+        dense_ffn_product(hidden, p, delta, workspace, stream, wide_verification && !mtp);
         row_parallel_residual(delta, residual, tp, stream);
+        return;
+    }
+    if (gu.qtype == QType::Q6_G64_FP16) {
+        Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
+        {
+            auto call = workspace.scope();
+            ops::linear(hidden, gu, gate_up, p.gate_up.policy, workspace, stream);
+        }
+        Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
+        ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2),
+                      activation, stream);
+        ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
         return;
     }
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
@@ -106,7 +132,8 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         auto call = workspace.scope();
         ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
     }
-    row_parallel_output(activation, p.down, residual, tp, workspace, stream);
+    ops::linear_add(activation, down, residual,
+                    residual_projection_policy(p.down, wide_verification), workspace, stream);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

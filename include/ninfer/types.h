@@ -20,12 +20,17 @@ using TokenId = std::int32_t;
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
+// Explicit markers plus the engine's automatic tool/leading-instruction/full-prompt candidates;
+// one request's shared-prefix opportunities never exceed this (frontend.cpp opportunities.reserve).
+inline constexpr std::size_t kMaximumPreparedPromptCacheCandidatesPerRequest = 7;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
+// Pinned Host tier of the hybrid prefix cache when --host-cache-mib is not given.
+inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -80,6 +85,13 @@ struct SpeculativeOptions {
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
+    // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
+    std::uint32_t ngram_draft_tokens = 0;
+    std::uint32_t ngram_min_match    = 12;
+    // CPU-only retention, separate from KV. Zero keeps request-local drafting.
+    std::size_t ngram_archive_bytes = 0;
+    std::size_t ngram_session_bytes = 128ULL << 20;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -95,6 +107,7 @@ enum class StartupPhase : std::uint8_t {
     HostStatePin,
     HostKvPin,
     CudaGraphPrepare,
+    PrefixCacheLoad,
     EngineFinalize,
 };
 
@@ -125,20 +138,128 @@ struct StartupObserver {
     std::function<void(const StartupEvent& event)> callback;
 };
 
+enum class DiagnosticLevel : std::uint8_t {
+    Debug,
+    Info,
+    Warning,
+    Error,
+};
+
+// One runtime diagnostic from the Engine worker: Device KV lease growth, recovery from out of
+// memory or a failed request, and prefix-cache persistence at shutdown.
+struct Diagnostic {
+    DiagnosticLevel level = DiagnosticLevel::Info;
+    std::string message;
+};
+
+struct DiagnosticObserver {
+    // Receives every diagnostic, from the worker thread or the destructor; the product decides
+    // which levels to show. Without a callback, Info and above go to stderr. Callback exceptions
+    // are ignored so a logging failure cannot disturb execution.
+    std::function<void(const Diagnostic& diagnostic)> callback;
+};
+
+// Prefix-cache implementation selected at Engine construction. Legacy is the owner/checkpoint
+// ResourceManager (docs/maintainer/resource-scheduling-and-context-cache.md). Hybrid is the
+// content-addressed block tree with sparse state snapshots
+// (docs/maintainer/hybrid-prefix-cache-spec.md).
+// Prefix-cache design. ninfer-serve selects Hybrid unless --use-original-prefix-caching selects
+// Legacy; the Engine option itself defaults to Legacy.
+enum class ContextCacheMode : std::uint8_t {
+    Legacy,
+    Hybrid,
+};
+
+// Abandons the Host tier save of a stopping Engine (HybridPrefixCacheOptions::persistent_file)
+// from any thread, also while the Engine is being destroyed. Copies share one state: the product
+// keeps a copy from the options it passes, beyond the Engine's lifetime.
+class PrefixCacheSaveControl {
+public:
+    enum class Abandon : std::uint8_t {
+        // Nothing replaced the previous file; a save in progress deleted its unfinished file.
+        Unsaved,
+        // The save had already completed.
+        Saved,
+        // The save did not stop within the timeout; its unfinished file may remain.
+        StillWriting,
+    };
+
+    PrefixCacheSaveControl();
+
+    // Stops a save in progress, or one not begun yet, from replacing the previous file. Waits at
+    // most `timeout` for a save in progress to stop and delete its unfinished file.
+    Abandon abandon(std::chrono::milliseconds timeout) const noexcept;
+
+    // The Engine's side. A save writes only after begin() returns true, polls abandoned() while
+    // it writes, and then calls end() with whether it replaced the file.
+    [[nodiscard]] bool begin() const noexcept;
+    [[nodiscard]] bool abandoned() const noexcept;
+    void end(bool saved) const noexcept;
+
+private:
+    struct State;
+    std::shared_ptr<State> state_;
+};
+
+// Hybrid-mode tuning. Every field is optional: Engine construction derives the unset ones from
+// max_concurrency, prefill_chunk and whether a Host tier exists (host_cache_budget_bytes, default
+// kDefaultHybridHostCacheBytes, 0 disables it), and Engine::options() reports the effective
+// values. Legacy-only fields of ContextCacheOptions are rejected in Hybrid mode.
+struct HybridPrefixCacheOptions {
+    // Device StateImage slots holding inactive snapshots (and tap/endpoint staging). Total Device
+    // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
+    // lane plus one staging slot with a Host tier, plus two without one (Device slots are then
+    // the only snapshot storage).
+    std::optional<std::uint32_t> device_snapshot_slots;
+    // New prefill state snapshots one request may create. Default 8 with a Host tier, 2 without.
+    std::optional<std::uint32_t> max_new_taps;
+    // Geometric ladder base G: ladder taps target prompt_tokens - G * 2^k. Default
+    // max(4096, 2 * prefill_chunk): ladder taps land on prefill chunk boundaries.
+    std::optional<std::uint32_t> tap_ladder_tokens;
+    // Ladder taps closer than this to another snapshot on the same path are skipped. Default
+    // max(1024, prefill_chunk).
+    std::optional<std::uint32_t> tap_min_gap_tokens;
+    // Opt-in persistence of the Host tier: saved to this file when the Engine shuts down cleanly
+    // and restored from it at startup, but only when it was written for the same artifact, KV and
+    // state formats and `persistent_identity` (the product binary's build). Empty disables it.
+    std::filesystem::path persistent_file;
+    std::string persistent_identity;
+    // Lets the product abandon the save at shutdown (ninfer-serve: Ctrl+C during the stop).
+    PrefixCacheSaveControl persistent_save;
+};
+
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2;
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,7) and L=4;
     // Engine::options() returns those effective values.
     bool enabled = true;
+    ContextCacheMode mode = ContextCacheMode::Legacy;
+    HybridPrefixCacheOptions hybrid;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
-    // Bounded private/shared logical catalogs and per-continuation long-anchor count.
+    // Single host RAM ceiling for the whole retention tier. In Hybrid mode it is the pinned Host
+    // slab pool that KV blocks and state snapshots share (default kDefaultHybridHostCacheBytes, 0
+    // disables the Host tier). In Legacy mode, when engaged it is authoritative:
+    // the plan sizes the Host state pool from the checkpoint inventory the capture path creates
+    // (2 + anchors per private owner plus one per shared entry), spends the remaining state
+    // headroom under the half-budget cap on extra long anchors per owner, gives Host KV the
+    // remainder, and rejects a plan whose state footprint exceeds half the budget.
+    // `host_state_slots` and `host_kv_capacity_bytes` are ignored in that mode.
+    std::optional<std::size_t> host_cache_budget_bytes;
+    // Bounded private/shared logical catalogs and per-continuation long-anchor count. An engaged
+    // host-cache budget raises the anchor count within the state inventory it funds.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Minimum token gap between the engine-automatic long anchors of one request, doubling per
+    // anchor walking back from the prompt end (gap k >= spacing * 2^k). Anchors closer than that
+    // cost a prefill split and a full StateImage each while covering little the endpoint and
+    // rewrite checkpoints do not, so the grid is sparse near the end and reaches deep history.
+    // Zero disables the spacing rule (every one of the last L message boundaries is anchored).
+    std::uint32_t long_anchor_min_spacing_tokens = 1024;
 };
 
 struct ContextCostOptions {
@@ -151,6 +272,10 @@ struct ContextCostOptions {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
+    // Message the model receives when it hits its thinking budget, before the canonical
+    // </think> close the frontend appends when the message lacks it. Empty preserves the
+    // model's built-in end-of-thinking control suffix.
+    std::string thinking_budget_message;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     // Tensor-parallel width (1 or 2). Each rank runs on `devices[rank]`; at width 1 an empty list
@@ -158,11 +283,22 @@ struct EngineOptions {
     std::uint32_t tensor_parallel = 1;
     std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
+    // Startup-fixed runtime YaRN override, finite [1,4]; 1 preserves native RoPE.
+    // Extends only the allowed ceiling, never max_context itself or artifact metadata.
+    float rope_yarn_factor             = 1.0F;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // INT8 KV prefills with the fast prompt-attention kernel and rounds prefill_chunk down to whole
+    // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
+    // it requires the INT8 KV cache.
+    bool original_int8_prefill_kernel  = false;
+    // NVFP4 KV prefills over more than 2048 visible keys with the fast prompt-attention kernel
+    // (block-scaled FP4 QK). True selects the tiled NVFP4 prompt kernel; it requires the NVFP4
+    // KV cache.
+    bool original_nvfp4_prefill_kernel = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -170,10 +306,16 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // Vision offload keeps the vision tower in pinned system RAM instead of device memory and
+    // streams it through borrowed evictable device staging per encode window.
+    bool vision_offload = false;
+    // Upper bound on merged tokens per vision item; zero leaves the compiled limit.
+    std::uint32_t vision_max_merged_tokens = 32768;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
+    DiagnosticObserver diagnostic_observer;
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -262,12 +404,27 @@ struct OutputOptions {
     // Presentation constraint supplied by the protocol adapter. It bounds only Qwen's emitted
     // function-name grammar; it does not require the name to match a currently declared tool.
     std::uint32_t tool_name_max_length = 128;
+    // Opt-in recovery of complete Qwen calls whose wrapper or suffix markup is malformed; see the
+    // tool-call parser tolerant mode. Off preserves the strict all-or-nothing behavior.
+    bool tolerant_tool_calls = false;
+};
+
+struct NgramSessionHints {
+    // Explicit local conversation identity, at most 256 bytes. Never inferred from
+    // prompt similarity or the KV session key. Empty means request-local drafting.
+    std::string key;
+    bool reset = false;
+    std::string parent;
+    std::uint64_t parent_generation = 0;
+    // Retention-enabled requests mix the sampling seed with fresh request entropy:
+    // prior generated proposals must not reuse the random draws that produced them.
 };
 
 struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    NgramSessionHints ngram_session;
 };
 
 enum class MediaKind : std::uint8_t {
@@ -310,6 +467,10 @@ enum class ToolCallParseFallbackReason : std::uint8_t {
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
+    // Tolerant recovery discarded a trailing suffix after an otherwise complete call, or kept a
+    // call whose closing tags were cut off at the region end. A structured response was still
+    // produced, so this is surfaced for transparency, not as a fallback-to-text failure.
+    TruncatedTail,
 };
 
 [[nodiscard]] inline constexpr const char*
@@ -327,16 +488,19 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "undeclared_tool";
     case ToolCallParseFallbackReason::TrailingContent:
         return "trailing_content";
+    case ToolCallParseFallbackReason::TruncatedTail:
+        return "truncated_tail";
     }
     return "malformed_structure";
 }
 
 struct ToolCallParseDiagnostics {
-    bool marker_seen                            = false;
-    std::uint32_t structured_call_count         = 0;
-    std::uint32_t empty_arguments_omitted       = 0;
-    std::uint32_t schema_mismatch_arguments     = 0;
-    ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    bool marker_seen                              = false;
+    std::uint32_t structured_call_count           = 0;
+    std::uint32_t empty_arguments_omitted         = 0;
+    std::uint32_t schema_mismatch_arguments       = 0;
+    std::uint32_t duplicate_parameters_repaired   = 0;
+    ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
@@ -649,12 +813,23 @@ struct GenerationTimings {
     double vision_seconds      = 0.0;
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
+    // decode_seconds with each compact-batch unit's elapsed time divided among the requests it
+    // served. Unlike decode_seconds, summing it over concurrent requests counts each unit once, so
+    // summed decode tokens over summed shares is aggregate decode throughput.
+    double decode_share_seconds = 0.0;
     // Request wall phases at committed model-state boundaries. Prompt begins when admission and
     // its exact reuse choice are published and ends at the first accepted output token. Generation
     // spans the first through last accepted output token and therefore has N-1 token intervals.
     double prompt_wall_seconds     = 0.0;
     double generation_wall_seconds = 0.0;
     double total_seconds           = 0.0;
+    // Vision offload: duration and traffic of the encode window that streamed the vision tower
+    // from system RAM through borrowed device memory.
+    double vision_offload_window_seconds       = 0.0;
+    double vision_offload_evict_seconds        = 0.0;
+    double vision_offload_restore_seconds      = 0.0;
+    std::uint64_t vision_offload_evicted_bytes = 0;
+    std::uint64_t vision_offload_staged_bytes  = 0;
 };
 
 // Wall elapsed time directly observed in Engine-owned regions. "Exposed" values are latency
@@ -685,6 +860,12 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    std::uint64_t ngram_rounds                  = 0;
+    std::uint64_t ngram_drafted_tokens          = 0;
+    std::uint64_t ngram_accepted_tokens         = 0;
+    std::uint64_t ngram_archive_rounds          = 0;
+    std::uint64_t ngram_archive_drafted_tokens  = 0;
+    std::uint64_t ngram_archive_accepted_tokens = 0;
 };
 
 struct ThinkingBudgetStats {
@@ -789,9 +970,29 @@ struct MaterializationDiagnostics {
     MaterializationSearchPhase search_stop_phase = MaterializationSearchPhase::None;
     bool search_boundary_limited                 = false;
 
+    // Hybrid prefix cache admission. `cached_prefix_tokens` is the longest prompt prefix held as
+    // cached KV blocks whether or not it was reusable: reuse also needs a state snapshot inside
+    // it, so a gap to the reused token count is prefix lost to snapshot placement.
+    // `restored_host_bytes` is what the admission copied back from the Host tier; the copies
+    // overlap the request's first prefill pass, so their time is part of its prefill.
+    std::uint32_t cached_prefix_tokens = 0;
+    std::uint64_t restored_host_bytes  = 0;
+
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,
                const MaterializationDiagnostics&) noexcept = default;
+};
+
+struct NgramArchiveStats {
+    bool enabled              = false;
+    bool bound                = false;
+    bool published            = false;
+    std::uint64_t generation  = 0;
+    std::size_t sources       = 0;
+    std::size_t session_bytes = 0;
+    std::size_t total_bytes   = 0;
+    // Effective seed after request-domain separation; archive state is also needed for replay.
+    std::optional<std::uint64_t> sampling_seed;
 };
 
 struct GenerationResult {
@@ -810,6 +1011,7 @@ struct GenerationResult {
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
+    NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;
 };
 
@@ -853,11 +1055,21 @@ struct MemorySummary {
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
+    // Device memory CUDA Graph preparation actually took at startup (free memory before minus
+    // after instantiating, uploading and launching every executable); 0 without CUDA Graphs.
+    std::size_t cuda_graph_measured_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
     std::uint32_t host_state_capacity_slots       = 0;
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    // Host retention-tier unit costs. Every Host StateImage slot pins image_bytes regardless of
+    // the prefix depth it resumes, and Host KV pins bytes per page group, so the split of a
+    // budget between the two is the depth-versus-positions trade made visible.
+    std::size_t host_state_image_bytes            = 0;
+    std::size_t host_kv_page_group_bytes          = 0;
+    // Engaged only when the single host RAM budget mode is active.
+    std::size_t host_cache_budget_bytes           = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -908,6 +1120,9 @@ struct RuntimeStats {
     std::uint32_t terminal_pending_requests = 0;
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
+    // A capture the Program declined because the offer was not physically feasible. Unlike an
+    // abort this is a silent retention loss, so it needs its own counter to be observable.
+    std::uint64_t active_captures_skipped   = 0;
 
     std::uint64_t root_selections                    = 0;
     std::uint64_t private_endpoint_selections        = 0;
@@ -917,6 +1132,8 @@ struct RuntimeStats {
     std::uint64_t shared_stable_prefix_selections    = 0;
     std::uint64_t reused_prompt_tokens               = 0;
     std::uint32_t last_selected_frontier_tokens      = 0;
+    // Aborted requests whose live state was published as a continuation endpoint.
+    std::uint64_t salvaged_continuations             = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;
@@ -956,6 +1173,11 @@ struct RuntimeStats {
     std::uint32_t host_state_occupied_slots            = 0;
     std::uint32_t device_main_kv_occupied_pages        = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
+    // Un-written growth reservation held by active requests, split out of the occupied totals
+    // above. Occupancy alone cannot distinguish KV that exists from KV a request is merely still
+    // entitled to, which is what made context-cache starvation invisible in the request log.
+    std::uint32_t device_main_kv_lease_pages           = 0;
+    std::uint32_t device_backend_kv_lease_pages        = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;
@@ -968,6 +1190,33 @@ struct RuntimeStats {
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;
+
+    // Hybrid prefix cache (ContextCacheMode::Hybrid); zero in Legacy mode. Block and snapshot
+    // gauges are absolute; the rest are cumulative event counters.
+    std::uint32_t hybrid_cached_blocks           = 0; // Device-resident tree blocks
+    std::uint32_t hybrid_evictable_blocks        = 0;
+    std::uint32_t hybrid_tree_blocks             = 0; // Device or Host
+    std::uint32_t hybrid_snapshots               = 0;
+    std::uint64_t hybrid_host_capacity_bytes     = 0;
+    std::uint64_t hybrid_host_used_bytes         = 0;
+    std::uint64_t hybrid_snapshot_hits           = 0;
+    std::uint64_t hybrid_reused_tokens           = 0;
+    std::uint64_t hybrid_blocks_inserted         = 0;
+    std::uint64_t hybrid_blocks_reattached       = 0;
+    std::uint64_t hybrid_blocks_duplicate        = 0;
+    std::uint64_t hybrid_taps_created            = 0;
+    std::uint64_t hybrid_taps_skipped            = 0;
+    std::uint64_t hybrid_endpoints_created       = 0;
+    std::uint64_t hybrid_host_image_writes       = 0;
+    std::uint64_t hybrid_host_block_writes       = 0;
+    std::uint64_t hybrid_host_image_restores     = 0;
+    std::uint64_t hybrid_host_block_restores     = 0;
+    std::uint64_t hybrid_host_write_bytes        = 0;
+    std::uint64_t hybrid_host_restore_bytes      = 0;
+    std::uint64_t hybrid_evicted_blocks          = 0;
+    std::uint64_t hybrid_host_snapshot_evictions = 0;
+    std::uint64_t hybrid_host_dead_reclaims      = 0;
+    std::uint64_t hybrid_unbacked_node_losses    = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
@@ -997,6 +1246,22 @@ struct ContextCostSummary {
     std::filesystem::path preset_path;
 };
 
+// Static facts about the loaded model, independent of the current request context and memory
+// layout. The Model supplies the architecture dimension facts (vocab_size, embedding_size,
+// native_context) and its registered identity; the Engine adds the artifact-measured facts
+// (parameters, weight_bytes). Serving renders these into the OpenAI /v1/models model object and
+// its llama.cpp-compatible `meta` field. The effective per-request context ceiling is a property
+// of the running instance, not of the model, and is reported separately (meta n_ctx).
+struct ModelMetadata {
+    std::string model_id;    // Registered model identity (serving public alias default).
+    std::string weights_id;  // Dominant loaded weights format name (meta ftype).
+    std::uint64_t vocab_size     = 0; // Tokenizer token domain (meta n_vocab).
+    std::uint64_t embedding_size = 0; // Model embedding width (meta n_embd).
+    std::uint64_t native_context = 0; // Model native/training context (meta n_ctx_train).
+    std::uint64_t parameters     = 0; // Total logical weight elements (meta n_params).
+    std::uint64_t weight_bytes   = 0; // Encoded weight payload bytes (meta size).
+};
+
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
@@ -1011,6 +1276,24 @@ struct LoadSummary {
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;
+
+    // Hybrid prefix cache restored from its persistent file at startup.
+    struct PrefixCacheRestore {
+        bool attempted = false;
+        bool restored  = false;
+        // Why nothing was restored (no file yet, incompatible file, I/O error).
+        std::string message;
+        std::uint64_t blocks    = 0;
+        std::uint64_t snapshots = 0;
+        std::uint64_t bytes     = 0;
+        double seconds          = 0.0;
+        // What the file holds and the Host tier bytes all of it takes, against this Engine's
+        // tier. When the tier is smaller, only the snapshots it values most were restored.
+        std::uint64_t saved_blocks        = 0;
+        std::uint64_t saved_snapshots     = 0;
+        std::uint64_t required_host_bytes = 0;
+        std::uint64_t host_bytes          = 0;
+    } prefix_cache;
 };
 
 } // namespace ninfer

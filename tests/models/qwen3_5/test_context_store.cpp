@@ -12,6 +12,7 @@
 #include <exception>
 #include <iostream>
 #include <new>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -194,7 +195,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
 
-    const auto address = addresses.create_active(3, 0);
+    const auto address = addresses.create_active(3, 0, device.stream);
     expect(address.has_value(), "active KV address allocation");
     addresses.ensure_mapped_to_tokens(*address, 65, device.stream);
     device.synchronize();
@@ -206,6 +207,27 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(addresses.mapped_pages(*address) == 2 && addresses.entitlement(*address) == 3 &&
                addresses.committed_frontier(*address) == 65 && addresses.bound_row(*address) == 0,
            "KV address tracks mapped pages, entitlement, frontier, and execution row");
+    // The growth-lease ladder asks whether a rung fits before resizing: the answer must match
+    // what the resize itself would do, in and out of space, and leave the entitlement alone.
+    expect(addresses.can_resize_entitlement(*address, 4) &&
+               addresses.can_resize_entitlement(*address, 2) &&
+               !addresses.can_resize_entitlement(*address, 1) &&
+               !addresses.can_resize_entitlement(*address, 5),
+           "entitlement feasibility disagrees with mapped pages or page capacity");
+    {
+        std::optional<ninfer::DeviceKVPageReservation> held = physical_pages.reserve(5);
+        expect(held.has_value(), "pool pressure reservation");
+        const bool fits = addresses.can_resize_entitlement(*address, 4);
+        bool threw      = false;
+        try {
+            addresses.resize_entitlement(*address, 4);
+        } catch (const std::bad_alloc&) { threw = true; }
+        expect(!fits && threw && addresses.entitlement(*address) == 3,
+               "entitlement feasibility missed a full pool, or the failed resize changed it");
+        held->clear();
+    }
+    expect(addresses.can_resize_entitlement(*address, 4) && addresses.entitlement(*address) == 3,
+           "entitlement feasibility did not recover when the pool freed space");
     expect(pages.active_address_references(addresses.logical_page(*address, 0)) == 1 &&
                pages.active_address_references(addresses.logical_page(*address, 1)) == 1,
            "active KV membership is counted on each logical page");
@@ -329,7 +351,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "KV release invalidates generations and closes physical ownership");
 
     // Verify crosses a page boundary, but the terminal commit consumes only its first column.
-    const auto terminal = addresses.create_active(3, 0);
+    const auto terminal = addresses.create_active(3, 0, device.stream);
     expect(terminal.has_value(), "terminal boundary KV address allocation");
     addresses.ensure_mapped_to_tokens(*terminal, 63, device.stream);
     addresses.commit_frontier(*terminal, 63);
@@ -365,7 +387,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.reserved_pages() == 0 && physical_pages.available_pages() == 8,
            "terminal settlement releases both mappings and unused growth");
 
-    const auto snapshot_source      = addresses.create_active(3, 0);
+    const auto snapshot_source      = addresses.create_active(3, 0, device.stream);
     const auto snapshot_destination = addresses.create_inactive();
     expect(snapshot_source && snapshot_destination, "active KV snapshot endpoints allocate");
     addresses.ensure_mapped_to_tokens(*snapshot_source, 65, device.stream);
@@ -391,7 +413,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0,
            "active KV snapshot references close with both address spaces");
 
-    const auto alternating = addresses.create_active(4, 0);
+    const auto alternating = addresses.create_active(4, 0, device.stream);
     expect(alternating.has_value(), "alternating Host release address allocation");
     addresses.ensure_mapped_to_tokens(*alternating, 193, device.stream);
     addresses.commit_frontier(*alternating, 193);
@@ -424,7 +446,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0,
            "alternating Host extent partitions close without leaked descriptors");
 
-    const auto shared = addresses.create_active(3, 0);
+    const auto shared = addresses.create_active(3, 0, device.stream);
     expect(shared.has_value(), "shared-prefix source address allocation");
     addresses.ensure_mapped_to_tokens(*shared, 65, device.stream);
     addresses.commit_frontier(*shared, 65);
@@ -479,7 +501,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.allocated_pages() == 0,
            "shared full-page occupancy survives until its final address reference releases");
 
-    const auto mixed_source = addresses.create_active(4, 0);
+    const auto mixed_source = addresses.create_active(4, 0, device.stream);
     expect(mixed_source.has_value(), "mixed snapshot retained-prefix source allocation");
     addresses.ensure_mapped_to_tokens(*mixed_source, 65, device.stream);
     addresses.commit_frontier(*mixed_source, 65);
@@ -570,14 +592,14 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0 && physical_pages.allocated_pages() == 0,
            "repeated mixed snapshot ownership closes without leaked logical or physical pages");
 
-    const auto filler = addresses.create_active(4, 0);
+    const auto filler = addresses.create_active(4, 0, device.stream);
     expect(filler.has_value(), "full-capacity staged-fork filler allocation");
     addresses.ensure_mapped_to_tokens(*filler, 193, device.stream);
     addresses.commit_frontier(*filler, 193);
     addresses.set_checkpoint_requirement(*filler, 193);
     addresses.deactivate(*filler);
 
-    const auto retained = addresses.create_active(4, 0);
+    const auto retained = addresses.create_active(4, 0, device.stream);
     expect(retained.has_value(), "full-capacity retained source allocation");
     addresses.ensure_mapped_to_tokens(*retained, 65, device.stream);
     addresses.commit_frontier(*retained, 65);
@@ -627,6 +649,99 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "staged retained fork closes Device and Host ownership without leaks");
 }
 
+// Engine recovery rebuilds the context stores when a failed owner release leaves objects behind.
+// That is only sound if abandoning a store with live objects returns every Device page, growth
+// reservation, execution row and Host KV allocation to its pool.
+void test_abandoned_stores_return_resources(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+
+    {
+        store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+        store::HostKVExtentStore extents(host_arena, 8);
+        store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+        const auto retained = addresses.create_active(1, 1, device.stream);
+        expect(retained.has_value(), "abandoned-store retained address");
+        addresses.ensure_mapped_to_tokens(*retained, 64, device.stream);
+        device.synchronize();
+        addresses.commit_frontier(*retained, 64);
+        addresses.deactivate(*retained);
+        const std::array membership{addresses.logical_page(*retained, 0)};
+        auto backup = extents.prepare(pages, membership);
+        expect(backup.has_value(), "abandoned-store Host extent reservation");
+        if (!backup) { return; }
+        physical_pages.copy_to_host(extents.device_sources(*backup), extents.writable_view(*backup),
+                                    device.transfer_stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        (void)extents.publish(std::move(*backup));
+
+        const auto active = addresses.create_active(4, 0, device.stream);
+        expect(active.has_value(), "abandoned-store active address");
+        addresses.ensure_mapped_to_tokens(*active, 65, device.stream);
+        device.synchronize();
+        expect(physical_pages.allocated_pages() == 3 && physical_pages.reserved_pages() == 2 &&
+                   host_arena.occupied_bytes() == host_layout.page_stride,
+               "abandoned stores hold Device pages, a growth reservation and Host KV");
+    }
+    expect(physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0 &&
+               host_arena.occupied_bytes() == 0,
+           "abandoning live stores returns Device pages, reservations and Host KV to the pools");
+
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+    const auto reused = addresses.create_active(4, 0, device.stream);
+    expect(reused.has_value() && addresses.bound_row(*reused) == 0,
+           "a rebuilt store rebinds the execution row an abandoned address held");
+    addresses.deactivate(*reused);
+    expect(addresses.release(*reused), "rebuilt-store address releases");
+
+    const q36::StateImageSpec spec{
+        .linear =
+            {
+                .layers         = 1,
+                .conv_channels  = 8,
+                .conv_width     = 3,
+                .value_heads    = 2,
+                .value_head_dim = 4,
+                .key_head_dim   = 4,
+                .slot_count     = 2,
+                .conv_dtype     = ninfer::DType::BF16,
+            },
+        .hidden = 8,
+    };
+    ninfer::LayoutBuilder state_builder;
+    const q36::StateImageDeviceLayout state_layout =
+        q36::plan_state_image_device_pool(state_builder, spec);
+    q36::HostStatePool host_states(state_layout.host, 2);
+    const auto first  = host_states.allocate();
+    const auto second = host_states.allocate();
+    expect(first && second && !host_states.allocate(), "Host StateImage pool fills");
+    host_states.release_all();
+    expect(host_states.occupied() == 0 && !host_states.release(*first) &&
+               host_states.allocate() && host_states.allocate(),
+           "Host StateImage release_all frees every slot and stales outstanding handles");
+}
+
 } // namespace
 
 int main() {
@@ -642,6 +757,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_abandoned_stores_return_resources(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

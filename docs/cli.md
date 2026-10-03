@@ -26,8 +26,9 @@ throughput, GPU memory, token IDs when requested, and speculative-decoding stati
 stderr as unprefixed product output, so stdout can be redirected independently. On a terminal,
 weight materialization is one transient progress line followed by a compact Engine-ready summary.
 Redirected stderr contains persistent readable progress for long loads and no carriage returns or
-ANSI escapes. `--log-level debug` exposes every startup phase. Option and local prompt/message input
-failures remain direct command diagnostics:
+ANSI escapes. `--log-level debug` exposes every startup phase. FFmpeg's media-decoding messages are
+records prefixed `media |`: FFmpeg errors are warnings and everything milder is `debug`. Option and
+local prompt/message input failures remain direct command diagnostics:
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
@@ -48,7 +49,8 @@ Changes to the file take effect after restarting NInfer:
 
 Omitted thinking and effort options use the selected template's defaults. `--no-thinking` or
 `--reasoning-effort none` requests disabled thinking; other effort values cannot be combined with
-`--no-thinking`. The template interprets the selected effort. `--greedy` selects exact argmax
+`--no-thinking`. The template interprets the selected effort; a value the template rejects renders
+as the nearest one it accepts (see [serving](serving.md)). `--greedy` selects exact argmax
 decoding independently.
 
 `--thinking-budget N` places a positive upper bound on accepted model-origin tokens while the
@@ -206,16 +208,24 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 
 | Option | Meaning | Default |
 |---|---|---:|
+| `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--vram-headroom-mib N` | VRAM in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto` | `1024` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
+| `--use-original-int8-prefill-kernel` | prefill INT8 KV with the original prompt-attention kernel; requires `--kv-dtype int8` | fast kernel |
+| `--use-original-nvfp4-prefill-kernel` | prefill NVFP4 KV with the tiled prompt-attention kernel; requires `--kv-dtype nvfp4` | fast kernel over more than 2048 visible keys |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter, `1..63`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
+| `--ngram-min-match N` | minimum matched tokens for an n-gram proposal, `4..64` | `12` |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-offload on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; takes effect only with `--vision` | `off` |
+| `--vision-max-merged N` | merged vision tokens per image or video, `64..32768`; larger media is downscaled during preprocessing | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
@@ -229,6 +239,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
+| `--log-colours on\|off` | colour the statistics output on stderr | on when stderr is a terminal |
 
 When a sampling flag is omitted, Engine selects the general-task preset for the loaded architecture
 and rendered prompt mode. The current official models use:
@@ -259,6 +270,11 @@ the cost of CPU usage while waiting for the GPU. Use `blocking` to let the waiti
 the decode performance cost depends on the host. `yield` yields the CPU while waiting, and `auto`
 uses CUDA's scheduling heuristic, not an automatic performance benchmark.
 
+For example, `ninfer-serve` on an RTX 5090 under Windows, replaying an agentic workload at two
+concurrent requests, used 165 % of a CPU core on average with `spin`, 103 % with `yield` and 2 %
+with `blocking`. Against `spin`, output tok/s was 1.8 % lower with `yield` and 1.2 % lower with
+`blocking`, and mean time to first token moved by at most 0.5 %.
+
 ```bash
 NINFER_CUDA_SYNC=blocking ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --prompt "Hello"
 ```
@@ -272,6 +288,12 @@ it does not override individual CUDA event creation flags.
 The official artifacts have a native context limit of 262,144 tokens. The practical allocation
 on one RTX 5090 depends on the selected artifact, media workload, output budget, and KV-cache type.
 The artifact describes its model configuration and weight representations;
+`--rope-yarn-factor F` opts into startup-fixed runtime YaRN with a finite factor in `[1,4]`
+(default `1`, native RoPE unchanged). It does not modify the artifact or converter. The factor
+extends the allowed context ceiling, but does not enlarge the default `--max-context` or KV pool;
+request a larger context explicitly. Memory and selected speculative-backend limits still apply.
+This is long-context extrapolation, not a guarantee of answer quality; evaluate your workload.
+
 `--kv-dtype` independently selects runtime KV storage. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to

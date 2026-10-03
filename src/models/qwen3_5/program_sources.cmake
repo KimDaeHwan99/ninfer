@@ -1,4 +1,5 @@
 target_sources(ninfer_model_runtime PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/ngram.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/measurement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/storage/draft_context.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/decoder_state.cpp"
@@ -25,4 +26,9 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/round_buffers.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix_identity.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_control.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/block_keys.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_cache.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_host_layout.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_persist.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_program.cpp"
 )

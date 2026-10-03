@@ -1,4 +1,6 @@
 #pragma once
+#include "ninfer/ops/speculative_round.h"
+#include "core/pdl.cuh"
 
 // Implements: include/ninfer/ops/speculative_round.h
 // Match: contiguous request-major state and BF16 verification logits.
@@ -15,7 +17,6 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kSparseSpeculativeCandidates = 16;
 
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
                                                          const std::int32_t* drafts,
@@ -23,6 +24,7 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
                                                          const std::int32_t* current_extents,
                                                          std::int32_t* verify_ids,
                                                          std::int32_t* positions, std::int32_t k) {
+    pdl::enter();
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
     int extent    = current_extents[row];
@@ -35,6 +37,25 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
         if (positions != nullptr) {
             positions[off] = base_positions[row] + (j <= extent ? j : extent);
         }
+    }
+}
+
+// One block per row. Rows whose device flag is zero keep the proposal already in place.
+__global__ void speculative_overlay_copy_proposals_kernel(
+    const std::int32_t* copy_rows, const std::int32_t* copy_drafts,
+    const std::int32_t* copy_candidates, const float* copy_q, std::int32_t* drafts,
+    std::int32_t* candidates, float* proposal_q, std::int32_t k, std::int32_t slots) {
+    pdl::enter();
+    const int row = static_cast<int>(blockIdx.x);
+    if (copy_rows[row] == 0) { return; }
+    for (int j = threadIdx.x; j < k; j += blockDim.x) {
+        drafts[row * k + j] = copy_drafts[row * k + j];
+    }
+    if (candidates == nullptr) { return; }
+    const int plane = k * slots;
+    for (int i = threadIdx.x; i < plane; i += blockDim.x) {
+        candidates[row * plane + i] = copy_candidates[row * plane + i];
+        proposal_q[row * plane + i] = copy_q[row * plane + i];
     }
 }
 
@@ -105,10 +126,10 @@ __device__ __forceinline__ void speculative_sparse_warp_store(const int* drafts,
                                                               int* licensed_tokens,
                                                               int* licensed_counts, int* accepted) {
     const int lane = threadIdx.x & 31;
-    if (lane <= k)
-        licensed_tokens[row * (k + 1) + lane] = lane < accepted_count    ? drafts[row * k + lane]
-                                                : lane == accepted_count ? terminal
-                                                                         : 0;
+    for (int column = lane; column <= k; column += 32)
+        licensed_tokens[row * (k + 1) + column] = column < accepted_count ? drafts[row * k + column]
+                                                  : column == accepted_count ? terminal
+                                                                             : 0;
     if (lane == 0) {
         licensed_counts[row] = accepted_count + 1;
         accepted[row]        = accepted_count;
@@ -123,11 +144,15 @@ __device__ __forceinline__ void speculative_sparse_warp_greedy(const int* target
                                                                int* licensed_counts, int* accepted,
                                                                int row, int extent, int k) {
     const int lane = threadIdx.x & 31;
-    const bool reject =
-        lane < extent && target_tokens[row * (k + 1) + lane] != drafts[row * k + lane];
-    const unsigned mask = __ballot_sync(0xffffffffU, reject);
-    const int a         = mask ? __ffs(mask) - 1 : extent;
-    const int terminal  = target_tokens[row * (k + 1) + a];
+    int a          = extent;
+    for (int base = 0; base < k; base += 32) {
+        const int column = base + lane;
+        const bool reject =
+            column < extent && target_tokens[row * (k + 1) + column] != drafts[row * k + column];
+        const unsigned mask = __ballot_sync(0xffffffffU, reject);
+        if (mask) a = min(a, base + __ffs(mask) - 1);
+    }
+    const int terminal = target_tokens[row * (k + 1) + a];
     speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
                                   licensed_counts, accepted);
 }
@@ -147,30 +172,36 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted) {
     const int lane       = threadIdx.x & 31;
     const int old_length = lengths[row];
-    bool reject          = false;
-    if (lane < extent) {
-        const int d = drafts[row * k + lane];
-        if (greedy)
-            reject = workspace.dist_idx[sampling_dist_offset(lane, 0)] != d;
-        else {
-            const int support = workspace.dist_support[lane];
-            float pd          = 0.0f;
-            for (int j = 0; j < support; ++j) {
-                const int at = sampling_dist_offset(lane, j);
-                if (workspace.dist_idx[at] == d) {
-                    pd = workspace.dist_prob[at];
-                    break;
+    int a                = extent;
+    // Keep the same per-position RNG keys and one-warp residual CDF at every width.
+    for (int base = 0; base < k; base += 32) {
+        const int column = base + lane;
+        bool reject      = false;
+        if (column < extent) {
+            const int d = drafts[row * k + column];
+            if (greedy)
+                reject = workspace.dist_idx[sampling_dist_offset(column, 0)] != d;
+            else {
+                const int support = workspace.dist_support[column];
+                float pd          = 0.0f;
+                for (int j = 0; j < support; ++j) {
+                    const int at = sampling_dist_offset(column, j);
+                    if (workspace.dist_idx[at] == d) {
+                        pd = workspace.dist_prob[at];
+                        break;
+                    }
                 }
+                const int at = (row * k + column) * kSparseSpeculativeCandidates;
+                const float qd =
+                    speculative_sparse_probability(candidate_ids + at, proposal_q + at, d);
+                const float u = sampling_uniform(cfg.seed, old_length + column + 1,
+                                                 kSamplePurposeSpeculativeAccept, 0);
+                reject        = !(pd >= qd || u * qd < pd);
             }
-            const int at   = (row * k + lane) * kSparseSpeculativeCandidates;
-            const float qd = speculative_sparse_probability(candidate_ids + at, proposal_q + at, d);
-            const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
-                                              kSamplePurposeSpeculativeAccept, 0);
-            reject         = !(pd >= qd || u * qd < pd);
         }
+        const unsigned failures = __ballot_sync(0xffffffffU, reject);
+        if (failures) a = min(a, base + __ffs(failures) - 1);
     }
-    const unsigned failures = __ballot_sync(0xffffffffU, reject);
-    const int a             = failures ? __ffs(failures) - 1 : extent;
     int terminal;
     if (greedy)
         terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
@@ -272,7 +303,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
     // No-op when the scratch/group path owns this shape.
-    if (sampler_multiblock_ok(token_domain, cols, partial_blocks, group_count)) { return; }
+    if (sampler_multiblock_ok(token_domain, cols, partial_blocks, group_count,
+                              kSpeculativeSamplerMaxColumns)) {
+        return;
+    }
 
     if (tid == 0) {
         a_sh     = 0;
@@ -386,6 +420,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
     std::int32_t cols, std::int32_t k, SamplingWorkspace workspace,
     std::size_t workspace_row_stride) {
+    pdl::enter();
     const int row     = static_cast<int>(blockIdx.z);
     const int col     = static_cast<int>(blockIdx.y);
     const int partial = static_cast<int>(blockIdx.x);
@@ -462,6 +497,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
     std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
     std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride) {
+    pdl::enter();
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
@@ -690,6 +726,7 @@ __global__ void speculative_select_accepted_hidden_kernel(const __nv_bfloat16* h
                                                           const std::int32_t* selectors,
                                                           __nv_bfloat16* out, std::int32_t rows,
                                                           std::int32_t cols) {
+    pdl::enter();
     const int batch = static_cast<int>(blockIdx.y);
     const int row   = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) { return; }

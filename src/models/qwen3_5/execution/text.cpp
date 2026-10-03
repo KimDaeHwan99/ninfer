@@ -183,6 +183,9 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
         Tensor source = value.view({value.ne[0], batch_width, batch_size});
         Tensor target =
             batch_features->slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
+        // pending_features is lane-owned at the frame's native width; a narrower round fills
+        // the leading columns of each lane through the parent strides.
+        if (target.ne[1] != batch_width) { target = target.slice(1, 0, batch_width); }
         ops::scatter_bf16_batch(source, *batch_lanes, *batch_valid_columns, target, stream);
         captured_mask |= 1U << index;
         return;
@@ -352,10 +355,11 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                                        dimension(config_.attention->num_attention_heads), T});
     Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
                                              dimension(config_.attention->num_key_value_heads), T});
-    ops::rmsnorm(q, mtp_->query_norm, config_.rms_norm_eps, true, qn, s);
-    ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
+
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
+    text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
+                      config_.rms_norm_eps, mtp_->query_norm, mtp_->key_norm,
+                      *parameters_.text.rope, q, k, qn, kn, s);
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -488,7 +492,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
                                       dimension(config_.attention->num_key_value_heads), T});
         ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
-        text_rope(rope_positions, *config_.rope_parameters, kn, s);
+        text_rope(rope_positions, *config_.rope_parameters, *parameters_.text.rope, kn, s);
         ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
         if (final_chunk) {
@@ -533,7 +537,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
             }
         }
-        text_rope(last_rope_position, *config_.rope_parameters, qn, s);
+        text_rope(last_rope_position, *config_.rope_parameters, *parameters_.text.rope, qn, s);
 
         Tensor a = work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
                                              dimension(config_.attention->num_attention_heads), 1});
@@ -720,7 +724,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            Tap& tap) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
-    if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
+    if (width <= 0 || width > static_cast<std::int32_t>(kDFlashVerifyMaximumWidth) || batch <= 0 ||
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("target verify batch shape is outside the supported domain");
     }
@@ -805,7 +809,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
-    if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) || batch <= 0 ||
+    if (width <= 0 || width > static_cast<std::int32_t>(kMtpVerifyMaximumWidth) || batch <= 0 ||
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
@@ -849,7 +853,6 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const auto projection = workspace::text_attention_projection(work_, config_, T);
     Tensor h              = projection.hidden;
     const auto ffn        = take_pending_ffn(T, ph == Phase::Prefill);
-    if (ffn.count == 0) { ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s); }
 
     Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
                                               dimension(config_.attention->num_attention_heads), T});
@@ -863,9 +866,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    if (ffn.count == 0) {
-        attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
-    } else {
+    const auto* single = std::get_if<LinearParameters>(&p.projection);
+    if (ffn.count != 0) {
         // Column-wise prologue: slice i starts once the previous FFN all-reduce of slice i lands.
         for (int i = 0; i < ffn.count; ++i) {
             const auto first   = ffn.first(i);
@@ -878,6 +880,15 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             Tensor ki = k_flat.slice(1, first, columns), vi = v_flat.slice(1, first, columns);
             attention_projection(hi, p, qi, gi, ki, vi, work_, s);
         }
+    } else if (single != nullptr &&
+               ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight, single->policy,
+                                                                 T)) {
+        ops::attn_input_proj_fused_rmsnorm_nvfp4(
+            x, w.input_norm, config_.rms_norm_eps, single->weight, q_flat, gate_flat, k_flat,
+            v_flat, single->policy, work_, s);
+    } else {
+        ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+        attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
     }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
@@ -886,14 +897,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                        dimension(config_.attention->num_attention_heads), T});
     Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
                                              dimension(config_.attention->num_key_value_heads), T});
-    ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
-    ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
+    text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
+                      config_.rms_norm_eps, p.query_norm, p.key_norm,
+                      *parameters_.text.rope, q, k, qn, kn, s);
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -938,7 +949,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    mixer_output(a.view({dimension(config_.attention->query_width()), T}), p.output, x);
+    mixer_output(a.view({dimension(config_.attention->query_width()), T}), p.output, x,
+                 wide_residual_verification(ph, active_sequence_batch_, T, T));
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -991,6 +1003,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            if (active_sequence_batch_ == 1) { records = records.single_row_prefix(width); }
             gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
                                   key_output, value_output, gate_output, work_, s);
@@ -1060,6 +1073,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            if (active_sequence_batch_ == 1) { records = records.single_row_prefix(width); }
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
@@ -1092,7 +1106,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
 
-    mixer_output(on.view({dimension(config_.gdn->value_width()), T}), p.output, x);
+    mixer_output(on.view({dimension(config_.gdn->value_width()), T}), p.output, x,
+                 wide_residual_verification(ph, active_sequence_batch_, T, T));
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1101,29 +1116,34 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
                                                  : ops::SparseMoeHints{};
 }
 
-void TextContext::mixer_output(const Tensor& input, const LinearParameters& output, Tensor& x) {
+void TextContext::mixer_output(const Tensor& input, const LinearParameters& output, Tensor& x,
+                               bool wide_verification) {
     auto slices = tensor_parallel_slices(tp_, x.ne[1], ctx_.stream);
-    if (slices.count == 0) {
-        row_parallel_output(input, output, x, tp_, work_, ctx_.stream);
+    if (slices.count == 0 || wide_verification) {
+        row_parallel_output(input, output, x, tp_, work_, ctx_.stream, wide_verification);
         return;
     }
     row_parallel_output_sliced(input, output, x, *tp_, 0, slices, work_, ctx_.stream);
     pending_mixer_ = slices;
 }
 
-void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
+void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
                            const ops::SparseMoeHints& hints) {
     cudaStream_t s  = ctx_.stream;
+    // Wide copy verification of one sequence keeps BF16 activations on FP8 residual projections.
+    const bool wide_verification =
+        ph == Phase::Verify && active_sequence_batch_ == 1 && x.ne[1] > 16 && x.ne[1] <= 64;
     wait_pending_ffn();
     const auto mixer = std::exchange(pending_mixer_, TensorParallelSlices{});
     const auto* dense = std::get_if<DenseParameters>(&weights.ffn);
     auto slices       = dense != nullptr ? tensor_parallel_slices(tp_, x.ne[1], s)
                                          : TensorParallelSlices{};
     Tensor h          = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
-    if (slices.count == 0 || (mixer.count != 0 && mixer.width != slices.width)) {
+    if (slices.count == 0 || wide_verification ||
+        (mixer.count != 0 && mixer.width != slices.width)) {
         for (int i = 0; i < mixer.count; ++i) ops::tp_wait(*tp_, mixer.tickets[i], s);
         ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, s);
-        ffn(h, weights.ffn, x, hints, work_, s, false, tp_);
+        ffn(h, weights.ffn, x, hints, work_, s, false, tp_, wide_verification);
         return;
     }
     // Token columns are independent through the norm and FFN: slice i waits only for its own
@@ -1172,6 +1192,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
             full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
         try {
+            if (layer < layer_ready_.size()) {
+                CUDA_CHECK(cudaStreamWaitEvent(ctx_.stream, layer_ready_[layer], 0));
+            }
             {
                 nvtx::ScopedRange mixer_range(
                     full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
@@ -1203,6 +1226,8 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     }
     // The last layer's FFN all-reduces complete x before the final norm reads it.
     wait_pending_ffn();
+    // Later passes are stream-ordered behind this one.
+    layer_ready_ = {};
 }
 
 void TextContext::run_layers(Tensor& x, Phase ph) {
@@ -1331,7 +1356,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
             const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
-            const ops::CausalAttentionExecutionEnvelope chunk_envelope{visible, visible};
+            const ops::CausalAttentionExecutionEnvelope chunk_envelope{
+                .min_visible_keys   = visible,
+                .max_visible_keys   = visible,
+                .fast_prompt_kernel = fast_prefill_kernel_};
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;

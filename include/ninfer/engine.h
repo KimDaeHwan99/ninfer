@@ -103,12 +103,19 @@ public:
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
+    [[nodiscard]] ModelMetadata model_metadata() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;
 
     void reset_memory_peaks() noexcept;
+
+    // Begins the orderly stop without waiting for it: new work is refused, and queued and active
+    // generation requests end with an Unavailable error within one unit of work. A Generation
+    // Engine then saves its prefix cache file, when configured. Destruction waits for the stop.
+    // Idempotent and callable from any thread.
+    void stop() noexcept;
 
 private:
     class Impl;

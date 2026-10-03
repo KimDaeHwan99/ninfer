@@ -174,6 +174,30 @@ void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
     workspace_logical_peak_bytes = std::max(workspace_logical_peak_bytes, phase_bytes);
 }
 
+const GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t verify_drafts) const {
+    if (!replay_records) { return nullptr; }
+    if (narrow_replay_records && verify_drafts + 1U == static_cast<std::uint32_t>(
+                                                           narrow_replay_records->spec.width)) {
+        return &*narrow_replay_records;
+    }
+    if (verify_drafts != draft_window) {
+        throw std::logic_error("speculative round width has no ReplaySSM record view");
+    }
+    return &*replay_records;
+}
+
+const ops::GdnReplayFoldPlan& ProgramImpl::round_replay_fold(std::uint32_t verify_drafts) const {
+    if (!replay_fold) { throw std::logic_error("speculative round has no ReplaySSM fold"); }
+    if (narrow_replay_fold && verify_drafts + 1U == static_cast<std::uint32_t>(
+                                                        narrow_replay_records->spec.width)) {
+        return *narrow_replay_fold;
+    }
+    if (verify_drafts != draft_window) {
+        throw std::logic_error("speculative round width has no ReplaySSM fold");
+    }
+    return *replay_fold;
+}
+
 void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                                 std::span<const std::uint32_t> starts,
                                                 std::span<const std::uint32_t> counts) {
@@ -246,7 +270,8 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
 
     execution::DFlashAppendContext state{{device, tensor_parallel, parameters, work, state_images->linear(),
                                           replay_records ? &*replay_records : nullptr, io,
-                                          prefill_hidden, prefill_chunk, proposal_head},
+                                          prefill_hidden, prefill_chunk, proposal_head,
+                                          fast_prefill_kernel},
                                          *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     execution::dflash_append_context(state, features, positions, device_counts,
@@ -335,7 +360,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         execution::OrdinaryBatchContext schedule_state{
             {device, tensor_parallel, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, fast_prefill_kernel},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -355,6 +380,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        const double share   = seconds / static_cast<double>(lanes.size());
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence    = active_sequence(lanes[row]);
             RequestControl& request    = requests[lanes[row]];
@@ -376,6 +402,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                  .produced      = 1};
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
+            request.timings.decode_share_seconds += share;
         }
         return runtime::BatchedGeneratedRound{
             .tokens =
@@ -395,6 +422,83 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     }
 }
 
+std::vector<NgramProposer::Match>
+ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
+                           std::span<const runtime::RoundBudget> budgets) {
+    std::vector<NgramProposer::Match> matches(lanes.size());
+    if (ngram_draft_window == 0) { return matches; }
+    if (budgets.size() != lanes.size()) {
+        throw std::invalid_argument("ngram budget count does not match lane count");
+    }
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        if (lanes[row] >= max_concurrency) {
+            throw std::invalid_argument("ngram lane is out of range");
+        }
+        matches[row] = propose_ngram_one(lanes[row], budgets[row]);
+    }
+    return matches;
+}
+
+void ProgramImpl::take_ngram_index(RequestControl& request, PreparedPromptData& prompt) {
+    if (!prompt.ngram_index) {
+        throw std::logic_error("prepared prompt carries no ngram index while ngram drafting is on");
+    }
+    request.ngram          = std::move(prompt.ngram_index);
+    request.ngram_indexed  = prompt.token_ids.size();
+    request.ngram_snapshot = std::move(prompt.ngram_snapshot);
+}
+
+NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
+                                                    const runtime::RoundBudget& budget) {
+    auto& request        = requests[lane];
+    const auto& sequence = active_sequence(lane);
+    const auto& ledger   = sequence.ledger;
+    const auto remaining = budget.generated_tokens_remaining;
+    const auto room =
+        sequence.execution_frontier < capacity ? capacity - sequence.execution_frontier - 1U : 0U;
+    const auto maximum = std::min({ngram_draft_window, remaining > 1 ? remaining - 1U : 0U, room});
+    // The neural path still validates decode readiness. No draft fits an anchor-only tail.
+    if (maximum == 0) { return {}; }
+    if (!request.ngram || request.ngram_indexed > ledger.size()) {
+        throw std::logic_error("ngram committed history is not initialized");
+    }
+    while (request.ngram_indexed < ledger.size()) {
+        request.ngram->append(ledger[request.ngram_indexed++]);
+    }
+    const auto history =
+        std::span<const TokenId>(ledger).last(std::min(kNgramMatchHistoryTokens, ledger.size()));
+    NgramProposer::Match match;
+    if (request.ngram_snapshot && request.ngram_copy_source != 0 &&
+        ledger.size() >= request.ngram_copy_ledger) {
+        const auto offset = request.ngram_copy_offset + ledger.size() - request.ngram_copy_ledger;
+        if (offset <= std::numeric_limits<std::uint32_t>::max()) {
+            match = request.ngram_snapshot->continue_copy(request.ngram_copy_source,
+                                                          static_cast<std::uint32_t>(offset),
+                                                          history, maximum + 2U, ngram_min_match);
+        }
+    }
+    if (match.tokens.size() < maximum + 2U) {
+        match = request.ngram->propose(history, maximum + 2U, ngram_min_match);
+        // Equal candidates keep the live source; a maximal match cannot be improved.
+        if (request.ngram_snapshot &&
+            !NgramProposer::maximal(match, history.size(), maximum + 2U)) {
+            auto retained = request.ngram_snapshot->propose(history, maximum + 2U, ngram_min_match);
+            if (retained.matched > match.matched ||
+                (retained.matched == match.matched &&
+                 retained.tokens.size() > match.tokens.size())) {
+                match = std::move(retained);
+            }
+        }
+    }
+    match = NgramProposer::finish_round(std::move(match), maximum, neural_draft_window);
+    // A cursor is only a candidate. Next round rechecks it against committed ledger
+    // tokens, including correction/bonus/control tokens, before skipping lookup.
+    request.ngram_copy_source = !match.tokens.empty() && match.archived ? match.source : 0;
+    request.ngram_copy_offset = match.offset;
+    request.ngram_copy_ledger = ledger.size();
+    return match;
+}
+
 runtime::BatchedGeneratedRound
 ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                               std::span<const runtime::RoundBudget> budgets,
@@ -410,8 +514,17 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("MTP batch membership is invalid");
     }
 
-    const std::uint32_t width      = draft_window + 1;
-    std::uint32_t maximum_frontier = 0;
+    const auto started = Clock::now();
+    const auto matches = propose_ngram(lanes, budgets);
+    // The decode frame is allocated once at plan.draft_window (the wider of the neural and ngram
+    // windows). Every round verifies at that native width so the frame is consumed in place; a
+    // width-narrowed view is only valid for a batch-1 frame. The body's AR depth (next_k) must
+    // equal the frame's next-drafts width for the same reason.
+    const std::uint32_t verify_drafts = draft_window;
+    const std::uint32_t mtp_ar_depth  = std::min(draft_window, kMtpDecodeMaximumDrafts);
+    auto& graph_family                = ngram_draft_window != 0 ? ngram_graphs : mtp_graphs;
+    const std::uint32_t width         = verify_drafts + 1;
+    std::uint32_t maximum_frontier    = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency ||
@@ -431,27 +544,26 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.prefix_identity.size() != sequence.ledger_frontier ||
             sequence.prefix_digests.size() != sequence.ledger_frontier ||
-            sequence.mtp_draft_count > draft_window) {
+            sequence.mtp_draft_count > mtp_ar_depth) {
             throw std::logic_error("MTP batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
-    const auto started = Clock::now();
     try {
         std::optional<nvtx::ScopedRange> submit_range;
         submit_range.emplace(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                              static_cast<std::uint64_t>(lanes.size()));
-        DecodeGraphExecutable* executable = nullptr;
-        execution::MtpCausalAttentionEnvelopes envelopes =
-            mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
+        DecodeGraphExecutable* executable                = nullptr;
+        execution::MtpCausalAttentionEnvelopes envelopes = mtp_causal_attention_envelopes(
+            maximum_frontier, verify_drafts, capacity, mtp_ar_depth);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
-                select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
+                select_graph_profile(graph_family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
-            executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
-            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
-                                                       capacity);
+            executable = &install_graph_profile(graph_family, profile, "MTP batch");
+            envelopes  = mtp_causal_attention_envelopes(
+                profile.max_execution_frontier, verify_drafts, capacity, mtp_ar_depth);
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -461,18 +573,21 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
-            const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
-                          capacity - sequence.execution_frontier - 1});
+            const bool row_ngram              = !matches[row].tokens.empty();
+            const std::uint32_t extent        = std::min(
+                {row_ngram ? static_cast<std::uint32_t>(matches[row].tokens.size())
+                           : sequence.mtp_draft_count,
+                 verify_drafts, max_by_budget, capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
             mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
-            for (std::uint32_t j = 0; j < draft_window; ++j) {
-                mtp_host_ingress->current_drafts[row * draft_window + j] =
-                    j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
+            for (std::uint32_t j = 0; j < verify_drafts; ++j) {
+                mtp_host_ingress->current_drafts[row * verify_drafts + j] =
+                    j < extent ? (row_ngram ? matches[row].tokens[j] : sequence.mtp_drafts[j])
+                               : sequence.ledger.back();
             }
             for (std::uint32_t j = 0; j < width; ++j) {
                 const std::uint32_t position = frontier + std::min(j, extent);
@@ -489,22 +604,23 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
-                                      std::min(capacity, frontier + extent + draft_window));
+                                      std::min(capacity, frontier + extent + mtp_ar_depth));
         }
 
         execution::MtpBatchContext schedule_state{{device, tensor_parallel, parameters, work, state_images->linear(),
                                                    replay_records ? &*replay_records : nullptr, io,
-                                                   prefill_hidden, prefill_chunk, proposal_head},
+                                                   prefill_hidden, prefill_chunk, proposal_head,
+                                                   fast_prefill_kernel},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   *io.mtp_decode,
                                                   *mtp_host_ingress,
                                                   *mtp_host_egress,
                                                   state_images->continuation_hidden_store()};
-
+        schedule_state.neural_proposal_drafts = mtp_ar_depth;
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                    draft_window, envelopes, executable);
+                                    verify_drafts, envelopes, executable);
         submit_range.reset();
         timing.begin_wait();
         {
@@ -515,6 +631,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        const double share   = seconds / static_cast<double>(lanes.size());
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = active_sequence(lanes[row]);
             RequestControl& request       = requests[lanes[row]];
@@ -525,7 +642,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::int32_t next_i     = mtp_host_egress->next_extents[row];
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || next_i < 0 ||
-                next_i > static_cast<std::int32_t>(draft_window) ||
+                next_i > static_cast<std::int32_t>(mtp_ar_depth) ||
                 static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
                 static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
                     capacity) {
@@ -548,15 +665,27 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                         1;
                 }
             }
+            if (!matches[row].tokens.empty()) {
+                request.speculative_stats.ngram_rounds += 1;
+                request.speculative_stats.ngram_drafted_tokens += pcur;
+                request.speculative_stats.ngram_accepted_tokens += accepted_i;
+                if (matches[row].archived) {
+                    request.speculative_stats.ngram_archive_rounds += 1;
+                    request.speculative_stats.ngram_archive_drafted_tokens += pcur;
+                    request.speculative_stats.ngram_archive_accepted_tokens += accepted_i;
+                }
+            }
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,
                 .base_E        = base_E,
                 .base_S        = base_S,
                 .prompt_tokens = 0,
                 .produced      = static_cast<std::uint32_t>(count_i),
+                .verify_drafts = verify_drafts,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
+            request.timings.decode_share_seconds += share;
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
@@ -593,7 +722,43 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 
-    const std::uint32_t width           = draft_window + 1U;
+    const auto started = Clock::now();
+    const auto matches = propose_ngram(lanes, budgets);
+    bool any_ngram     = false;
+    for (const auto& row_match : matches) {
+        if (!row_match.tokens.empty()) {
+            any_ngram = true;
+            break;
+        }
+    }
+    // Every round verifies at its family's own window, on the frame viewed at that width for any
+    // batch size. A round with at least one copy proposal replays the ngram family; an all-neural
+    // round replays the neural family (which runs the drafter). In a batch>1 ngram round the
+    // drafter also runs and the per-row copy payload overlays it on the device, so a row without
+    // a copy keeps its neural proposal (extent neural_draft_window) instead of decoding one token.
+    const std::uint32_t verify_drafts = any_ngram ? ngram_draft_window : neural_draft_window;
+    const bool drafter_runs           = !any_ngram || lanes.size() > 1;
+    auto& graph_family                = any_ngram ? ngram_graphs : dflash_graphs;
+    qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        dflash_host_ingress->copy_rows[row] = any_ngram && !matches[row].tokens.empty() ? 1 : 0;
+    }
+    for (std::size_t row = 0; any_ngram && row < lanes.size(); ++row) {
+        const std::uint32_t row_extent = static_cast<std::uint32_t>(matches[row].tokens.size());
+        for (std::uint32_t step = 0; step < verify_drafts; ++step) {
+            const auto token = step < row_extent ? matches[row].tokens[step] : 0;
+            dflash_host_ingress->ngram_tokens[row * verify_drafts + step] = token;
+            for (std::uint32_t slot = 0; slot < ops::kSparseSpeculativeCandidates; ++slot) {
+                const auto cand = row * verify_drafts * ops::kSparseSpeculativeCandidates +
+                                  step * ops::kSparseSpeculativeCandidates + slot;
+                dflash_host_ingress->ngram_candidates[cand] =
+                    (token + static_cast<TokenId>(slot)) %
+                    parameters.model.resources().public_token_count;
+                dflash_host_ingress->ngram_q[cand] = slot == 0 ? 1.0F : 0.0F;
+            }
+        }
+    }
+    const std::uint32_t width           = verify_drafts + 1U;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -613,7 +778,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
-            sequence.execution_frontier - sequence.dflash_context_frontier > width ||
+            sequence.execution_frontier - sequence.dflash_context_frontier > draft_window + 1U ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.prefix_identity.size() != sequence.ledger_frontier ||
@@ -623,32 +788,34 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
+        const bool row_copy = any_ngram && !matches[row].tokens.empty();
         const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+            std::min({row_copy ? static_cast<std::uint32_t>(matches[row].tokens.size())
+                               : (drafter_runs ? neural_draft_window : 0U),
+                      max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
     }
 
-    const auto started = Clock::now();
     try {
         std::optional<nvtx::ScopedRange> submit_range;
         submit_range.emplace(nvtx::Name::DecodeDFlashSubmit, nvtx::Category::DFlash,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable    = nullptr;
-        execution::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
+        execution::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
-                select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
+                select_graph_profile(graph_family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "DFlash batch");
-            executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
-            envelopes       = dflash_envelopes(profile.min_execution_frontier,
-                                               profile.max_execution_frontier, draft_window);
+            executable = &install_graph_profile(graph_family, profile, "DFlash/ngram batch");
+            envelopes =
+                dflash_envelopes(profile.min_execution_frontier, profile.max_execution_frontier);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
+                                     verify_drafts + 1ULL))};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -658,15 +825,19 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
+            const bool row_copy = any_ngram && !matches[row].tokens.empty();
             const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                std::min({row_copy ? static_cast<std::uint32_t>(matches[row].tokens.size())
+                                   : (drafter_runs ? neural_draft_window : 0U),
+                          max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
             dflash_host_ingress->context_frontiers[row] =
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
-            dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
-            dflash_host_ingress->proposal_extents[row]       = static_cast<std::int32_t>(extent);
+            dflash_host_ingress->proposal_valid_columns[row] =
+                static_cast<std::int32_t>(neural_draft_window + 1U);
+            dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             for (std::uint32_t column = 0; column < width; ++column) {
                 const std::uint32_t position = frontier + std::min(column, extent);
@@ -688,18 +859,20 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
         execution::DFlashBatchContext schedule_state{
             {device, tensor_parallel, parameters, work, state_images->linear(),
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             round_replay_records(verify_drafts), io, prefill_hidden, prefill_chunk,
+             proposal_head, fast_prefill_kernel},
             decoder->text_kv,
             *dflash,
-            *io.dflash_decode,
+            frame,
             *dflash_host_ingress,
             *dflash_host_egress,
             state_images->continuation_hidden_store()};
 
+        schedule_state.ngram                  = any_ngram;
+        schedule_state.neural_proposal_drafts = neural_draft_window;
         mark_workspace_usage(workspace_plan.dflash_round);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                       draft_window, envelopes, target_envelope, executable);
+                                       verify_drafts, envelopes, target_envelope, executable);
         submit_range.reset();
         timing.begin_wait();
         {
@@ -710,6 +883,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        const double share   = seconds / static_cast<double>(lanes.size());
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = active_sequence(lanes[row]);
             RequestControl& request       = requests[lanes[row]];
@@ -741,6 +915,16 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         1;
                 }
             }
+            if (any_ngram && !matches[row].tokens.empty()) {
+                request.speculative_stats.ngram_rounds += 1;
+                request.speculative_stats.ngram_drafted_tokens += extent;
+                request.speculative_stats.ngram_accepted_tokens += accepted_i;
+                if (matches[row].archived) {
+                    request.speculative_stats.ngram_archive_rounds += 1;
+                    request.speculative_stats.ngram_archive_drafted_tokens += extent;
+                    request.speculative_stats.ngram_archive_accepted_tokens += accepted_i;
+                }
+            }
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{
                                  .kind          = PendingKind::Speculative,
@@ -748,9 +932,11 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                  .base_S        = base_S,
                                  .prompt_tokens = 0,
                                  .produced      = static_cast<std::uint32_t>(count_i),
+                                 .verify_drafts = verify_drafts,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
+            request.timings.decode_share_seconds += share;
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(dflash_host_egress->licensed_tokens.data(),

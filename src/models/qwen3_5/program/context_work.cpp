@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -211,15 +212,31 @@ detail::PhysicalResources checked_resource_sum(detail::PhysicalResources left,
     };
 }
 
+namespace {
+
+std::string describe_resources(const detail::PhysicalResources& value) {
+    return "{lanes " + std::to_string(value.device.active_lanes) + ", state " +
+           std::to_string(value.device.state_slots) + ", main " +
+           std::to_string(value.device.main_kv_pages) + ", backend " +
+           std::to_string(value.device.backend_kv_pages) + ", host state " +
+           std::to_string(value.host.state_slots) + ", host KV bytes " +
+           std::to_string(value.host.kv_bytes) + "}";
+}
+
+} // namespace
+
 detail::PhysicalResources checked_resource_difference(detail::PhysicalResources value,
-                                                      detail::PhysicalResources removed) {
+                                                      detail::PhysicalResources removed,
+                                                      const char* site) {
     if (removed.device.active_lanes > value.device.active_lanes ||
         removed.device.state_slots > value.device.state_slots ||
         removed.device.main_kv_pages > value.device.main_kv_pages ||
         removed.device.backend_kv_pages > value.device.backend_kv_pages ||
         removed.host.state_slots > value.host.state_slots ||
         removed.host.kv_bytes > value.host.kv_bytes) {
-        throw std::logic_error("Qwen3.5 resource subtraction underflow");
+        throw std::logic_error(std::string("Qwen3.5 resource subtraction underflow at ") + site +
+                               ": " + describe_resources(value) + " - " +
+                               describe_resources(removed));
     }
     return detail::PhysicalResources{
         .device =
@@ -265,26 +282,26 @@ detail::PhysicalResources positive_resource_difference(detail::PhysicalResources
 
 execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
                                                                       std::uint32_t k,
-                                                                      std::uint32_t capacity) {
+                                                                      std::uint32_t capacity,
+                                                                      std::uint32_t next_k) {
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
     execution::MtpCausalAttentionEnvelopes out;
     out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
     out.batch         = out.target_verify;
-    for (std::uint32_t step = 0; step + 1 < k; ++step) {
+    for (std::uint32_t step = 0; step + 1 < next_k; ++step) {
         out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};
     }
     return out;
 }
 
-execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
-                                            std::uint32_t k) {
+execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier,
+                                            std::uint32_t max_frontier) {
     (void)min_frontier;
     return execution::DFlashEnvelopes{
-        .local  = {0, max_frontier},
-        .full   = {0, max_frontier},
-        .append = {0, k + 1},
+        .local = {0, max_frontier},
+        .full  = {0, max_frontier},
     };
 }
 

@@ -28,12 +28,15 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    float rope_yarn_factor             = 1.0F;
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    bool original_int8_prefill_kernel  = false;
+    bool original_nvfp4_prefill_kernel = false;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
@@ -47,15 +50,30 @@ struct ServeOptions {
     std::vector<int> devices{0};
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;
-    bool enable_vision      = false;
-    bool use_cuda_graph     = true;
-    bool allow_prefix_reuse = true;
+    bool enable_vision                     = false;
+    bool vision_offload                    = false;
+    std::uint32_t vision_max_merged_tokens = 32768;
+    bool use_cuda_graph                    = true;
+    bool allow_prefix_reuse                = true;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
+    // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).
+    bool tolerant_tool_calls = false;
     std::optional<std::uint32_t> default_thinking_budget;
+    // End-of-thinking message fed to the model when it hits the thinking budget; empty
+    // preserves the model's built-in control suffix.
+    std::string thinking_budget_message;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+    bool log_colours       = false; // --log-colours on|off: colour the console stats lines
+    // --log-stats-panel on|off: pin the session statistics beneath the console log (terminal only).
+    bool log_stats_panel = true;
+    // --usage-chunk-choice: emit the streaming usage chunk with a zero-delta choice instead of the
+    // OpenAI-conformant empty choices array. Strict client parsers (GitHub Copilot) reject the
+    // empty array as "Response contained no choices"; the extra choice is inert for other clients.
+    bool usage_chunk_choice = false;
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

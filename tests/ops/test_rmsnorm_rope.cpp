@@ -1,5 +1,7 @@
 #include "ninfer/ops/rmsnorm_rope.h"
 #include "core/decode_graph.h"
+#include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/rope.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -24,6 +26,18 @@ constexpr double kEpsilon      = 1.0e-6;
 constexpr double kTheta        = 1.0e7;
 constexpr double kRelativeL2   = 1.85e-3;
 constexpr double kPairRelative = 6.9e-3;
+
+// Text profile: wider head, narrower rotation, out of place.
+constexpr int kTextHeadDim   = 256;
+constexpr int kTextRotaryDim = 64;
+// The text profile normalizes over twice as many channels, so its FP32 reduction sits further
+// from the FP64 oracle than the D128 profile does. Both limits are the measured worst case over
+// the cases below with margin (relative L2 1.99e-3, pair ratio 1.17e-2). They are properties of
+// this route rather than of the fusion: the fused result is bit-identical to
+// rmsnorm -> rmsnorm -> rope, which the same limits therefore have to admit, and the test checks
+// that equality separately.
+constexpr double kTextRelativeL2   = 2.5e-3;
+constexpr double kTextPairRelative = 1.4e-2;
 
 struct OracleResult {
     std::vector<double> output;
@@ -60,7 +74,8 @@ std::vector<std::int32_t> make_positions(int tokens, int first_position) {
 // Independent FP64 oracle for the complete public formula. It does not call either standalone Op
 // or reproduce the production warp reduction, coefficient table, or range reduction.
 OracleResult fused_oracle(const std::vector<float>& input, const std::vector<float>& weight,
-                          const std::vector<std::int32_t>& positions, int heads) {
+                          const std::vector<std::int32_t>& positions, int heads,
+                          const ops::RopeScaling& scaling = {}) {
     const int tokens = static_cast<int>(positions.size());
     OracleResult result{
         .output     = std::vector<double>(input.size()),
@@ -83,11 +98,22 @@ OracleResult fused_oracle(const std::vector<float>& input, const std::vector<flo
             }
             for (int pair = 0; pair < kHeadDim / 2; ++pair) {
                 const double exponent = -2.0 * static_cast<double>(pair) / kHeadDim;
-                const double phase =
-                    static_cast<double>(positions[static_cast<std::size_t>(token)]) *
-                    std::pow(kTheta, exponent);
-                const double cosine = std::cos(phase);
-                const double sine   = std::sin(phase);
+                double frequency = std::pow(kTheta, exponent);
+                double attention = 1.0;
+                if (scaling.factor != 1.0F) {
+                    const double pi = std::acos(-1.0);
+                    const double low = std::max(0.0, std::floor(64.0 *
+                        std::log(scaling.original_max_positions / (64.0 * pi)) / std::log(kTheta)));
+                    double high = std::min(127.0, std::ceil(64.0 *
+                        std::log(scaling.original_max_positions / (2.0 * pi)) / std::log(kTheta)));
+                    if (low == high) { high += 0.001; }
+                    const double ramp = std::clamp((pair - low) / (high - low), 0.0, 1.0);
+                    frequency = (1.0 - ramp) * frequency + ramp * frequency / scaling.factor;
+                    attention = 1.0 + 0.1 * std::log(static_cast<double>(scaling.factor));
+                }
+                const double phase = positions[static_cast<std::size_t>(token)] * frequency;
+                const double cosine = attention * std::cos(phase);
+                const double sine   = attention * std::sin(phase);
                 const double first  = normalized[static_cast<std::size_t>(pair)];
                 const double second = normalized[static_cast<std::size_t>(pair + kHeadDim / 2)];
                 const double scale  = std::hypot(first, second);
@@ -105,7 +131,8 @@ OracleResult fused_oracle(const std::vector<float>& input, const std::vector<flo
 }
 
 int verify_profile(const std::string& label, const std::vector<double>& got,
-                   const OracleResult& expected) {
+                   const OracleResult& expected, double pair_relative = kPairRelative,
+                   double relative_l2_limit = kRelativeL2) {
     if (got.size() != expected.output.size() || got.size() != expected.pair_scale.size()) {
         std::cerr << label << ": result size mismatch\n";
         return 1;
@@ -121,7 +148,7 @@ int verify_profile(const std::string& label, const std::vector<double>& got,
         }
         const double error = std::abs(got[index] - expected.output[index]);
         const double scale = expected.pair_scale[index];
-        const double limit = kPairRelative * scale;
+        const double limit = pair_relative * scale;
         const double ratio = limit == 0.0
                                  ? (error == 0.0 ? 0.0 : std::numeric_limits<double>::infinity())
                                  : error / limit;
@@ -137,8 +164,9 @@ int verify_profile(const std::string& label, const std::vector<double>& got,
         reference_square_sum += expected.output[index] * expected.output[index];
     }
     const double relative_l2 = std::sqrt(error_square_sum / reference_square_sum);
-    if (relative_l2 > kRelativeL2) {
-        std::cerr << label << ": relative L2=" << relative_l2 << " exceeds " << kRelativeL2 << '\n';
+    if (relative_l2 > relative_l2_limit) {
+        std::cerr << label << ": relative L2=" << relative_l2 << " exceeds " << relative_l2_limit
+                  << '\n';
         ++violations;
     }
     if (error_stats_enabled()) {
@@ -177,7 +205,7 @@ void execute(Launch launch, Reset reset, bool graph) {
 }
 
 int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
-                  bool graph = false) {
+                  bool graph = false, const ops::RopeScaling& scaling = {}, bool scaled_api = false) {
     const int tokens              = width * batch;
     const std::size_t q_count     = static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens;
     const std::size_t k_count     = static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens;
@@ -186,8 +214,8 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
     const auto q_weight           = make_bf16_values(kHeadDim, seed + 2U, 0.25F, 1.75F);
     const auto k_weight           = make_bf16_values(kHeadDim, seed + 3U, 0.25F, 1.75F);
     const auto positions          = make_positions(tokens, first_position);
-    const OracleResult q_expected = fused_oracle(q, q_weight, positions, kQueryHeads);
-    const OracleResult k_expected = fused_oracle(k, k_weight, positions, kKeyHeads);
+    const OracleResult q_expected = fused_oracle(q, q_weight, positions, kQueryHeads, scaling);
+    const OracleResult k_expected = fused_oracle(k, k_weight, positions, kKeyHeads, scaling);
     const auto q_bits             = bf16_bits(q);
     const auto k_bits             = bf16_bits(k);
     const auto q_weight_bits      = bf16_bits(q_weight);
@@ -205,10 +233,16 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
     Tensor q_weight_tensor(q_weight_device.p, DType::BF16, {kHeadDim});
     Tensor k_weight_tensor(k_weight_device.p, DType::BF16, {kHeadDim});
     Tensor position_tensor(position_device.p, DType::I32, {width, batch});
+    const auto prepared = ops::prepare_rope(128, static_cast<float>(kTheta), scaling);
     execute(
         [&](cudaStream_t stream) {
-            ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, q_tensor, k_tensor,
-                              stream);
+            if (scaled_api) {
+                ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, prepared,
+                                  q_tensor, k_tensor, stream);
+            } else {
+                ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, q_tensor, k_tensor,
+                                  stream);
+            }
         },
         [&](cudaStream_t stream) {
             cuda_check(cudaMemcpyAsync(q_device.data(), q_bits.data(), q_device.bytes(),
@@ -227,6 +261,18 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
         verify_profile(label + " q", from_device_bf16(q_device.data(), q_count), q_expected);
     failures +=
         verify_profile(label + " k", from_device_bf16(k_device.data(), k_count), k_expected);
+    if (scaled_api && scaling.factor == 1.0F) {
+        const auto prepared_q = from_device<std::uint16_t>(q_device.data(), q_count);
+        const auto prepared_k = from_device<std::uint16_t>(k_device.data(), k_count);
+        q_device.copy_from_host(q_bits.data(), q_device.bytes());
+        k_device.copy_from_host(k_bits.data(), k_device.bytes());
+        ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, q_tensor, k_tensor, nullptr);
+        cuda_synchronize();
+        failures += verify_exact("prepared fused factor1 q identity",
+                                 from_device<std::uint16_t>(q_device.data(), q_count), prepared_q);
+        failures += verify_exact("prepared fused factor1 k identity",
+                                 from_device<std::uint16_t>(k_device.data(), k_count), prepared_k);
+    }
     failures += q_device.verify_guards(label + " q guards");
     failures += k_device.verify_guards(label + " k guards");
     failures +=
@@ -241,12 +287,13 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
     return failures;
 }
 
-int run_single_case(int tokens, int first_position, std::uint32_t seed, bool graph = false) {
+int run_single_case(int tokens, int first_position, std::uint32_t seed, bool graph = false,
+                    const ops::RopeScaling& scaling = {}, bool scaled_api = false) {
     const std::size_t count     = static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens;
     const auto input            = make_bf16_values(count, seed, -4.0F, 4.0F);
     const auto weight           = make_bf16_values(kHeadDim, seed + 1U, 0.25F, 1.75F);
     const auto positions        = make_positions(tokens, first_position);
-    const OracleResult expected = fused_oracle(input, weight, positions, kKeyHeads);
+    const OracleResult expected = fused_oracle(input, weight, positions, kKeyHeads, scaling);
     const auto input_bits       = bf16_bits(input);
     const auto weight_bits      = bf16_bits(weight);
 
@@ -257,9 +304,14 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
     Tensor input_tensor(input_device.data(), DType::BF16, {kHeadDim, kKeyHeads, tokens});
     Tensor weight_tensor(weight_device.p, DType::BF16, {kHeadDim});
     Tensor position_tensor(position_device.p, DType::I32, {tokens});
+    const auto prepared = ops::prepare_rope(128, static_cast<float>(kTheta), scaling);
     execute(
         [&](cudaStream_t stream) {
-            ops::rmsnorm_rope(position_tensor, weight_tensor, input_tensor, stream);
+            if (scaled_api) {
+                ops::rmsnorm_rope(position_tensor, weight_tensor, prepared, input_tensor, stream);
+            } else {
+                ops::rmsnorm_rope(position_tensor, weight_tensor, input_tensor, stream);
+            }
         },
         [&](cudaStream_t stream) {
             cuda_check(cudaMemcpyAsync(input_device.data(), input_bits.data(), input_device.bytes(),
@@ -272,6 +324,14 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
                               " T=" + std::to_string(tokens) +
                               " P=" + std::to_string(first_position);
     int failures = verify_profile(label, from_device_bf16(input_device.data(), count), expected);
+    if (scaled_api && scaling.factor == 1.0F) {
+        const auto prepared_bits = from_device<std::uint16_t>(input_device.data(), count);
+        input_device.copy_from_host(input_bits.data(), input_device.bytes());
+        ops::rmsnorm_rope(position_tensor, weight_tensor, input_tensor, nullptr);
+        cuda_synchronize();
+        failures += verify_exact("prepared fused factor1 single identity",
+                                 from_device<std::uint16_t>(input_device.data(), count), prepared_bits);
+    }
     failures += input_device.verify_guards(label + " guards");
     failures +=
         verify_exact((label + " positions").c_str(),
@@ -279,6 +339,199 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
     failures +=
         verify_exact((label + " weight").c_str(),
                      from_device<std::uint16_t>(weight_device, weight_bits.size()), weight_bits);
+    return failures;
+}
+
+std::size_t text_index(int heads, int token, int head, int dim) {
+    return (static_cast<std::size_t>(token) * heads + head) * kTextHeadDim + dim;
+}
+
+// Independent FP64 oracle for the text formula: RMSNorm over 256 channels, split-half rotation
+// over the first 64 channels, pass-through for the remaining 192.
+OracleResult text_oracle(const std::vector<float>& input, const std::vector<float>& weight,
+                         const std::vector<std::int32_t>& positions, int heads) {
+    const int tokens = static_cast<int>(positions.size());
+    OracleResult result{
+        .output     = std::vector<double>(input.size()),
+        .pair_scale = std::vector<double>(input.size()),
+    };
+    std::vector<double> normalized(kTextHeadDim);
+    for (int token = 0; token < tokens; ++token) {
+        for (int head = 0; head < heads; ++head) {
+            double sum_squares = 0.0;
+            for (int dim = 0; dim < kTextHeadDim; ++dim) {
+                const double value = input[text_index(heads, token, head, dim)];
+                sum_squares += value * value;
+            }
+            const double inverse =
+                1.0 / std::sqrt(sum_squares / static_cast<double>(kTextHeadDim) + kEpsilon);
+            for (int dim = 0; dim < kTextHeadDim; ++dim) {
+                // Offset epilogue: the stored weight is a delta around one.
+                normalized[static_cast<std::size_t>(dim)] =
+                    static_cast<double>(input[text_index(heads, token, head, dim)]) * inverse *
+                    (static_cast<double>(weight[static_cast<std::size_t>(dim)]) + 1.0);
+            }
+            for (int dim = kTextRotaryDim; dim < kTextHeadDim; ++dim) {
+                const std::size_t index  = text_index(heads, token, head, dim);
+                const double value       = normalized[static_cast<std::size_t>(dim)];
+                result.output[index]     = value;
+                result.pair_scale[index] = std::abs(value);
+            }
+            for (int pair = 0; pair < kTextRotaryDim / 2; ++pair) {
+                const double exponent = -2.0 * static_cast<double>(pair) / kTextRotaryDim;
+                const double phase =
+                    static_cast<double>(positions[static_cast<std::size_t>(token)]) *
+                    std::pow(kTheta, exponent);
+                const double cosine = std::cos(phase);
+                const double sine   = std::sin(phase);
+                const double first  = normalized[static_cast<std::size_t>(pair)];
+                const double second =
+                    normalized[static_cast<std::size_t>(pair + kTextRotaryDim / 2)];
+                const double scale            = std::hypot(first, second);
+                const std::size_t first_index = text_index(heads, token, head, pair);
+                const std::size_t second_index =
+                    text_index(heads, token, head, pair + kTextRotaryDim / 2);
+                result.output[first_index]      = first * cosine - second * sine;
+                result.output[second_index]     = second * cosine + first * sine;
+                result.pair_scale[first_index]  = scale;
+                result.pair_scale[second_index] = scale;
+            }
+        }
+    }
+    return result;
+}
+
+// One text case, with two independent verdicts on the same inputs:
+//   (a) the FP64 oracle, which says the Op computes the documented formula;
+//   (b) bit equality against rmsnorm -> rmsnorm -> rope, which says it computes it the same way
+//       the three calls it replaces do. (b) is the property a caller relies on when it swaps one
+//       for the other, and no tolerance can stand in for it.
+int run_text_case(int query_heads, int key_heads, int tokens, int first_position,
+                  std::uint32_t seed, bool graph = false) {
+    const std::size_t q_count     = static_cast<std::size_t>(kTextHeadDim) * query_heads * tokens;
+    const std::size_t k_count     = static_cast<std::size_t>(kTextHeadDim) * key_heads * tokens;
+    const auto q                  = make_bf16_values(q_count, seed, -4.0F, 4.0F);
+    const auto k                  = make_bf16_values(k_count, seed + 1U, -4.0F, 4.0F);
+    const auto q_weight           = make_bf16_values(kTextHeadDim, seed + 2U, 0.25F, 1.75F);
+    const auto k_weight           = make_bf16_values(kTextHeadDim, seed + 3U, 0.25F, 1.75F);
+    const auto positions          = make_positions(tokens, first_position);
+    const OracleResult q_expected = text_oracle(q, q_weight, positions, query_heads);
+    const OracleResult k_expected = text_oracle(k, k_weight, positions, key_heads);
+    const auto q_bits             = bf16_bits(q);
+    const auto k_bits             = bf16_bits(k);
+    const auto q_weight_bits      = bf16_bits(q_weight);
+    const auto k_weight_bits      = bf16_bits(k_weight);
+
+    DeviceBuffer q_in_device     = to_device(q_bits);
+    DeviceBuffer k_in_device     = to_device(k_bits);
+    DeviceBuffer q_weight_device = to_device(q_weight_bits);
+    DeviceBuffer k_weight_device = to_device(k_weight_bits);
+    DeviceBuffer position_device = to_device(positions);
+    GuardedDeviceBuffer q_out_device(q_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer k_out_device(k_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer q_split_device(q_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer k_split_device(k_count * sizeof(std::uint16_t));
+
+    Tensor q_in(q_in_device.p, DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor k_in(k_in_device.p, DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor q_weight_tensor(q_weight_device.p, DType::BF16, {kTextHeadDim});
+    Tensor k_weight_tensor(k_weight_device.p, DType::BF16, {kTextHeadDim});
+    Tensor position_tensor(position_device.p, DType::I32, {tokens});
+    Tensor q_out(q_out_device.data(), DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor k_out(k_out_device.data(), DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor q_split(q_split_device.data(), DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor k_split(k_split_device.data(), DType::BF16, {kTextHeadDim, key_heads, tokens});
+
+    execute(
+        [&](cudaStream_t stream) {
+            ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, q_in, k_in, q_out,
+                              k_out, stream);
+        },
+        [](cudaStream_t) {}, graph);
+
+    // The route this replaces, on the same inputs.
+    ops::rmsnorm(q_in, q_weight_tensor, static_cast<float>(kEpsilon), true, q_split, nullptr);
+    ops::rmsnorm(k_in, k_weight_tensor, static_cast<float>(kEpsilon), true, k_split, nullptr);
+    ops::rope(position_tensor, kTextRotaryDim, static_cast<float>(kTheta), q_split, k_split,
+              nullptr);
+    cuda_synchronize();
+
+    const std::string label = "rmsnorm_rope text Q=" + std::to_string(query_heads) +
+                              " K=" + std::to_string(key_heads) +
+                              " graph=" + std::to_string(graph) + " T=" + std::to_string(tokens) +
+                              " P=" + std::to_string(first_position);
+    int failures = verify_profile(label + " q", from_device_bf16(q_out_device.data(), q_count),
+                                  q_expected, kTextPairRelative, kTextRelativeL2);
+    failures += verify_profile(label + " k", from_device_bf16(k_out_device.data(), k_count),
+                               k_expected, kTextPairRelative, kTextRelativeL2);
+    failures += verify_exact((label + " q equals split route").c_str(),
+                             from_device<std::uint16_t>(q_out_device.data(), q_count),
+                             from_device<std::uint16_t>(q_split_device.data(), q_count));
+    failures += verify_exact((label + " k equals split route").c_str(),
+                             from_device<std::uint16_t>(k_out_device.data(), k_count),
+                             from_device<std::uint16_t>(k_split_device.data(), k_count));
+    failures += q_out_device.verify_guards(label + " q guards");
+    failures += k_out_device.verify_guards(label + " k guards");
+    failures += verify_exact((label + " q input unchanged").c_str(),
+                             from_device<std::uint16_t>(q_in_device, q_bits.size()), q_bits);
+    failures += verify_exact((label + " k input unchanged").c_str(),
+                             from_device<std::uint16_t>(k_in_device, k_bits.size()), k_bits);
+    failures +=
+        verify_exact((label + " positions").c_str(),
+                     from_device<std::int32_t>(position_device, positions.size()), positions);
+    return failures;
+}
+
+// A prefill chunk may be any positive multiple of 128, so the Op has to take widths far past the
+// ones the oracle can afford to check. Here the reference is the split route only: the FP64 oracle
+// already covers the arithmetic at the widths above, and what is at stake here is dispatch.
+int run_text_wide_case(int query_heads, int key_heads, int tokens, std::uint32_t seed) {
+    const std::size_t q_count = static_cast<std::size_t>(kTextHeadDim) * query_heads * tokens;
+    const std::size_t k_count = static_cast<std::size_t>(kTextHeadDim) * key_heads * tokens;
+    const auto q_bits         = bf16_bits(make_bf16_values(q_count, seed, -4.0F, 4.0F));
+    const auto k_bits         = bf16_bits(make_bf16_values(k_count, seed + 1U, -4.0F, 4.0F));
+    const auto q_weight_bits  = bf16_bits(make_bf16_values(kTextHeadDim, seed + 2U, 0.25F, 1.75F));
+    const auto k_weight_bits  = bf16_bits(make_bf16_values(kTextHeadDim, seed + 3U, 0.25F, 1.75F));
+    const auto positions      = make_positions(tokens, 0);
+
+    DeviceBuffer q_in_device     = to_device(q_bits);
+    DeviceBuffer k_in_device     = to_device(k_bits);
+    DeviceBuffer q_weight_device = to_device(q_weight_bits);
+    DeviceBuffer k_weight_device = to_device(k_weight_bits);
+    DeviceBuffer position_device = to_device(positions);
+    GuardedDeviceBuffer q_out_device(q_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer k_out_device(k_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer q_split_device(q_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer k_split_device(k_count * sizeof(std::uint16_t));
+
+    Tensor q_in(q_in_device.p, DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor k_in(k_in_device.p, DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor q_weight_tensor(q_weight_device.p, DType::BF16, {kTextHeadDim});
+    Tensor k_weight_tensor(k_weight_device.p, DType::BF16, {kTextHeadDim});
+    Tensor position_tensor(position_device.p, DType::I32, {tokens});
+    Tensor q_out(q_out_device.data(), DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor k_out(k_out_device.data(), DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor q_split(q_split_device.data(), DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor k_split(k_split_device.data(), DType::BF16, {kTextHeadDim, key_heads, tokens});
+
+    ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, q_in, k_in, q_out, k_out,
+                      nullptr);
+    ops::rmsnorm(q_in, q_weight_tensor, static_cast<float>(kEpsilon), true, q_split, nullptr);
+    ops::rmsnorm(k_in, k_weight_tensor, static_cast<float>(kEpsilon), true, k_split, nullptr);
+    ops::rope(position_tensor, kTextRotaryDim, static_cast<float>(kTheta), q_split, k_split,
+              nullptr);
+    cuda_synchronize();
+
+    const std::string label =
+        "rmsnorm_rope text wide Q=" + std::to_string(query_heads) + " T=" + std::to_string(tokens);
+    int failures = verify_exact((label + " q equals split route").c_str(),
+                                from_device<std::uint16_t>(q_out_device.data(), q_count),
+                                from_device<std::uint16_t>(q_split_device.data(), q_count));
+    failures += verify_exact((label + " k equals split route").c_str(),
+                             from_device<std::uint16_t>(k_out_device.data(), k_count),
+                             from_device<std::uint16_t>(k_split_device.data(), k_count));
+    failures += q_out_device.verify_guards((label + " q guards").c_str());
+    failures += k_out_device.verify_guards((label + " k guards").c_str());
     return failures;
 }
 
@@ -304,6 +557,29 @@ int main() {
     failures += run_single_case(64, 262'080, 0x2003U);
     failures += run_single_case(1024, 130'048, 0x2004U);
     failures += run_single_case(2048, 260'032, 0x2005U);
+
+    for (float factor : {1.0F, 1.5F, 2.0F, 4.0F}) {
+        for (int position : {0, 262143, 524288, 1048575}) {
+            failures += run_pair_case(2, 1, position, 0x4001U, false, {factor, 262144}, true);
+            failures += run_pair_case(16, 8, position, 0x4002U, true, {factor, 262144}, true);
+            failures += run_single_case(1, position, 0x4003U, false, {factor, 262144}, true);
+            failures += run_single_case(2048, position, 0x4004U, true, {factor, 262144}, true);
+        }
+    }
+    failures += run_single_case(8, 131071, 0x5001U, false, {4.0F, 32768}, true);
+
+    // Text profile: both registered head geometries, widths from one token to a prefill chunk,
+    // and both graph modes.
+    for (const int tokens : {1, 2, 3, 4, 7, 8, 16, 17, 64, 128, 129, 1024, 4096}) {
+        failures += run_text_case(16, 2, tokens, tokens == 1 ? 0 : 131'072, 0x3000U + tokens);
+        failures += run_text_case(24, 4, tokens, tokens == 1 ? 0 : 262'000, 0x4000U + tokens);
+    }
+    failures += run_text_case(16, 2, 4, 0, 0x3101U, true);
+    failures += run_text_case(24, 4, 16, 262'000, 0x4101U, true);
+    // Past the widths the FP64 oracle can afford, and past any ceiling of our own: a prefill
+    // chunk is only required to be a positive multiple of 128.
+    failures += run_text_wide_case(16, 2, 8320, 0x5001U);
+    failures += run_text_wide_case(24, 4, 16384, 0x5002U);
 
     if (failures != 0) {
         std::cerr << "rmsnorm_rope failures=" << failures << '\n';

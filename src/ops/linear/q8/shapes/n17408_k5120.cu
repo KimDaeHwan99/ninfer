@@ -3,23 +3,28 @@
 
 namespace ninfer::ops::detail {
 namespace {
+// The Q8 MTP row-split projection. Same K as the 14336-row input projection, and the same
+// token ladder and schedules the fork measured for it on the old K-split templates.
 using Geometry = Q8N17408K5120;
 using Access   = Q8ScaleAccess;
 using Stage    = Q8ActivationStage;
 using C4 =
-    Q8A16SlicedKMmaSchedule<8, 4, 1, 2, Access::Direct, Cache::ca, Cache::cg, Stage::PaddedZero>;
+    Q8A16SlicedKMmaSchedule<8, 8, 1, 3, Access::Direct, Cache::ca, Cache::cg, Stage::RuntimeActive>;
 using C8 =
-    Q8A16SlicedKMmaSchedule<8, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using C16 =
-    Q8A16SlicedKMmaSchedule<16, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using C24 =
-    Q8A16SlicedKMmaSchedule<24, 8, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using C32 = Q8A16SlicedKMmaSchedule<32, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg,
+    Q8A16SlicedKMmaSchedule<8, 4, 1, 3, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
+// Bound registers to allow six resident 128-thread CTAs per SM.
+using C16 = Q8A16SlicedKMmaSchedule<16, 4, 1, 6, Access::Shared, Cache::ca, Cache::cg,
                                     Stage::RuntimeActive>;
-using C40 = Q8A16SlicedKMmaSchedule<40, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg,
+using C24 = Q8A16SlicedKMmaSchedule<24, 8, 1, 3, Access::Shared, Cache::ca, Cache::cg,
                                     Stage::RuntimeActive>;
-using C56 =
-    Q8A16SlicedKMmaSchedule<56, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
+using C32 = Q8A16SlicedKMmaSchedule<32, 4, 1, 3, Access::Shared, Cache::ca, Cache::cg,
+                                    Stage::RuntimeActive>;
+using C40 = Q8A16SlicedKMmaSchedule<40, 4, 1, 3, Access::Shared, Cache::ca, Cache::cg,
+                                    Stage::RuntimeActive>;
+using C48 = Q8A16SlicedKMmaSchedule<48, 4, 1, 3, Access::Shared, Cache::ca, Cache::cg,
+                                    Stage::RuntimeActive>;
+using C56 = Q8A16SlicedKMmaSchedule<56, 4, 1, 3, Access::Shared, Cache::ca, Cache::cg,
+                                    Stage::RuntimeActive>;
 } // namespace
 
 Q8Launch select_q8_n17408_k5120(std::int32_t tokens) {
@@ -29,9 +34,9 @@ Q8Launch select_q8_n17408_k5120(std::int32_t tokens) {
     if (tokens <= 24) return launch_q8_a16_sliced<Geometry, 24, C24>;
     if (tokens <= 32) return launch_q8_a16_sliced<Geometry, 32, C32>;
     if (tokens <= 40) return launch_q8_a16_sliced<Geometry, 40, C40>;
-    if (tokens <= 48) return launch_q8_a16_mma_r64x16_t48_k128_a1;
+    if (tokens <= 48) return launch_q8_a16_sliced<Geometry, 48, C48>;
     if (tokens <= 56) return launch_q8_a16_sliced<Geometry, 56, C56>;
-    if (tokens <= 64) return launch_q8_a16_mma_r128_t64;
+    if (tokens <= 64) return launch_q8_a16_mma_r32_t64;
     return launch_q8_a16_mma_r64_t128;
 }
 

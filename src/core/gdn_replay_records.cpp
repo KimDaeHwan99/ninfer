@@ -122,6 +122,41 @@ GdnReplayRecords::GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayo
     validate_layout(layout);
 }
 
+GdnReplayRecords GdnReplayRecords::narrowed(std::int32_t width) const {
+    validate_spec(spec);
+    if (width <= 0 || width > spec.width) {
+        throw std::invalid_argument("GDN replay narrowed width must be in [1,spec.width]");
+    }
+    for (const Tensor* plane : {&conv, &key, &value, &gate}) {
+        if (plane->data == nullptr || !plane->is_contiguous()) {
+            throw std::invalid_argument("GDN replay narrowed view requires bound dense planes");
+        }
+    }
+    const std::int32_t outer = checked_outer_extent(spec);
+    GdnReplayRecords result;
+    result.spec       = spec;
+    result.spec.width = width;
+    result.conv       = Tensor(conv.data, DType::BF16, {spec.conv_channels, width, outer});
+    result.key   = Tensor(key.data, DType::BF16, {spec.key_dim, spec.qk_heads, width, outer});
+    result.value = Tensor(value.data, DType::BF16, {spec.value_dim, spec.value_heads, width, outer});
+    result.gate  = Tensor(gate.data, DType::FP32, {2, spec.value_heads, width, outer});
+    return result;
+}
+
+GdnReplayRecordLayer GdnReplayRecordLayer::single_row_prefix(std::int32_t width) const {
+    if (width <= 0 || width > conv.ne[1] || conv.ne[2] != 1 || conv.ne[3] != 1 ||
+        !conv.is_contiguous()) {
+        throw std::invalid_argument("GDN replay prefix requires one packed row and a valid width");
+    }
+    for (const Tensor* tensor : {&key, &value, &gate}) {
+        if (tensor->ne[2] != conv.ne[1] || tensor->ne[3] != 1 || !tensor->is_contiguous()) {
+            throw std::invalid_argument("GDN replay prefix planes do not match the packed row");
+        }
+    }
+    return {conv.slice(1, 0, width), key.slice(2, 0, width), value.slice(2, 0, width),
+            gate.slice(2, 0, width)};
+}
+
 GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int32_t rows) const {
     validate_spec(spec);
     if (layer_index < 0 || layer_index >= spec.layers) {

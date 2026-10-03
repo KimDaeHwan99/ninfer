@@ -8,6 +8,7 @@ namespace ninfer::models::qwen3_5 {
 struct RuntimeTypes {
     using Frontend                   = qwen3_5::Frontend;
     using PreparedPrompt             = qwen3_5::PreparedPrompt;
+    using NgramArchive               = qwen3_5::NgramArchive;
     using OutputSession              = qwen3_5::OutputSession;
     using PublishedOutput            = qwen3_5::PublishedOutput;
     using SequencePlanner            = qwen3_5::SequencePlanner;
@@ -28,6 +29,7 @@ struct RuntimeTypes {
     using AssessedPressureTarget     = qwen3_5::AssessedPressureTarget;
     using CapturePressurePlan        = qwen3_5::CapturePressurePlan;
     using MaterializationResult      = qwen3_5::MaterializationResult;
+    using HybridAdmissionQuote       = qwen3_5::HybridAdmissionQuote;
     using ContextTransactionProgress = qwen3_5::ContextTransactionProgress;
     using CaptureAssessment          = qwen3_5::CaptureAssessment;
     using ActiveCaptureResult        = qwen3_5::ActiveCaptureResult;

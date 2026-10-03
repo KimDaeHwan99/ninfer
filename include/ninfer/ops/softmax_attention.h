@@ -13,11 +13,19 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
+inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
 
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
+    // Run prompt-route launches over an INT8-G64 or NVFP4-G16 cache on the fast prompt kernel
+    // (each warp keeps its query rows, scores and output in registers; FP16 per-tile PV
+    // accumulation; NVFP4 also decodes V in registers and runs QK on block-scaled FP4 Tensor Cores
+    // with a two-term NVFP4 Q) instead of the storage's tiled kernel. NVFP4 takes it only over more
+    // than 2048 visible keys. Other routes and cache formats ignore it, and it never changes the
+    // route. Over NVFP4 it can change the workspace: the fast kernel may split a single-row launch's
+    // keys across CTAs, so workspace planning and execution must use the same hint.
+    bool fast_prompt_kernel = false;
 };
 
 struct ContextAttentionExecutionEnvelope {
@@ -155,6 +163,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      const PagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
                                      WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+
+/**
+ * Return the prompt-route width granule of one registered head geometry on the current device.
+ * A single-sequence call whose width is a multiple of the granule launches whole waves of fast
+ * prompt-kernel CTAs, so a caller that splits a long prompt into such calls leaves no SM idle behind
+ * a partial wave. The granule is a positive multiple of 128 tokens.
+ */
+[[nodiscard]] std::int32_t
+causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry);
 
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
