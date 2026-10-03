@@ -437,8 +437,6 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
         instance->program = models::qwen3_5::create_program(
             instance->parameters, std::move(sequence), device, options.startup_observer);
     }
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer);
     LoadSummary::PrefixCacheRestore restore;
     if (resolved.context_cache.enabled && resolved.context_cache.mode == ContextCacheMode::Hybrid) {
         instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
