@@ -11,7 +11,9 @@
 //   row-parallel (columns kept):  attention/GDN output, MLP down; the rank's partial products are
 //                                 summed by the residual all-reduce.
 //   channel-split (columns kept): GDN convolution, whose channels are Q | K | V sections.
-//   replicated:                   norms, token embedding, MTP input projection, proposal ids.
+//   replicated:                   norms, token embedding, MTP input projection, proposal ids; the
+//                                 DFlash2 drafter and, with a drafter, the proposal head (each
+//                                 rank drafts the same candidates from its replicated hidden).
 // Head-aligned row ranges keep every split exact; nothing is repacked.
 #include "models/qwen3_5/load/bindings.h"
 
@@ -81,6 +83,12 @@ ParameterSplit split_for(const std::string& name, const Shape& shape, const Conf
     const auto replicated = ParameterSplit{};
     const auto& text      = full.text;
     if (name.starts_with("vision/")) { return replicated; }
+    // The drafter is small and reads only the replicated residual stream: both ranks run it whole,
+    // so drafting needs no exchange and gives the same candidates on each rank.
+    if (name.starts_with("dflash2/") || name.starts_with("dflash/")) { return replicated; }
+    if (full.draft && (name == "proposal/head" || name == "proposal/token_ids")) {
+        return replicated;
+    }
     if (ends_with(name, "/attention/query") || ends_with(name, "/attention/gate")) {
         return rows(text.attention->num_attention_heads, text.attention->head_dim);
     }
@@ -336,7 +344,7 @@ Config shard_config(const Config& full, TensorParallelPlacement tp) {
     }
     // Vision stays whole on both ranks: each rank encodes the same media into its replicated
     // hidden state, so the text layers see identical inputs without a cross-GPU transfer.
-    if (full.draft) { throw ArtifactError("tensor parallel: DFlash drafts are not split"); }
+    // A DFlash2 drafter stays whole (split_for); its config is the full one.
     Config out          = full;
     auto& attention     = *out.text.attention;
     auto& gdn           = *out.text.gdn;

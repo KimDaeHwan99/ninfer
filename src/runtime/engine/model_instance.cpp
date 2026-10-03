@@ -71,9 +71,15 @@ void validate_options(const EngineOptions& options) {
             throw std::invalid_argument(
                 "Engine tensor_parallel 2 needs two distinct devices led by the primary device");
         }
-        if (options.speculative.backend != SpeculativeBackend::None &&
-            options.speculative.backend != SpeculativeBackend::Mtp) {
-            throw std::invalid_argument("tensor-parallel execution supports MTP speculation only");
+        if (options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw std::invalid_argument(
+                "tensor-parallel execution supports MTP and DFlash2 speculation only");
+        }
+        // The DFlash2 drafter runs whole on both ranks and drafts through the replicated
+        // proposal head; its full-head path would read the vocabulary-split output head.
+        if (options.speculative.backend == SpeculativeBackend::DFlash2 &&
+            options.speculative.proposal_head != ProposalHead::Optimized) {
+            throw std::invalid_argument("tensor-parallel DFlash2 requires --lm-head-draft");
         }
         if (options.context_cache.enabled &&
             options.context_cache.mode == ContextCacheMode::Hybrid &&
