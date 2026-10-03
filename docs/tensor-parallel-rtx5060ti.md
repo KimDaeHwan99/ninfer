@@ -8,14 +8,15 @@ The branch was written by **Claude Opus 5.5 (medium reasoning effort)** in Claud
 operator set the goals, approved each production change and ran the server. Every commit carries a
 `Co-Authored-By: Claude Opus 5.5` trailer.
 
-> 한국어 요약 (2026-10-03 갱신): RTX 5060 Ti 16GB 두 장(P2P 없음)에서 Qwen3.8-27B를 텐서 병렬로
-> 서빙하는 브랜치입니다. 모든 코드는 Claude Code의 Claude Opus 5.5가 작성했습니다. 현재 권장 구성은
-> QUASAR-QAT 전체 NVFP4 아티팩트 + MTP(드래프트 4) + n-gram 복사 드래프트 + hybrid prefix 캐시입니다. 공식
-> 아티팩트 구성 대비 코드 생성 94.9 → 117 tok/s, 한국어 67.6 → 73~85, 1.6만/3.1만 토큰 첫 응답 2.70/5.71 →
-> 2.37/5.19초, 짧은 요청 첫 응답 0.10 → 0.06~0.08초, 파일을 거의 그대로 다시 쓰는 편집 128 → 396 tok/s,
-> 여러 대화를 번갈아 이어갈 때 첫 응답 0.125 → 0.041초, KV 용량 114K → 223K 토큰입니다. 품질은
-> GSM8K 200문항(193~196 대 195)과 MMLU-Pro 210문항(175 대 172)에서 같은 수준입니다. 아래
-> "2026-10-03 update"에 측정과 근거가 있고, 그 아래 절들은 공식 아티팩트 시절의 기록입니다.
+> 한국어 요약 (2026-10-03 최종): RTX 5060 Ti 16GB 두 장(P2P 없음)에서 Qwen3.8-27B를 텐서 병렬로
+> 서빙하는 브랜치입니다. 모든 코드는 Claude Code의 Claude Opus 5.5가 작성했습니다. 권장 구성은
+> QUASAR-QAT 전체 NVFP4 아티팩트 + MTP(드래프트 4) + n-gram 복사 드래프트 + hybrid prefix 캐시입니다.
+> 최종 측정(라우터 경유, 공식 아티팩트 구성 대비): 코드 생성 94.9 → 117~120 tok/s, 한국어 67.6 → 76~78,
+> 1.6만/3.1만 토큰 첫 응답 2.70/5.71 → 2.38/5.20초, 짧은 요청 첫 응답 0.10 → 0.05~0.10초, 파일을 거의
+> 그대로 다시 쓰는 편집 128 → 379 tok/s, 대화 재개 첫 응답 0.125 → 0.055초, 동시 4요청 합계
+> 264 → 300 tok/s, KV 용량 114K → 223K 토큰. 품질은 GSM8K 100문항 98, MMLU-Pro 210문항 174(공식
+> 아티팩트 172)로 같은 수준입니다. 아래 "2026-10-03 update"에 측정과 근거가 있고, 그 아래 절들은
+> 공식 아티팩트 시절의 기록입니다.
 
 ## 2026-10-03 update
 
@@ -49,6 +50,11 @@ What changed, each measured on the machine below against the previous production
 | `ninfer-serve` exits with status 2 after an Engine-wide failure | A container restart policy now reloads a dead engine. |
 | `--draft-tokens 4` instead of 3 (with QUASAR and the two-width families) | Three interleaved runs per setting: greedy code 102-106 → 117-120 tok/s, Korean 74.5-75.5 → 73.2-75.9, sampled essay mean 91.1 → 89.8 (−1.4 %, within the run-to-run spread of 84-96), copy edits 388 → 379-386, GSM8K 100 at four parallel requests 96 → 97 correct in 115 → 112 s. Five drafts were no faster than four on code and slower on Korean and copy edits. The older `--draft-tokens 3` advice below predates QUASAR and the two-width families. |
 | DFlash2 at `--tp 2` (replicated drafter) | Works (official artifact: code +31 %, copy edits +65 % over MTP3), but not recommended here: with QUASAR the grafted drafter accepts fewer drafts (Korean 12 % vs 20 %) and costs 60 % of the KV pool. |
+
+Final measurement of the recommended configuration (2026-10-03, through the router, three runs):
+greedy code 117.1-119.6 tok/s, Korean 76.3-77.5, sampled essay mean 89.4, 16K/31K first token
+2.38/5.20 s, copy edits 379 tok/s, resumed conversation 0.055 s, parallel sampled requests
+1/2/4 -> 107.5/165.1/300.2 tok/s aggregate, GSM8K 100 98, MMLU-Pro 210 174.
 
 Quality of the recommended configuration: GSM8K 200 (zero-shot, greedy) 193-196 against 195 for the
 previous production; MMLU-Pro 210 (15 per category, thinking budget 2048) 175 against 172 for the
