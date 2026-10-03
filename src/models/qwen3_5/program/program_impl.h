@@ -6,10 +6,12 @@
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_tree.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/speculative/tree_width_controller.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
@@ -435,6 +437,19 @@ struct DecodeGraphFamily {
     std::vector<DecodeGraphTopology> topologies;
 };
 
+// A speculative round family (see SpeculativeRoundShape) and its captured graphs.
+struct SpeculativeRoundFamily {
+    SpeculativeRoundShape shape;
+    DecodeGraphFamily graphs;
+};
+
+// ReplaySSM records viewed densely at a width narrower than the frame's, with the fold bound to
+// that view. Rounds verified at the narrower width record and fold only through it.
+struct NarrowReplayView {
+    GdnReplayRecords records;
+    ops::GdnReplayFoldPlan fold;
+};
+
 // Target model continuation for one logical sequence. This state remains meaningful after the
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
@@ -530,6 +545,9 @@ struct RequestControl {
         std::uint32_t base                  = 0;
         std::uint32_t cursor                = 0;
         std::uint32_t prompt_tokens         = 0;
+        // Tokens left in the prefill chunk under way: one service unit, which Concurrent steps
+        // may finish over several steps. Zero between chunks.
+        std::uint32_t chunk_remaining       = 0;
         std::uint32_t initial_mtp_extent    = 0;
         double elapsed_seconds              = 0.0;
         bool prepare_mtp                    = false;
@@ -590,8 +608,8 @@ public:
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
-                                                  std::uint32_t first_target);
+    [[nodiscard]] ScoreResult causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
+                                           const ScoreOptions& options);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -630,7 +648,8 @@ public:
     [[nodiscard]] bool try_claim_seal_window() noexcept;
     void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
-                                                  runtime::ExecutionTiming* failed_timing);
+                                                  runtime::ExecutionTiming* failed_timing,
+                                                  runtime::PrefillStepWidth width);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -760,9 +779,17 @@ public:
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
-    const bool fast_prefill_kernel;
+    // Widest Concurrent prefill step (at most prefill_chunk).
+    const std::uint32_t concurrent_prefill_chunk;
+    const PromptAttention prompt_attention;
     const std::uint32_t draft_window;
     const std::uint32_t neural_draft_window;
+    // DFlash2 tree verification: the tree widths each batch size may verify and the most
+    // root-to-leaf paths a tree row holds. In automatic mode tree_controller picks each
+    // all-neural round's width.
+    const TreeWidthPlan tree_widths;
+    const std::uint32_t draft_tree_paths;
+    std::optional<TreeWidthController> tree_controller;
     const std::uint32_t ngram_draft_window;
     const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;
@@ -795,11 +822,9 @@ public:
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
-    // When the DFlash neural and ngram windows differ, rounds of the narrower family verify at
-    // their own width for every batch size. They record ReplaySSM transitions through a dense
-    // narrowed view of the same record storage and are replayed by the matching fold plan.
-    std::optional<GdnReplayRecords> narrow_replay_records;
-    std::optional<ops::GdnReplayFoldPlan> narrow_replay_fold;
+    // One view per round-family width below draft_window: rounds of a narrower family verify at
+    // their own width for every batch size and record/fold through the dense view of that width.
+    std::vector<NarrowReplayView> narrow_replay_views;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
@@ -816,9 +841,9 @@ public:
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
 
     DecodeGraphFamily ordinary_graphs;
-    DecodeGraphFamily mtp_graphs;
-    DecodeGraphFamily dflash_graphs;
-    DecodeGraphFamily ngram_graphs;
+    // Speculative round families in plan order; fixed after construction, so references into it
+    // stay valid.
+    std::vector<SpeculativeRoundFamily> round_families;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -1241,7 +1266,8 @@ private:
                         MaterializationTransaction& transaction);
     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
     [[nodiscard]] runtime::PrefillStepResult
-    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing);
+    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing,
+                        runtime::PrefillStepWidth width);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
                runtime::ExecutionTiming* failed_timing);
@@ -1477,7 +1503,7 @@ private:
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
-                    runtime::ExecutionTiming* failed_timing);
+                    runtime::ExecutionTiming* failed_timing, runtime::PrefillStepWidth width);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
@@ -1486,6 +1512,9 @@ private:
     // ReplaySSM record view and fold plan for a speculative round verified at verify_drafts.
     [[nodiscard]] const GdnReplayRecords* round_replay_records(std::uint32_t verify_drafts) const;
     [[nodiscard]] const ops::GdnReplayFoldPlan& round_replay_fold(std::uint32_t verify_drafts) const;
+    // The narrowest family of `kind` that verifies at least `drafts` proposals per row.
+    [[nodiscard]] SpeculativeRoundFamily& round_family(SpeculativeRoundKind kind,
+                                                       std::uint32_t drafts = 0);
     [[nodiscard]] std::vector<NgramProposer::Match>
     propose_ngram(std::span<const std::uint32_t> lanes,
                   std::span<const runtime::RoundBudget> budgets);

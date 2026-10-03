@@ -590,8 +590,9 @@ void HybridPrefixCache::submit_restore() {
         }
         return event;
     };
-    // Prelude: what activation reads (the snapshot tail) and what a pass reads outside the layer
-    // stack (backend KV, the continuation hidden, DFlash local state).
+    // Prelude: what activation reads (the snapshot tail), what a pass reads outside the layer
+    // stack (backend KV, the continuation hidden, DFlash local state) and the StateImage's VQ KV
+    // window (the rest of the image, landed whole before the pass starts).
     enqueue_from_host(restore_.tail_copies, restore_stream_);
     if (!restore_.copies.backend_pages.empty()) {
         backend_pages_->physical_pool().copy_from_host_records(

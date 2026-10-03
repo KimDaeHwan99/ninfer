@@ -14,6 +14,7 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/vq2/launch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -27,7 +28,8 @@ namespace {
 
 constexpr std::int32_t kHeadDim             = 256;
 constexpr float kExpectedScale              = 0.0625f;
-constexpr std::int32_t kMaximumVerifyTokens = 16;
+// The widest verification a multi-request call admits (an ngram copy round of 63 drafts).
+constexpr std::int32_t kMaximumVerifyTokens = 64;
 constexpr std::int32_t kMaximumBatchSize    = 8;
 // Query rows of one eight-warp fast INT8 prompt CTA (int8/fast_tiled_launch.cuh checks it).
 constexpr std::int32_t kPromptWaveRows = 128;
@@ -308,6 +310,10 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width,
                                                 envelope);
 
+    if (kv_storage_has_exact_window(cache_storage))
+        return detail::vq_kv_workspace_bytes(q_heads, geometry.kv_heads, batch_size, min_width,
+                                             max_width, envelope);
+
     return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope);
 }
 
@@ -315,6 +321,17 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
+                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                              Tensor& out, cudaStream_t stream) {
+    causal_softmax_attention(q, k, v, positions, valid_columns, kv_table_rows, Tensor{}, geometry,
+                             scale, cache, envelope, workspace, out, stream);
+}
+
+void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              const Tensor& positions, const Tensor& valid_columns,
+                              const Tensor& kv_table_rows, const Tensor& tree_masks,
+                              AttentionHeadGeometry geometry, float scale,
+                              PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "causal_softmax_attention";
@@ -330,33 +347,51 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
+    if (tree_masks.data != nullptr) {
+        if (tree_masks.dtype != DType::I32 || width < 2 || width > 32 ||
+            valid_columns.data == nullptr) {
+            throw std::invalid_argument(std::string(op) +
+                                        ": tree masks must be I32 with 2<=W<=32 and valid columns");
+        }
+        require_shape(tree_masks, width, batch, 1, 1, op, "tree masks");
+        require_contiguous_nonnull(tree_masks, op, "tree masks");
+    }
 
     if (cache.storage == KvCacheStorage::BFloat16) {
-        detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                         cache, envelope, workspace, out, stream);
+        detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                         tree_masks, scale, cache, envelope, workspace, out,
+                                         stream);
         return;
     }
 
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
-        detail::fp8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, envelope, workspace, out, stream);
+        detail::fp8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                        tree_masks, scale, cache, envelope, workspace, out, stream);
         return;
     }
 
     if (cache.storage == KvCacheStorage::Int8Group64) {
-        detail::int8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                         cache, envelope, workspace, out, stream);
+        detail::int8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                         tree_masks, scale, cache, envelope, workspace, out,
+                                         stream);
         return;
     }
 
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
-        detail::nvfp4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                          cache, envelope, workspace, out, stream);
+        detail::nvfp4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                          tree_masks, scale, cache, envelope, workspace, out,
+                                          stream);
         return;
     }
 
-    detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                                     envelope, workspace, out, stream);
+    if (kv_storage_has_exact_window(cache.storage)) {
+        detail::vq_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                       tree_masks, scale, cache, envelope, workspace, out, stream);
+        return;
+    }
+
+    detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, tree_masks,
+                                     scale, cache, envelope, workspace, out, stream);
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
@@ -388,6 +423,12 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         detail::nvfp4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
                                           stream);
+        return;
+    }
+
+    if (kv_storage_has_exact_window(cache.storage)) {
+        detail::vq_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                       stream);
         return;
     }
 

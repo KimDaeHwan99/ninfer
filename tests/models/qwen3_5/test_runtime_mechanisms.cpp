@@ -131,6 +131,31 @@ void test_decoder_layout() {
                k8v4.mtp_kv &&
                k8v4.mtp_kv->payload_bytes() == (k8_vector_bytes + v4_vector_bytes) * mtp_vectors,
            "K8V4 Text/MTP asymmetric physical payload bytes");
+
+    // Vector-quantized formats: compact code planes with one FP16 row scale. Their exact
+    // recent-key window is sequence state (StateImage), not part of the page pool.
+    for (const auto storage :
+         {ninfer::KvCacheStorage::Vq2, ninfer::KvCacheStorage::Q4KeyVq2Value}) {
+        ninfer::LayoutBuilder vq_builder;
+        const q36::DecoderStateSpec spec = decoder_spec(storage, true);
+        const q36::DecoderStateLayout vq = q36::plan_decoder_state(vq_builder, spec);
+        (void)vq_builder.finish(256);
+        const int key_bytes = storage == ninfer::KvCacheStorage::Vq2 ? 64 : 128;
+        expect(vq.text_kv.pages.planes.size() == 8 &&
+                   vq.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::U8 &&
+                   vq.text_kv.pages.planes[0].geometry.leading_extent == key_bytes &&
+                   vq.text_kv.pages.planes[1].geometry.leading_extent == 64 &&
+                   vq.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+                   vq.text_kv.pages.planes[2].geometry.leading_extent == 1 &&
+                   vq.text_kv.pages.planes[3].geometry.leading_extent == 1,
+               "vector-quantized Text KV has code planes and FP16 row-scale planes");
+        expect(vq.text_kv.payload_bytes() ==
+                       static_cast<std::size_t>(key_bytes + 2 + 64 + 2) * text_vectors &&
+                   vq.mtp_kv &&
+                   vq.mtp_kv->payload_bytes() ==
+                       static_cast<std::size_t>(key_bytes + 2 + 64 + 2) * mtp_vectors,
+               "vector-quantized Text/MTP physical payload bytes");
+    }
 }
 
 void test_round_layout() {
@@ -252,11 +277,7 @@ void test_round_layout() {
            "MTP wide copy frame allocates at most four neural AR steps");
     for (std::uint32_t k = 1; k <= 15; ++k) {
         for (std::uint32_t next_k = 1; next_k <= 5; ++next_k) {
-            const auto& base_frame = *mtp_copy.mtp_decode;
-            const auto frame       = base_frame.current_drafts.ne[0] == static_cast<int>(k) &&
-                                       base_frame.next_drafts.ne[1] == static_cast<int>(next_k)
-                                         ? base_frame
-                                         : base_frame.narrowed(k, next_k);
+            const auto frame = mtp_copy.mtp_decode->narrowed(k, next_k);
             expect(frame.target_logits.ne[1] == static_cast<int>(k + 1) &&
                        frame.current_drafts.ne[0] == static_cast<int>(k) &&
                        frame.alignment_ids.ne[0] == static_cast<int>(k + 1) &&
@@ -277,31 +298,36 @@ void test_round_layout() {
         } catch (const std::invalid_argument&) { rejected = true; }
         expect(rejected, "MTP invalid verify/proposal frame width rejected");
     }
-    // A batched frame narrows densely: an MTP round verifies at the neural width on a frame
-    // allocated at the ngram width, for every row count.
-    ninfer::LayoutBuilder batched_builder;
-    auto batched_layout = q36::begin_round_state_layout(
-        batched_builder, {.hidden         = 32,
-                          .output_rows    = 128,
-                          .batch_capacity = 4,
-                          .draft_window   = 15,
-                          .backend        = ninfer::SpeculativeBackend::Mtp});
-    q36::complete_round_state_layout(batched_builder, batched_layout);
-    const auto batched_bytes = batched_builder.finish(256);
-    std::vector<std::byte> batched_storage(batched_bytes + 255);
-    const auto batched_address =
-        (reinterpret_cast<std::uintptr_t>(batched_storage.data()) + 255) & ~std::uintptr_t(255);
-    q36::RoundState batched({reinterpret_cast<void*>(batched_address), batched_bytes},
-                            batched_layout);
-    const auto narrow = batched.mtp_decode->narrowed(3, 3);
-    expect(narrow.target_logits.ne[1] == 4 && narrow.target_logits.ne[2] == 4 &&
-               narrow.target_logits.is_contiguous() && narrow.verify_ids.ne[0] == 4 &&
-               narrow.verify_ids.ne[1] == 4 && narrow.current_drafts.ne[0] == 3 &&
-               narrow.current_drafts.ne[1] == 4 &&
-               narrow.target_logits.slice(2, 0, 2).is_contiguous() &&
-               narrow.next_drafts.ne[1] == 3 && narrow.next_drafts.slice(0, 0, 2).ne[0] == 2 &&
-               narrow.ar_positions.ne[1] == 2,
-           "MTP batched frame narrows to a dense neural-width view");
+    // Above one request the narrowed MTP frame stays a dense [k+1,C] view of the native storage,
+    // and the step-major proposal tensors keep their row stride.
+    ninfer::LayoutBuilder mtp_batch_builder;
+    auto mtp_batch_layout = q36::begin_round_state_layout(
+        mtp_batch_builder, {.hidden         = 32,
+                            .output_rows    = 128,
+                            .batch_capacity = 3,
+                            .draft_window   = 15,
+                            .backend        = ninfer::SpeculativeBackend::Mtp});
+    q36::complete_round_state_layout(mtp_batch_builder, mtp_batch_layout);
+    const auto mtp_batch_bytes = mtp_batch_builder.finish(256);
+    std::vector<std::byte> mtp_batch_storage(mtp_batch_bytes + 255);
+    const auto mtp_batch_address =
+        (reinterpret_cast<std::uintptr_t>(mtp_batch_storage.data()) + 255) & ~std::uintptr_t(255);
+    q36::RoundState mtp_batch({reinterpret_cast<void*>(mtp_batch_address), mtp_batch_bytes},
+                              mtp_batch_layout);
+    for (const auto [k, next_k] :
+         std::vector<std::pair<unsigned, unsigned>>{{3, 3}, {7, 3}, {15, 3}, {5, 5}}) {
+        const auto frame = mtp_batch.mtp_decode->narrowed(k, next_k);
+        expect(frame.target_hidden.ne[1] == static_cast<int>(k + 1) &&
+                   frame.target_hidden.ne[2] == 3 &&
+                   frame.target_hidden.data == mtp_batch.mtp_decode->target_hidden.data &&
+                   frame.target_hidden.is_contiguous() &&
+                   frame.current_drafts.ne[0] == static_cast<int>(k) &&
+                   frame.current_drafts.ne[1] == 3 &&
+                   frame.verify_ids.ne[0] == static_cast<int>(k + 1) &&
+                   frame.next_drafts.ne[1] == static_cast<int>(next_k) &&
+                   frame.next_drafts.nb[1] == mtp_batch.mtp_decode->next_drafts.nb[1],
+               "MTP frame narrowed above one request");
+    }
 }
 
 void test_mtp_alignment() {

@@ -46,28 +46,37 @@ for creating NInfer!
 3. keeps upstream's original prefix caching, with a raft of fixes, behind
    `--use-original-prefix-caching` (I worked on it before switching to a new design; I found the
    original too complex and fragile)
-4. prefills INT8 and NVFP4 KV with faster prompt-attention kernels by default (a third to two
-   thirds less prompt-attention time on long prompts); `--use-original-int8-prefill-kernel` and
-   `--use-original-nvfp4-prefill-kernel` select upstream's kernels
-5. adds ngram copy drafting (based on an implementation by [remesis](https://github.com/remesis)),
+4. prefills INT8, NVFP4, FP8 and K8V4 KV with faster prompt-attention kernels by default (a third
+   to two thirds less prompt-attention time on long INT8 and NVFP4 prompts than upstream's kernels,
+   a sixth to a half less for FP8 and K8V4); `--use-original-int8-prefill-kernel` and
+   `--use-original-nvfp4-prefill-kernel` select upstream's INT8 and NVFP4 kernels; NVFP4 and K8V4
+   P×V runs on 8-bit Tensor Cores by default (5-7 % less end-to-end long-prompt prefill, KL
+   divergence from BF16 KV within 1.1× the FP16 form's), while INT8 KV keeps FP16 P×V unless
+   `--prefill-8bit-pv` asks for its 8-bit form, and `--no-prefill-8bit-pv` forces FP16 everywhere
+5. adds two compact KV formats, `--kv-dtype vq2` and `k4v2` (a quarter and three eighths of INT8's
+   KV memory, based on HyperQuant and [cometkim](https://github.com/cometkim)'s implementation),
+   which keep the most recent keys exact, always run P×V in FP16, and decode faster than INT8 at
+   long context
+6. adds ngram copy drafting (based on an implementation by [remesis](https://github.com/remesis)),
    which greatly speeds up copy-heavy workloads, with more than one concurrent request
-6. overlaps each decode kernel's launch and weight loading with the kernel before it, and tunes
+7. overlaps each decode kernel's launch and weight loading with the kernel before it, and tunes
    the decode-width kernels, for faster speculative decode rounds with the same output
-7. can offload the vision encoder to system RAM (`--vision-offload on`), based on the work of
+8. can offload the vision encoder to system RAM (`--vision-offload on`), based on the work of
    Valeriy Selitskiy ([iamwavecut](https://github.com/iamwavecut))
-8. supports YaRN context extension up to 1M tokens (`--rope-yarn-factor F`, F from 1 to 4)
-9. sizes the CUDA Graph memory allowance from measurement instead of an estimate that could reserve
-   far more VRAM than ever used
-10. lets `--vram-headroom-mib N` shrink the 1 GiB VRAM headroom left after `--kv-capacity auto`
-11. adds a custom thinking budget message (`--default-thinking-budget N` with
+9. supports YaRN context extension up to 1M tokens (`--rope-yarn-factor F`, F from 1 to 4)
+10. sizes the CUDA Graph memory allowance from measurement instead of an estimate that could reserve
+    far more VRAM than ever used
+11. lets `--vram-headroom-mib N` shrink the 1 GiB VRAM headroom left after `--kv-capacity auto`
+12. adds a custom thinking budget message (`--default-thinking-budget N` with
     `--thinking-budget-message "..."`)
-12. accepts more tool-call formats and API options used by agent clients such as Claude Code, Qwen
+13. accepts more tool-call formats and API options used by agent clients such as Claude Code, Qwen
     Code, Codex, Zed and GitHub Copilot, and fixes several tool-call and reasoning-output issues
     (mostly based on the work of others credited below); `--tolerant-tool-calls` recovers some
     broken tool calls
-13. improves the console: optional colours (`--log-colours on`), a statistics panel at the bottom
-    (`--log-stats-panel off` removes it) and a `--help` screen organised by category
-14. contains various other fixes and improvements, including upstream pull requests merged before
+14. improves the console: optional colours (`--log-colours on`), a statistics panel at the bottom
+    (`--log-stats-panel off` removes it) and a `--help` screen organised by category, and can
+    rotate the request log by size (`--request-log-max-mib N`)
+15. contains various other fixes and improvements, including upstream pull requests merged before
     upstream did
 
 I recommend using this with the NVIDIA NVFP4 artifact I’ve uploaded here, which runs a bit faster
@@ -370,17 +379,134 @@ which require `--use-original-prefix-caching`. Details:
   original INT8 kernel (4K windows: 4.8986 against 4.9027, BF16 KV 4.8948).
   `--use-original-int8-prefill-kernel` keeps upstream's kernel.
   Commit: [`4c9a949`][c-fast-int8].
-- **Fast NVFP4 prompt attention** (default for `--kv-dtype nvfp4` over more than 2048 cached keys):
-  QK runs on block-scaled FP4 Tensor Cores (8× the FP16 rate on RTX 5090) straight from the stored
-  K codes, with Q as two NVFP4 terms (0.9 % RMS error); a single chunk whose rows alone would leave
-  SMs idle splits its keys across CTAs. 0.34-0.67× the time of upstream's NVFP4 prompt kernel per
-  attention layer; end to end, prefill is 3.5 % faster at a 16K-token prompt, 6.4 % at 32K and
-  14.4 % at 64K. Perplexity moves by +1.1e-3 nats per token (standard error 2.0e-3).
-  `--use-original-nvfp4-prefill-kernel` keeps upstream's kernel.
+- **Key splits for short INT8 prompt chunks**: a chunk of up to about 1300 tokens over a long
+  cached prefix leaves SMs idle with one CTA per row block, so the fast INT8 kernel divides its keys
+  among eight-warp CTAs and merges their FP32 partial rows, as the NVFP4 kernel does. It splits
+  only when the time saved outweighs writing and merging the partial rows (a cost model fitted to
+  every split count measured at 0-64K keys), so chunks over less than about 1K keys and widths whose
+  row blocks already fill the GPU stay unsplit. Per attention layer against the kernel before
+  splits: 257-384-token chunks take 4-7 % less time over 1K cached keys, 10-14 % over 2K, 15-19 %
+  over 4K and 28-37 % over 32K-128K; 512 tokens 6-34 % less from 2K keys, 576-640 tokens 7-20 % less
+  from 8K and 1024-1280 tokens 8-23 % less from 4K. Slower: 448 tokens over 8K keys (+2.9 %), 576
+  over 4K (+1.9 %) and 1024-1280 over 2K (+1.9 to +2.7 %); other widths, including full 3584-token
+  chunks, are within 1 %. End to end, a 267-token follow-up over a 128K-token cached prefix
+  prefilled 21 % faster, and 550-620-token follow-ups 12 % faster (5 % over 32K; measured with an
+  earlier plan that splits these widths the same way); uncached prompts, full documents and longer
+  follow-ups were unchanged within about 2 %. Perplexity on the full `ninfer-ppl-1m-v1` corpus moved
+  from 4.9077081 to 4.9076804 with 4K windows and from 4.9041197 to 4.9041624 with 64K windows, each
+  within 0.7 standard errors of the per-window differences. The partials took up to 64 MiB of
+  workspace: 576 fewer KV tokens (0.23 %) at startup with `--max-context 140000`; their bound is now
+  `--prefill-split-workspace-mib` (below).
+- **8-bit P×V in prompt attention** (default for NVFP4, K8V4 and VQ2 KV; `--prefill-8bit-pv`
+  turns it on for INT8 and K4V2 KV, which default to FP16 P×V, and `--no-prefill-8bit-pv`
+  forces FP16 everywhere).
+  NVFP4 and K8V4 KV: the MX-FP8 tiled prompt kernel rounds each probability (as 256 p against its
+  tile's own row maximum, which the softmax reference follows) and each decoded V value to E4M3 and
+  multiplies them on block-scaled E4M3 Tensor Cores with FP32 accumulation, four times the rate of
+  upstream's FP16 P×V with FP32 accumulation; a per-tile power of two keeps V in E4M3's range and
+  returns through the MMA's block scale. Its error against exact attention over the stored values is
+  about 15 times the FP16 form's (relative L2 0.026-0.037 against 0.0017), but the divergence it
+  causes does not follow that: on a Q6 artifact with BF16 activations, where the measurement is not
+  buried under A4 activation noise, its KL divergence from a BF16 KV reference over the full corpus
+  at 64K context is 0.0203 against the FP16 form's 0.0205 (NVFP4) and 0.0141 against 0.0134 (K8V4),
+  within 1.1× of FP16 in every context bucket and within 0.06 pp of top-1 agreement. Per attention
+  layer, against the FP16 form, 3584-token chunks take 19 % (K8V4) and 18 % (NVFP4) less time over
+  128K keys and up to 20 % less elsewhere; end to end, one request's prefill (DFlash2, 4096-token
+  chunks) is 4.7-5.1 % (NVFP4) and 5.0-5.4 % (K8V4) faster at 64K tokens and 6.8-7.1 % and 7.5-7.7 %
+  at 128K (two runs differing by 0.4-0.7 pp).
+  Perplexity on the full `ninfer-ppl-1m-v1` corpus: 4.89624 → 4.91573 (K8V4) and 4.91651 → 4.91384
+  (NVFP4) with 4K windows, 4.84164 → 4.97411 and 4.89965 → 4.87335 with 64K windows; the median
+  stream moved by under 0.002 nats per token, but at 64K single streams moved by up to 0.36 (K8V4) —
+  the corpus moves that much for any small numeric change, which is why the KL comparison above is
+  the direct measure.
+  VQ2 and K4V2 KV: the vector-quantized prompt kernel runs the same integer form over the tile's
+  INT8 V rows, scaling each group's probabilities by that key's row scale and rounding them to
+  u8 codes against their row maximum. VQ2 takes it by default: against a BF16 KV reference on a
+  BF16-activation model its KL divergence moves 0.0367 → 0.0378 (1.03x, every bucket within
+  1.05x, top-1 within 0.04 pp) while prefill of one request is 5.0 % faster at 64K tokens and
+  6.8 % at 128K. K4V2 stays opt-in: its divergence moves 0.0212 → 0.0232, 1.09x overall but
+  1.11x in the 32-64K bucket, against the 1.10x bound the other formats were held to, for
+  5.3 % and 7.2 % the same way. Per attention layer the two are 3.3-18 % faster at 3584-key
+  chunks over long context (geomean 0.97 over 256-3584 keys at 0-64K) and up to 5 % slower for
+  512-1024-key calls over an empty context.
+\1
+  (4× the FP16 rate with FP32 accumulation on RTX 5090); each row's probabilities, scaled by the V
+  group scale, are quantized to 8-bit codes per 64-key tile and multiplied against the stored INT8 V
+  codes, which stay exact. Per attention layer, 3584-token chunks take 3.5 % less time from an empty
+  context and 8-11 % less from 16K to 128K; end to end, prefill is 1.9-2.6 % faster at a 16K-token
+  prompt, 2.6-4.2 % at 64K and 4.0-5.1 % at 128K (two runs). Unlike the E4M3 form it is not free: probabilities below
+  half a code step of their tile's largest round to zero, and on the same Q6 artifact the KL
+  divergence from BF16 KV about doubles, 0.0051 → 0.0111 at 64K, with all sixteen streams worse and
+  the growth concentrated in longer context (the 32-64K bucket ×2.28, top-1 98.9 % → 98.6 %). The
+  fast kernel's FP16 P×V matches the original INT8 prompt kernel there (0.0051 against 0.0050), so
+  the whole cost is the 8-bit P, and FP16 P×V stays INT8's default.
+- **Fast NVFP4 prompt attention** (default for `--kv-dtype nvfp4` over more than 768 cached
+  keys, re-tuned from 2048 with the decode-once kernel: forced at every visible count the fast
+  kernel is within 0.03 % of the per-shape best above 768 visible keys in both head geometries
+  (24 query heads x 4 KV heads and 16 x 2), where 2048 costs 2.3-2.7 % overall and up to 64 % in
+  its worst cell):
+  QK runs on block-scaled FP4 Tensor Cores (8× the FP16 rate on RTX 5090) straight from the stored K
+  codes, with Q as two NVFP4 terms (0.9 % RMS error). It now runs on the MX-FP8 tiled kernel (below)
+  with NVFP4 keys: each 64-key V tile is decoded once per CTA into shared memory instead of in every
+  warp's registers. Per attention layer it takes 6-26 % less time than the previous fast NVFP4
+  kernel wherever it runs (3584-token chunks 8 % less over an empty context, 15 % over 8K-32K and
+  17 % over 128K keys), and 0.32-0.63× the time of upstream's NVFP4 prompt kernel; end to end,
+  prefill of one request (DFlash2) is 2.1 % faster at 16K tokens, 3.6 % at 32K, 6.0 % at 64K and
+  9.2 % at 128K than with the previous fast kernel, both with the previous kernel's 64 MiB split
+  budget; the bound is now `--prefill-split-workspace-mib` (below). Perplexity:
+  4.90646 → 4.91651 with 4K windows and 4.90946 → 4.89965 with 64K windows, moves of the size the
+  corpus shows for any small numeric change (below). `--use-original-nvfp4-prefill-kernel` keeps
+  upstream's kernel.
   Commit: [`8dcd89a`][c-nvfp4-kv].
+- **Faster FP8 and K8V4 prompt attention** (default): upstream's MX-FP8 tiled prompt kernel now
+  accumulates P×V on FP16 Tensor Cores per 64-key tile (FP32 accumulation runs at half their rate on
+  RTX 5090) under a per-tile power-of-two V shift, issues the heaviest row blocks first, and chooses
+  each launch's key splits by a cost model that counts writing and merging the split partials, which
+  upstream's wave count ignored. Per attention layer against master, every width and context
+  measured (256-4096 tokens over 0-128K cached keys) is faster: K8V4 5.5-58 % less time (3584-token
+  chunks 31 % less over an empty context, 26 % over 8K, 22 % over 32K, 15 % over 128K;
+  1408-2048-token chunks about half the time over an empty context), FP8 5.7-59 % less. End to end,
+  prefill of one request (DFlash2) is 2-2.4 % faster at 16K tokens, 4 % at 32K, 6 % at 64K and 8.5 %
+  (K8V4) and 9.4 % (FP8) at 128K. Perplexity: K8V4 4.91185 → 4.89624 and FP8 4.89797 → 4.89736 with
+  4K windows, 4.88656 → 4.84164 and 4.84961 → 4.89144 with 64K windows. These come from one or two
+  streams that react strongly to any small numeric change: a control build that differed only by
+  FP32 accumulation scored K8V4 4.92107 (4K), and one stream moved by 0.08-0.11 nats per token
+  between the three. The median stream moved by under 0.001 nats per token, and the kernel's error
+  against exact attention is within 2 % of master's (relative L2 0.0017-0.0018). These measurements
+  kept upstream's unbounded split workspace (about 550 MiB at 3328-token launches); it is now bounded
+  by `--prefill-split-workspace-mib` (next).
+- **One split-workspace bound for prompt attention** (`--prefill-split-workspace-mib`, default
+  256 MiB). The fast INT8 and NVFP4 prompt kernels and the FP8/K8V4 prompt kernel split a launch's
+  keys across SMs when its row blocks alone would leave SMs idle, which needs FP32 partial rows in
+  workspace. INT8 and NVFP4 were capped at 64 MiB and FP8 and K8V4 were unbounded (about 550 MiB with
+  4096-token chunks; upstream's default 1024-token chunks need 169 MiB). One bound now applies to all
+  four, and a launch that would need more runs fewer splits. Per attention layer against unbounded
+  (3 interleaved passes, widths 256-4096 over 0-128K cached keys), 1024-2048-token chunks take
+  17-25 % longer at 64 MiB over 32K-128K keys (27 % at worst), 2-5 % at 128 MiB and under 1 % from
+  192 MiB, the same for all four formats; at the 256 MiB default 3-4K-token chunks over 128K keys
+  still take up to 5 % longer, and 3584-token chunks and short contexts are unaffected. These widths
+  are follow-up turns over a cached prefix and `--prefill-round-robin` steps beside another request;
+  a fresh 64K or 128K prompt prefills in the same time within 0.3 % end to end. The startup
+  workspace with 4096-token chunks and `--max-context 220000` is 515 MiB at 256 MiB against 380 MiB
+  at 64 MiB: about 4K fewer INT8 KV tokens (7.7K NVFP4); FP8 and K8V4 gain about 300 MiB of KV
+  cache against unbounded.
+- **Wave-aligned prefill chunks for NVFP4, FP8 and K8V4 KV**: their prompt kernel (the MX-FP8
+  tiled kernel, which fast NVFP4 prompt attention now also uses) runs one 128-row CTA per SM, like
+  the fast INT8 kernel, so
+  `--prefill-chunk` is now rounded down to whole attention waves for them too (`4096` runs as
+  `3584`), which keeps each full chunk's attention free of a mostly idle last wave. One request,
+  DFlash2: FP8 prefill 1.3 % faster at 32K tokens, 1.2 % at 64K and 0.8 % at 128K (same-session A/B,
+  two passes), K8V4 0.7-1.6 %, NVFP4 1.4-2.2 % at 128K and within noise at 32-64K.
 - **Several requests can prefill at the same time**, overlapping one request's prefill with
   others' prefill and decode. By David Oelfke in the [gzenz/ninfer](https://github.com/gzenz/ninfer)
   fork. Commit: [`25e52f9`][c-concurrent-prefill].
+- **`--prefill-round-robin`** (opt-in) serves concurrently prefilling requests in turn and, while
+  another request is active, prefills in steps of at most 1024 tokens (896 where the prefill chunk
+  is rounded to attention waves), so a short prompt or a decoding request beside a long prompt waits one short step
+  instead of the whole long prefill. A prompt alone still prefills in whole chunks, and KV capacity
+  is unchanged. Based on the round-robin prefill and narrow prefill width by
+  [giveen](https://github.com/giveen) in [giveen/ninfer-ext](https://github.com/giveen/ninfer-ext).
+  Commit: [`dae362c`][c-prefill-rr].
 - **Fused text q/k RMSNorm + RoPE at every width** (14-22 % faster than three separate calls at
   the 3584-token chunk, one sincos per lane), and only for checkpoints with its built-in RoPE theta
   and epsilon. Commit: [`2c8be5e`][c-rope-fused].
@@ -405,6 +531,39 @@ which require `--use-original-prefix-caching`. Details:
   tokens), and two 16-row tiles sharing each staged activation in the FP8 head and the Q8 DFlash2
   drafter.
   Commits: [`5db3795`][c-nvfp4-linear-add], [`5db53c7`][c-row-tiles].
+- **NVFP4 MLP tiles for verification widths**: the fused gate/up projection runs 64-row tiles at
+  two CTAs per SM up to 64 tokens (with a third pipeline stage up to 32), and the [5120,17408]
+  down projection streams 512 K per stage up to 8 tokens. Gate/up takes 65.3 instead of 66.1 µs
+  at 8 tokens, 64.9 instead of 66.1 at 12 and 66.1 instead of 68.0-68.2 at 33-49 (unchanged at
+  16-32 and 56-64); the down projection 36.6 instead of 37.6 µs at 8 tokens. Every output keeps its
+  K order, so output is unchanged bit for bit. On the decode-saturation suite (DFlash2 K=7, n-gram
+  15/12, INT8 KV, four passes) one request's rounds are 0.56 % shorter with chain verification and
+  0.23 % with 12-column trees, four requests' 0.18 % (chain); four requests verifying 12-column
+  trees (48 columns, on the 33-64-token tiles) changed by -0.15 % and +0.23 % in two passes, which is
+  within noise.
+- **Faster split-KV attention for verification rows** (DFlash2/MTP drafts and n-gram copies):
+  short rows split their keys into more, balanced KV splits so they fill the GPU; the split merge
+  launches as a programmatic dependent of the attention kernel; and INT8 KV rows of 2-16 columns
+  use a kernel that decodes V in registers and keeps the next K/V tile in flight. 8-column INT8
+  rows spend 3 % less time in attention at 131K keys and up to 47 % less at 2K, 16-column rows
+  21-39 % less at every length, and FP8, K8V4 and NVFP4 rows 9-35 % less at 512-2K keys. Output
+  is unchanged except for rows shorter than about 11K-22K keys, whose split merge now rounds in a
+  different order. On the NVIDIA artifact a single ~100K-token request decodes 2.4 % faster with
+  identical output.
+  Commits: [`88df116`][c-split-balance], [`fad95fa`][c-merge-pdl], [`8777710`][c-int8-pipelined].
+- **NVFP4 DFlash2 drafter MLP** (`qwen3_8_27b_nvfp4_nvidia` recipe): the drafter's MLP gate/up
+  projections are stored as NVFP4 (new `nvfp4_mse` quantizer) instead of Q8 and run with 16-bit
+  activations through the fused SwiGLU kernel, which now covers every width (sliced kernels to 32
+  tokens, a Tensor Core route above). On the decode-saturation suite (DFlash2 K=7, n-gram 15/12,
+  INT8 KV) rounds are 1.6 % shorter with one request (+1.2 % tokens/s) and 0.2 % shorter with four
+  (tokens/s within noise). Acceptance moved by -0.35 % on 24 sampled agent prompts and -0.4 %
+  (tokens per round) on the suite. Existing artifacts must be reconverted to use it.
+- **FP8 LM head for 42-64 tokens per round**: rounds of 42-64 verified tokens (three or four
+  requests verifying 16-column n-gram or tree blocks, four verifying 12-column trees) ran the FP8 LM
+  head on its 64-token MMA schedule; they now stay on the sliced-K kernel, with two K warps and a
+  double-buffered stage above 48 tokens. The LM head is 17-21 % faster at 42-48 tokens, 12-15 % at
+  49-56 and 3-8 % at 57-64, and unchanged at other widths (it saves 0.12 ms per 12-column tree round
+  with four requests). Logits at those widths round in a different order.
 - **Reciprocal NVFP4 activation quantizer on the Linear MMA route** (upstream #327 by
   [DuncanBetts](https://github.com/DuncanBetts)): 2-5 % faster at 8-64 tokens; the other A4 routes
   keep the divisions, because opting them in changed the generated text.
@@ -417,11 +576,98 @@ which require `--use-original-prefix-caching`. Details:
   the engine worker. See [ngram copy proposals](docs/ngram.md).
   Commits: [`d2209f6`][c-ngram], [`c5e390b`][c-ngram-concurrency],
   [`c54dacb`][c-ngram-prep].
+- **DFlash2 tree verification** (opt-in, `--draft-tree-nodes auto` or a per-batch-size list):
+  instead of one proposal path, a round verifies a small tree of proposals that the GPU builds every
+  round from the DFlash2 drafter's candidate lattice, spending the extra columns where the drafter
+  is least sure. Sampling stays exact (recursive rejection sampling over each node's alternatives),
+  and the accepted path is moved onto the main-chain columns so the KV cache, GDN state and drafter
+  see an ordinary round. It works with every `--kv-dtype` on artifacts whose GDN input projections
+  are single FP8 or NVFP4 matrices. A column buys the same acceptance at any batch size but costs
+  more of the round as the batch and the context grow, so `auto` measures both while it runs: the
+  round time of each width per batch size and context length, and, from every tree round's accepted
+  path, the tokens each narrower tree and the chain would have emitted on the same text. Each round
+  then verifies the chain or a tree of K+5 or K+9 columns, whichever gives the most tokens per
+  second. Each round computes every tree column's GDN recurrence once, in one depth-first walk per
+  row, so 12- and 16-column tree rounds cost 0.4-0.6 % less than replaying every root-to-leaf path
+  with one request, 1.7-2.0 % with two and 2.9-4.0 % with four. On the decode-saturation suite
+  (DFlash2 K=7, n-gram 15/12, INT8 KV) `auto` decodes an estimated 6.9 % faster with one request and
+  4.4 % with two (measured before the walk), and about 2.9 % with three and 2.7 % with four (from
+  2.0 % and 0.3 % before the walk and the LM head change above, in the same runs); at 128K tokens of
+  context it loses 0.6-2.3 % in a fresh process (a fixed 16-column tree loses 4.2-5.4 %), and on
+  text the drafter already predicts it keeps chain verification. Below about 64K tokens the fixed
+  table `16,12,12,0` gains up to 2 points more (7-8.5 % with one request and 4-5 % with two on INT8,
+  K8V4 and NVFP4 KV) and keeps seeded one-request runs reproducible, which `auto` does not, since
+  its choice depends on measured time. See [tree
+  verification](docs/maintainer/tree-verification.md).
 - **NVFP4 KV groups pick the best of five scales** (NVFP4 K and V, K8V4 V): each 16-value group
   maps its largest magnitude to 6, 4, 4.5, 5 or 5.5 and keeps the scale with the least squared
   error (Four Over Six, arXiv:2512.02010, generalized). RMS error of the 27B model's rotated K rows
   falls from 9.5 % to 8.5 %; perplexity moves within one standard error.
   Commit: [`a79c2cd`][c-nvfp4-targets].
+
+### Smaller KV cache: `--kv-dtype vq2` and `k4v2`
+
+- **Two vector-quantized KV formats.** `vq2` stores K and V in 2 bits per value, and `k4v2` stores K
+  in 4 bits and V in 2. Per token and KV head they take 132 and 196 bytes, against 528 for INT8 and
+  288 for NVFP4. For the 27B models' attention layers, 240K tokens of context need 1.9 GiB of KV as
+  `vq2` and 2.8 GiB as `k4v2`, against 7.6 GiB as INT8 and 4.1 GiB as NVFP4, so the same VRAM holds
+  three or four times the context or requests. How it works:
+  - each 256-value row is rotated with the fork's fixed Hadamard transform;
+  - V, and K for `vq2`, then store every 8 values as one 16-bit code (one of 512 trained magnitude
+    patterns plus 7 sign bits, the 8th sign set by parity);
+  - K for `k4v2` stores 4-bit Lloyd-Max levels instead;
+  - each row keeps an FP16 scale chosen so its reconstruction is unbiased.
+- **Recent keys stay exact.** The attention sinks (the first 64 tokens) and the 768 tokens before
+  each query are read from INT8 copies held in the request's state. Which keys a query reads
+  exactly depends only on positions, so a context reads the same values however it was split into
+  prefill chunks, decode steps or cache reuse points. These copies take about 40 MB per state slot
+  for the 27B models; each running request, each GPU checkpoint slot and each host checkpoint image
+  holds one.
+- **Quality** (perplexity at 64K context, 32K stride, `ninfer-ppl-1m-v1` quick corpus, NVIDIA NVFP4
+  27B artifact):
+
+  | KV | Perplexity | vs BF16 |
+  |---|---:|---:|
+  | BF16 | 4.1661 | |
+  | INT8 | 4.1728 | +0.16 % |
+  | NVFP4 | 4.1764 | +0.25 % |
+  | `k4v2` | 4.1709 | +0.12 % |
+  | `vq2` | 4.1859 | +0.48 % |
+- **Speed** (one request, official NVFP4 27B artifact, RTX 5090, `ninfer_bench` against INT8 measured
+  in the same run):
+
+  | Run | Format | Prefill | Decode |
+  |---|---|---:|---:|
+  | 32K context | `vq2` / `k4v2` | -4.5 % | +1.6 % / +1.4 % |
+  | 128K context | `vq2` / `k4v2` | -7.3 % / -8.7 % | +7.4 % / +6.7 % |
+  | DFlash2 K=7, 32K context | `vq2` / `k4v2` | -4.2 % / -4.4 % | -3.4 % / -3.6 % |
+
+  In the DFlash2 rows, draft acceptance is 0.82 for both formats against INT8's 0.85.
+  Per attention layer, against INT8 measured in the same run (`ninfer_causal_softmax_attention_bench`,
+  40 calls, cold, first row / four rows):
+
+  | Call | 2K keys | 8K keys | 32K keys | 128K keys |
+  |---|---:|---:|---:|---:|
+  | one-token decode | 1.54x / 2.23x | 1.19x / 0.96x | 0.80x / 0.62x | 0.62x / 0.59x |
+  | 4-column verification | 1.61x / 2.21x | 1.23x / 1.07x | 0.89x / 0.75x | 0.76x / 0.73x |
+  | 8-column verification | 1.54x / 2.48x | 1.23x / 1.42x | 1.09x / 1.10x | 1.04x / 1.03x |
+  | 16-column verification | 1.71x / 3.29x | 1.28x / 1.64x | 1.30x / 1.31x | 1.22x / 1.33x |
+
+  Below 32K keys these formats pay for expanding their codes; from 32K, calls of up to four columns
+  overtake INT8 at 0.6-0.9x, because the attention reads a quarter of the KV bytes. Wider
+  verification stays above INT8 at 1.0-1.4x, where its G64 kernel fills the SM better. `k4v2` is
+  within about 0.05x of `vq2` except on 16-column verification, where it is 0.1-0.4x slower
+  (1.4-1.9x at 8K keys and below). Prompt attention is 1.2-1.3x at 32-128K keys
+  and 1.4x at 8K against INT8's fast prompt kernel (896-3584 columns, 20 calls), and on short
+  prompts the encoding of each new row costs more than the attention.
+- They work with the hybrid and original prefix caches (a restored checkpoint reads exactly what
+  the original request read), cache files, MTP, DFlash2 chain and tree verification, n-gram
+  drafting, concurrent requests, CUDA Graphs and vision.
+- Based on the HyperQuant KV cache (arXiv 2606.23406) and the implementation of it by
+  [cometkim (Hyeseong Kim)](https://github.com/cometkim). Measured on this model's K and V rows, a
+  fixed-rate 8-value code beat HyperQuant's E8 lattice with Rice coding at fewer bytes. Keeping
+  recent keys exact mattered more than either, so the fork implements the fixed-rate code with an
+  exact window.
 
 ### Tool calls and reasoning output
 
@@ -438,7 +684,9 @@ which require `--use-original-prefix-caching`. Details:
 - **`--tolerant-tool-calls`** keeps a good call followed by junk, a final call cut off by the
   output limit (if a parameter is complete), repairs a missing `>` after the function name, and
   returns calls to undeclared tools. By David Oelfke in the gzenz/ninfer fork, ported onto this
-  fork's parser. Commit: [`9e28ab8`][c-tolerant-tools].
+  fork's parser. The request log's `tool_call_parse.tolerant_recovered` shows when it rescued a
+  call (from giveen's giveen/ninfer-ext). Commits: [`9e28ab8`][c-tolerant-tools],
+  [`d2ab752`][c-tolerant-recovered].
 - **A reasoning effort the chat template rejects renders as its nearest accepted one** (the
   official Qwen3.8 template accepts only low, medium and xhigh), and `--chat-template` gains the
   froggeric v22.5 template. Commits: [`9b7c58b`][c-effort-nearest],
@@ -468,6 +716,10 @@ which require `--use-original-prefix-caching`. Details:
   routes answer under a doubled `/v1` prefix (a base URL ending in `/v1`).
   Commits: [`e56b408`][c-pr223], [`f863ddc`][c-thinking-budget-max],
   [`e49a360`][c-doubled-v1].
+- **Claude Code's `thinking.display: "omitted"`** is accepted instead of rejected: Thinking blocks
+  come back with empty text and the reasoning in their signature, which is restored when the
+  client sends the block back, so retained thinking and prefix-cache reuse are unchanged. Ported
+  from giveen's change in giveen/ninfer-ext. Commit: [`ca1f50e`][c-thinking-omitted].
 
 ### Stability
 
@@ -482,11 +734,14 @@ which require `--use-original-prefix-caching`. Details:
 - **Smaller fixes:** a workspace scope opened before an arena reset no longer rolls the next
   phase's allocations back; a request an idle engine can never admit gets 503 instead of 500;
   token-count requests are bounded like generation requests; Windows servers detect clients that
-  vanish without closing the connection; and a vision overlay suffix is encoded at the right
-  position (fork PR #1 by Yunado).
+  vanish without closing the connection; a vision overlay suffix is encoded at the right
+  position (fork PR #1 by Yunado); an Anthropic stream whose client leaves while it is still
+  queued is logged as a disconnect (499) instead of an internal error (500), by Gideon Zenz in
+  the gzenz/ninfer fork; and a full main KV pool no longer ends an MTP or DFlash answer early when
+  only its draft KV lease needed room, from giveen's giveen/ninfer-ext.
   Commits: [`f67a284`][c-arena-scope], [`edc9785`][c-idle-503],
   [`7936838`][c-count-bound], [`f6af07f`][c-win-keepalive],
-  [`22e6ef1`][c-pr1].
+  [`22e6ef1`][c-pr1], [`bcac0a8`][c-queued-cancel], [`6ee864c`][c-lease-thin].
 
 ### Models, conversion and vision
 
@@ -497,6 +752,12 @@ which require `--use-original-prefix-caching`. Details:
   with DFlash2 heads and an indexed proposal head; **third-party tokenizer settings** rebuilt during
   conversion. Commits: [`33afed8`][c-modelopt], [`de4623a`][c-quasar],
   [`5b73bba`][c-tokenizer].
+- **`nvfp4_absmax` and `nvfp4_mse` conversion methods** quantize BF16 sources to NVFP4 for
+  16-bit-activation parents; the NVIDIA recipe uses them for the DFlash2 drafter MLP. `nvfp4_mse`
+  picks each 16-value group's scale from all 126 E4M3 values by squared error (based on
+  giveen's scale sweep in giveen/ninfer-ext): on the drafter's gate projection the relative
+  error is 0.0812, against 0.0847 for the earlier best of five targets and 0.0952 for absmax.
+  Commit: [`2309ead`][c-nvfp4-mse].
 - **A `qwen3_8_27b_q6` recipe** and a `grouped_mse` scale-search method for groupwise
   quantisation; **Q8 MTP** and a **general BF16 GEMM fallback** for shapes without a dedicated
   kernel. Commits: [`a4c112f`][c-pr284], [`afb274c`][c-grouped-mse],
@@ -539,6 +800,11 @@ which require `--use-original-prefix-caching`. Details:
   warns if the graphs ever use more. Commit: [`61e082f`][c-graph-allowance].
 - **`--thinking-budget-message S`** sets the message inserted when a request reaches its
   `--default-thinking-budget N`. Commit: [`f3aaad7`][c-thinking-message].
+- **`--request-log-max-mib N`** rotates the `--request-log-jsonl` file once it reaches `N` MiB,
+  keeping `--request-log-keep K` older files (default 4); each new file starts with a copy of the
+  server's start record. Based on the rotation by
+  [Gideon Zenz (gzenz)](https://github.com/gzenz) in the gzenz/ninfer fork.
+  Commit: [`80d73bb`][c-log-rotation].
 
 ### Kept in sync with upstream
 
@@ -606,7 +872,8 @@ A big thank you to all the contributors to upstream NInfer and to the forks this
 [Macasacker](https://github.com/Macasacker),
 [Sha1rholder](https://github.com/Sha1rholder),
 [adubkov](https://github.com/adubkov),
-[Gideon Zenz (gzenz)](https://github.com/gzenz), David Oelfke, Fedor Suchkov,
+[Gideon Zenz (gzenz)](https://github.com/gzenz),
+[cometkim (Hyeseong Kim)](https://github.com/cometkim), David Oelfke, Fedor Suchkov,
 Yunado, and everyone else whose pull
 requests, reviews and commits made this fork possible — and a particular thank you to
 **[Neroued](https://github.com/Neroued)** for creating NInfer, maintaining upstream so
@@ -641,6 +908,9 @@ well, and for the work this branch builds on.
 [c-pdl]: https://github.com/Wallawalla47/ninfer-custom/commit/0c59ca61b00a641f9164174a868b26402ef0841f
 [c-nvfp4-linear-add]: https://github.com/Wallawalla47/ninfer-custom/commit/5db37954cce4689cb7fcfe90ba2b4c93c4243fea
 [c-row-tiles]: https://github.com/Wallawalla47/ninfer-custom/commit/5db53c7991dfe420a7b4072a24ef6ad0a0f4c112
+[c-split-balance]: https://github.com/Wallawalla47/ninfer-custom/commit/88df116fe8e7b07b77180815b590fd935db3ab44
+[c-merge-pdl]: https://github.com/Wallawalla47/ninfer-custom/commit/fad95faa79707ce7e513c805a7ee361a8c28793e
+[c-int8-pipelined]: https://github.com/Wallawalla47/ninfer-custom/commit/8777710b8e0e5206d32d519b3d7325c0650140b8
 [c-pr327]: https://github.com/Wallawalla47/ninfer-custom/commit/58808ee2d2d0ce35aa8f989d64b9a9e4a251c47d
 [c-ngram]: https://github.com/Wallawalla47/ninfer-custom/commit/d2209f60ad3a520ffb1886fe6329183bf66c389b
 [c-ngram-concurrency]: https://github.com/Wallawalla47/ninfer-custom/commit/c5e390b1bcc4b25e0ea9d649b7db0e11d1956160
@@ -692,6 +962,13 @@ well, and for the work this branch builds on.
 [c-vram-headroom]: https://github.com/Wallawalla47/ninfer-custom/commit/1684538e4cba676dc8e4832b253bdd0f25246f4f
 [c-graph-allowance]: https://github.com/Wallawalla47/ninfer-custom/commit/61e082f37a5aba0a23477e1698075daa82e47eb7
 [c-thinking-message]: https://github.com/Wallawalla47/ninfer-custom/commit/f3aaad7c3a8e0d6a66746aa6558e5cb05ceeba57
+[c-log-rotation]: https://github.com/Wallawalla47/ninfer-custom/commit/80d73bb9ee5d83fa88a4ced068a1ec792bf2bc22
+[c-queued-cancel]: https://github.com/Wallawalla47/ninfer-custom/commit/bcac0a84e115341c78ece01e905c9831c95b712e
+[c-nvfp4-mse]: https://github.com/Wallawalla47/ninfer-custom/commit/2309ead35d7d2e2b532c88b061f5a29ae811ad33
+[c-prefill-rr]: https://github.com/Wallawalla47/ninfer-custom/commit/dae362c9ae56babbbc430fae4bdcfd29d6516d47
+[c-thinking-omitted]: https://github.com/Wallawalla47/ninfer-custom/commit/ca1f50edd8754aa468a5a099e6a8dd5141cca902
+[c-lease-thin]: https://github.com/Wallawalla47/ninfer-custom/commit/6ee864cd60ba17f41f29f1dfafbc4c807f68ff6c
+[c-tolerant-recovered]: https://github.com/Wallawalla47/ninfer-custom/commit/d2ab7524324919dd2319c4b7b6fcf724910a4105
 
 ---
 

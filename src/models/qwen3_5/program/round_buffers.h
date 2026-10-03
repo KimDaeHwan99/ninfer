@@ -121,6 +121,10 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashVerifyMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    // Tree rounds: the accepted root path's columns (row stride = the round width, -1 beyond A)
+    // and the depth at which it left the main chain (0 when it stayed on it, -1 for a chain row).
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashVerifyMaximumWidth> accepted_path{};
+    std::array<std::int32_t, kMaximumConcurrency> accepted_branch{};
 };
 
 struct OrdinaryDecodeStateLayout {
@@ -178,6 +182,10 @@ struct DFlashDecodeStateLayout {
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
+    // DFlash2 tree rounds: each row's device-built tree (ops::SpeculativeTreeRow) and its I32
+    // [W,B] ancestor masks.
+    std::optional<TensorRegion> tree_rows;
+    std::optional<TensorRegion> tree_masks;
 };
 
 struct RoundStateLayout {
@@ -285,11 +293,9 @@ struct MtpDecodeState {
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
                    std::uint32_t batch_capacity, std::uint32_t draft_window);
-    // The frame at verify width k+1 and proposal depth next_k, both at most the allocated ones.
-    // Every width-dimensioned tensor is written and consumed within one round and every host
-    // index into ingress/egress uses the round's own width, so a dense [k+1, rows] view of the
-    // native storage is exact for any row count; the step-major proposal tensors keep their
-    // leading next_k steps.
+    // The frame viewed for a round that verifies k drafts per row and proposes next_k: every round
+    // tensor becomes a dense [k+1,C] (or [k,C]) view of the native storage and the step-major AR
+    // tensors keep their row stride.
     [[nodiscard]] MtpDecodeState narrowed(std::uint32_t k, std::uint32_t next_k) const;
 };
 
@@ -312,6 +318,10 @@ struct DFlashDecodeState {
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
+    Tensor tree_rows;
+    Tensor tree_masks;
+    Tensor accepted_path;
+    Tensor accepted_branch;
     Tensor proposal_ids;
     Tensor proposal_positions;
     Tensor verify_positions;

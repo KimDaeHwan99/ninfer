@@ -92,6 +92,10 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::Vq2:
+        return "vq2";
+    case ninfer::KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
     }
     return "unknown";
 }
@@ -258,6 +262,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             }
             print_metric(backend + " accepted by pos", positions.str());
         }
+        if (speculative.tree_rounds != 0) {
+            print_metric(backend + " tree rounds", std::to_string(speculative.tree_rounds));
+            print_metric(backend + " tree side rounds",
+                         std::to_string(speculative.tree_side_rounds));
+            print_metric(backend + " tree side drafts",
+                         std::to_string(speculative.tree_side_accepted_tokens));
+        }
     }
 }
 
@@ -316,6 +327,8 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
+        engine_options.prefill_8bit_pv              = cli.prefill_8bit_pv;
+        engine_options.prefill_split_workspace_mib  = cli.prefill_split_workspace_mib;
         engine_options.original_nvfp4_prefill_kernel = cli.original_nvfp4_prefill_kernel;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;

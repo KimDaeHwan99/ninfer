@@ -18,6 +18,14 @@ inline constexpr int kDefaultMaxTokens                    = 8192;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
+inline constexpr std::uint32_t kDefaultRequestLogKeep     = 4;
+inline constexpr std::uint32_t kMaximumRequestLogKeep     = 1000;
+
+// Size-based rotation of the request JSONL log.
+struct RequestLogRotation {
+    std::uint64_t max_bytes = 0;                      // 0 => one file that grows without bound
+    std::uint32_t keep      = kDefaultRequestLogKeep; // rotated files kept: PATH.1 .. PATH.keep
+};
 
 struct ServeOptions {
     bool help_requested = false;
@@ -28,6 +36,7 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    RequestLogRotation request_log_rotation;
     float rope_yarn_factor             = 1.0F;
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
@@ -35,7 +44,10 @@ struct ServeOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    bool prefill_round_robin           = false;
     bool original_int8_prefill_kernel  = false;
+    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
+    std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs

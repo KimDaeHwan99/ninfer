@@ -28,6 +28,13 @@ namespace {
 
 using Json = nlohmann::json;
 
+// The log is a text-mode stream: each '\n' is written as "\r\n" on Windows.
+#ifdef _WIN32
+constexpr std::uint64_t kLineTerminatorBytes = 2;
+#else
+constexpr std::uint64_t kLineTerminatorBytes = 1;
+#endif
+
 template <class T>
 T monotonic_delta(T previous, T current) noexcept {
     return current >= previous ? current - previous : T{};
@@ -100,7 +107,8 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"duplicate_parameters_repaired", diagnostics.duplicate_parameters_repaired},
                 {"fallback_reason",
-                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
+                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
+                {"tolerant_recovered", diagnostics.tolerant_recovered}};
 }
 
 std::string tool_choice_name(const ToolChoice& choice) {
@@ -130,6 +138,10 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::Vq2:
+        return "vq2";
+    case ninfer::KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
     }
     return "unknown";
 }
@@ -308,6 +320,9 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"ngram_archive_rounds", metrics.ngram_archive_rounds},
                 {"ngram_archive_drafted_tokens", metrics.ngram_archive_drafted_tokens},
                 {"ngram_archive_accepted_tokens", metrics.ngram_archive_accepted_tokens},
+                {"tree_rounds", metrics.tree_rounds},
+                {"tree_side_rounds", metrics.tree_side_rounds},
+                {"tree_side_accepted_tokens", metrics.tree_side_accepted_tokens},
                 {"ngram_archive",
                  {{"enabled", metrics.ngram_archive.enabled},
                   {"bound", metrics.ngram_archive.bound},
@@ -495,7 +510,10 @@ std::string format_server_start_json(
              {"max_pending_requests", engine_options.max_pending_requests},
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},
+             {"prefill_round_robin", engine_options.prefill_round_robin},
              {"original_int8_prefill_kernel", engine_options.original_int8_prefill_kernel},
+             {"prefill_8bit_pv", prefill_pv8_name(engine_options.prefill_8bit_pv)},
+             {"prefill_split_workspace_mib", engine_options.prefill_split_workspace_mib},
              {"original_nvfp4_prefill_kernel", engine_options.original_nvfp4_prefill_kernel},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
@@ -505,6 +523,9 @@ std::string format_server_start_json(
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
+             {"draft_tree_nodes", engine_options.speculative.draft_tree_nodes},
+             {"draft_tree_auto", engine_options.speculative.draft_tree_auto},
+             {"draft_tree_paths", engine_options.speculative.draft_tree_paths},
              {"ngram_draft_window", engine_options.speculative.ngram_draft_tokens},
              {"ngram_min_match", engine_options.speculative.ngram_min_match},
              {"ngram_archive_bytes", engine_options.speculative.ngram_archive_bytes},
@@ -884,17 +905,42 @@ ServerLogEnvironment query_server_log_environment(int device) {
 
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  const std::string& protected_artifact_path,
-                                 std::shared_ptr<spdlog::logger> logger)
-    : path_(path), logger_(std::move(logger)) {
+                                 std::shared_ptr<spdlog::logger> logger,
+                                 RequestLogRotation rotation)
+    : path_(path), logger_(std::move(logger)), rotation_(rotation) {
     if (path_.empty()) { return; }
-    if (!protected_artifact_path.empty() &&
-        normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
-        throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
+    if (rotation_.keep > kMaximumRequestLogKeep) {
+        throw std::invalid_argument("request JSONL log keeps too many rotated files");
+    }
+    if (!protected_artifact_path.empty()) {
+        const std::filesystem::path artifact = normalized_absolute_path(protected_artifact_path);
+        if (normalized_absolute_path(path_) == artifact) {
+            throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
+        }
+        for (std::uint32_t index = 1; rotation_.max_bytes != 0 && index <= rotation_.keep;
+             ++index) {
+            if (normalized_absolute_path(rotated_path(index)) == artifact) {
+                throw std::invalid_argument(
+                    "a rotated request JSONL log must not overwrite the model artifact");
+            }
+        }
     }
     server_instance_id_ = new_server_instance_id();
     output_.open(path_, std::ios::out | std::ios::app);
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);
+    }
+    enabled_ = true;
+    std::error_code error;
+    const std::uintmax_t existing = std::filesystem::file_size(path_, error);
+    written_bytes_                = error ? 0 : static_cast<std::uint64_t>(existing);
+    // An existing file already at the limit is rotated before this server writes to it.
+    if (rotation_.max_bytes != 0 && written_bytes_ >= rotation_.max_bytes) {
+        const std::string warning = rotate_locked();
+        if (!warning.empty() && logger_ != nullptr) { logger_->warn("{}", warning); }
+        if (failed_) {
+            throw std::runtime_error("failed to reopen request JSONL log after rotation: " + path_);
+        }
     }
 }
 
@@ -909,9 +955,14 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
     const std::optional<std::uint64_t> artifact_size =
         error ? std::nullopt : std::optional<std::uint64_t>(size);
-    append(format_server_start_json(server_instance_id_, unix_time_ms(), options, engine_options,
-                                    sampling_defaults, public_model_id, load, memory,
-                                    query_server_log_environment(options.device), artifact_size));
+    std::string record = format_server_start_json(
+        server_instance_id_, unix_time_ms(), options, engine_options, sampling_defaults,
+        public_model_id, load, memory, query_server_log_environment(options.device), artifact_size);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        server_start_record_ = record;
+    }
+    append(std::move(record));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
@@ -943,6 +994,7 @@ void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
 
 void JsonlRequestLog::append(std::string record) {
     bool report_failure = false;
+    std::string rotation_warning;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (failed_) { return; }
@@ -951,12 +1003,66 @@ void JsonlRequestLog::append(std::string record) {
         if (!output_) {
             failed_        = true;
             report_failure = true;
+        } else {
+            written_bytes_ += record.size() + kLineTerminatorBytes;
+            if (rotation_.max_bytes != 0 && written_bytes_ >= rotation_.max_bytes) {
+                rotation_warning = rotate_locked();
+                report_failure   = failed_;
+            }
         }
     }
+    if (!rotation_warning.empty() && logger_ != nullptr) { logger_->warn("{}", rotation_warning); }
     if (report_failure && logger_ != nullptr) {
         logger_->error("request log disabled | write failed | {}",
                        product::format_pretty_text(path_));
     }
+}
+
+std::string JsonlRequestLog::rotated_path(std::uint32_t index) const {
+    return path_ + '.' + std::to_string(index);
+}
+
+std::string JsonlRequestLog::rotate_locked() {
+    output_.close();
+    std::error_code error;
+    if (rotation_.keep == 0) {
+        std::filesystem::remove(path_, error);
+    } else {
+        // Shift PATH.(keep-1) .. PATH.1 up by one, overwriting the oldest, then retire PATH.
+        for (std::uint32_t index = rotation_.keep - 1; index >= 1; --index) {
+            std::error_code shift_error;
+            if (!std::filesystem::exists(rotated_path(index), shift_error)) { continue; }
+            std::filesystem::remove(rotated_path(index + 1), shift_error);
+            std::filesystem::rename(rotated_path(index), rotated_path(index + 1), shift_error);
+        }
+        std::error_code remove_error;
+        std::filesystem::remove(rotated_path(1), remove_error);
+        std::filesystem::rename(path_, rotated_path(1), error);
+    }
+    std::string warning;
+    if (error) {
+        // Typically another process holds the file open without delete sharing (Windows). Keep
+        // appending to it and try again once another max_bytes have been written.
+        warning = "request log rotation failed | " + product::format_pretty_text(path_) + " | " +
+                  error.message() + " | appending to the current file";
+    }
+    output_.clear();
+    output_.open(path_, std::ios::out | std::ios::app);
+    written_bytes_ = 0;
+    if (!output_) {
+        failed_ = true;
+        return warning;
+    }
+    if (!error && !server_start_record_.empty()) {
+        output_ << server_start_record_ << '\n';
+        output_.flush();
+        if (!output_) {
+            failed_ = true;
+            return warning;
+        }
+        written_bytes_ = server_start_record_.size() + kLineTerminatorBytes;
+    }
+    return warning;
 }
 
 } // namespace ninfer::serve

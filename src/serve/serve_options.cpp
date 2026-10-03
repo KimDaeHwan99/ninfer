@@ -55,6 +55,8 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    if (value == "vq2") { return KvCacheStorage::Vq2; }
+    if (value == "k4v2") { return KvCacheStorage::Q4KeyVq2Value; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -83,13 +85,34 @@ std::string serve_usage_text(const char* argv0) {
            "                             (--device, when also given, must name the first)\n"
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
            "                             (default 1024)\n"
+           "  --prefill-round-robin      rotate prefill over the requests that are\n"
+           "                             prefilling, in steps of at most 1024 tokens while\n"
+           "                             another request is active, so it waits less\n"
+           "                             (default: lowest lane first, whole chunks)\n"
            "  --use-original-int8-prefill-kernel\n"
            "                             prefill INT8 KV with the original prompt kernel at\n"
            "                             the requested chunk (default: the fast kernel, chunk\n"
            "                             rounded down to whole attention waves)\n"
+           "  --prefill-8bit-pv          INT8 and K4V2 KV: run prompt attention's P*V on\n"
+           "                             8-bit Tensor Cores (up to 5 % (INT8) and 7 % (K4V2)\n"
+           "                             faster long-prompt prefill, but a measurable KL\n"
+           "                             divergence from a BF16 KV reference: twice FP16\n"
+           "                             P*V's for INT8, 1.09x for K4V2, so FP16 P*V is\n"
+           "                             the default)\n"
+           "  --no-prefill-8bit-pv       NVFP4, K8V4 and VQ2 KV: run prompt attention's\n"
+           "                             P*V in FP16 instead of 8 bits (5-7 % slower long-\n"
+           "                             prompt prefill; the default 8-bit form stays\n"
+           "                             within 1.1x FP16's KL divergence from BF16 KV)\n"
            "  --use-original-nvfp4-prefill-kernel\n"
            "                             prefill NVFP4 KV with the tiled prompt kernel\n"
            "                             (default: the fast kernel)\n"
+           "  --prefill-split-workspace-mib N\n"
+           "                             memory for splitting prompt attention across SMs\n"
+           "                             (default " +
+           std::to_string(kDefaultPrefillSplitWorkspaceMiB) +
+           "; 128-384 recommended). Less frees KV cache but\n"
+           "                             slows 1-2K-token chunks over long context (64: up\n"
+           "                             to 27% slower attention; 0: no splitting)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
@@ -127,7 +150,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            ")\n"
-           "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4\n"
+           "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2\n"
            "  --no-prefix-reuse          disable prefix caching in either system below\n"
            "                             (enabled by default); cannot be combined with any\n"
            "                             prefix-cache option\n"
@@ -191,8 +214,23 @@ std::string serve_usage_text(const char* argv0) {
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
            "  --draft-tokens N           draft tokens per round (mtp 1-5; dflash/dflash2 1-15)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
-           "  --ngram-draft-tokens N     propose N verified ngram copies per round, 1-63 (0 off);\n"
-           "                             above 15 requires --max-concurrency 1\n"
+           "  --draft-tree-nodes auto|LIST\n"
+           "                             dflash2: verify a small tree of alternative drafts\n"
+           "                             each round instead of a single draft, so more drafted\n"
+           "                             tokens are accepted (same output distribution).\n"
+           "                             auto (recommended): measures speed while serving and\n"
+           "                             uses a tree only where it is faster, typically with\n"
+           "                             one to three active requests below ~64K context; its\n"
+           "                             choices follow timing, so seeded output can vary\n"
+           "                             between runs. Artifacts without tree support keep\n"
+           "                             single drafts (startup warning).\n"
+           "                             LIST: fixed tree sizes in tokens by number of active\n"
+           "                             requests, e.g. 16,12,12,0 = 16 for one request, 12\n"
+           "                             for two or three, single drafts from four; sizes are\n"
+           "                             draft tokens + 2 to 32, 0 = single draft (draft\n"
+           "                             tokens + 1)\n"
+           "  --draft-tree-paths N       most branches per tree, 2-8 (default 8)\n"
+           "  --ngram-draft-tokens N     propose N verified ngram copies per round, 1-63 (0 off)\n"
            "  --ngram-min-match N        minimum ngram match length, 4-64\n"
            "  --ngram-archive-mib N      MiB of retained source archive for ngram proposals\n"
            "  --ngram-session-mib N      MiB session-scoped ngram source budget (default 128);\n"
@@ -240,6 +278,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-pending-requests N   max queued requests (default 16)\n"
            "  --pending-timeout-ms N     queue timeout in ms (default 30000)\n"
            "  --request-log-jsonl FILE   append full-precision server/request records\n"
+           "  --request-log-max-mib N    rotate FILE when it reaches N MiB: it becomes\n"
+           "                             FILE.1, older files shift up (default: one file\n"
+           "                             without a size limit)\n"
+           "  --request-log-keep N       rotated files kept, 0-1000 (default 4)\n"
            "  --response-store-max-records N Responses-state record cap (default 1024)\n"
            "  --response-store-max-mib N      Responses-state byte cap in MiB (default 256)\n"
            "  --log-stats-interval-ms N  throughput-log interval in ms\n"
@@ -262,8 +304,9 @@ std::string serve_usage_text(const char* argv0) {
            "  prefix caching system).\n"
            "  Options of the two prefix caching systems cannot be mixed.\n"
            "  --vision-offload on requires --vision.\n"
-           "  --ngram-draft-tokens above 15 requires --max-concurrency 1.\n"
            "  --ngram-native-sessions requires --ngram-archive-mib.\n"
+           "  --request-log-max-mib requires --request-log-jsonl, and --request-log-keep\n"
+           "  requires --request-log-max-mib.\n"
            "  --rope-yarn-factor is startup-fixed, finite [1,4] (default 1); it extends the\n"
            "  allowed ceiling only, not --max-context.\n"
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
@@ -290,6 +333,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     std::vector<int> rank_devices;
     std::uint32_t tensor_parallel = 1;
     bool kv_capacity_explicit        = false;
+    bool request_log_keep_explicit   = false;
     bool context_capacity_explicit   = false;
     bool host_state_slots_explicit   = false;
     bool host_kv_mib_explicit        = false;
@@ -354,11 +398,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+        } else if (arg == "--prefill-round-robin") {
+            options.prefill_round_robin = true;
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
+        } else if (arg == "--prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::On;
+        } else if (arg == "--no-prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::Off;
+        } else if (arg == "--prefill-split-workspace-mib") {
+            options.prefill_split_workspace_mib = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--prefill-split-workspace-mib"), "prefill-split-workspace-mib"));
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--context-cost-presets") {
@@ -498,6 +551,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--request-log-max-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--request-log-max-mib"), "request-log-max-mib");
+            if (mib == 0 || mib > std::numeric_limits<std::uint64_t>::max() >> 20) {
+                throw std::invalid_argument("--request-log-max-mib is out of range");
+            }
+            options.request_log_rotation.max_bytes = mib << 20;
+        } else if (arg == "--request-log-keep") {
+            const int keep =
+                parse_nonnegative_int(require_value("--request-log-keep"), "request-log-keep");
+            if (keep > static_cast<int>(kMaximumRequestLogKeep)) {
+                throw std::invalid_argument("--request-log-keep must be in [0,1000]");
+            }
+            options.request_log_rotation.keep = static_cast<std::uint32_t>(keep);
+            request_log_keep_explicit         = true;
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");
@@ -526,6 +594,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--draft-tree-nodes") {
+            product::apply_draft_tree_nodes(options.speculative,
+                                            require_value("--draft-tree-nodes"));
+        } else if (arg == "--draft-tree-paths") {
+            options.speculative.draft_tree_paths = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--draft-tree-paths"), "draft-tree-paths"));
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
@@ -716,19 +790,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
+    if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
+        throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");
+    }
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_offload && !options.enable_vision) {
         throw std::invalid_argument("--vision-offload on requires --vision");
     }
-    // A speculative decode frame is allocated at the wider of the neural and ngram draft windows
-    // and cannot be narrowed for a multi-request batch. The GDN conv-record workspace admits at
-    // most 16 verification columns when the batch holds more than one request, so a wider ngram
-    // proposal is admitted only for a single active request.
-    if (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1) {
-        throw std::invalid_argument("--ngram-draft-tokens above 15 requires --max-concurrency 1");
-    }
     if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
         throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");
+    }
+    if (options.request_log_rotation.max_bytes != 0 && options.request_log_jsonl.empty()) {
+        throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");
+    }
+    if (request_log_keep_explicit && options.request_log_rotation.max_bytes == 0) {
+        throw std::invalid_argument("--request-log-keep requires --request-log-max-mib");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {

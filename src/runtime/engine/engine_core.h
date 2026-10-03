@@ -95,6 +95,7 @@ public:
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
+        scheduler_.set_prefill_round_robin(options.prefill_round_robin);
         if (!options.context_cache.max_private_continuations ||
             !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
@@ -1451,7 +1452,9 @@ private:
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
-        Scheduling::consume_service_work(*request, 1);
+        // A Concurrent step inside a prefill chunk leaves its service unit to the step that
+        // finishes the chunk.
+        if (progress.completes_service_unit) { Scheduling::consume_service_work(*request, 1); }
         if (!request->admitted_begin) {
             throw std::logic_error("prefill progress has no committed admission summary");
         }
@@ -1511,10 +1514,20 @@ private:
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
         }
+        scheduler_.record_prefill_served(lane);
+        // With round-robin, a step beside another active request advances only the Program's
+        // narrower concurrent width, so that request waits less on this prefill.
+        bool shared = false;
+        for (const auto& other : slots_) {
+            shared = shared || (other != nullptr && other != request && !other->terminal_reason);
+        }
+        const PrefillStepWidth width = scheduler_.prefill_round_robin() && shared
+                                           ? PrefillStepWidth::Concurrent
+                                           : PrefillStepWidth::Nominal;
         setup.finish();
         ProgramCallScope program_call(*this);
-        auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+        auto progress = instance_.program->advance_prefill(*request->sequence,
+                                                           &program_call.failed_timing(), width);
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         // A completed prefill already re-arms admission (owner cleared above). Re-arm again when

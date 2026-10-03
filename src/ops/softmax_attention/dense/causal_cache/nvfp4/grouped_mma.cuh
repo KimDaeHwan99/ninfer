@@ -1,14 +1,16 @@
 #pragma once
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/tile_io.cuh"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/schedule.cuh"
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
+#include "ops/softmax_attention/common/causal_tree.cuh"
 
 namespace ninfer::ops::detail {
 // Decode represented G16 cache to FP16. Q remains unquantized; QK/PV accumulate in FP32.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
-          bool ParallelQueries = false>
+          bool ParallelQueries = false, bool Tree = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void nvfp4_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
@@ -19,7 +21,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float attention_scale,
-        float* partial_acc, float* partial_m, float* partial_l) {
+        float* partial_acc, float* partial_m, float* partial_l, const std::uint32_t* tree_masks) {
     constexpr int TokenTile = Schedule::kTokenTile, WarpsPerCta = Schedule::kWarps;
     constexpr int KeyBlock             = Schedule::kKeyRows;
     constexpr bool DynamicArena        = Schedule::kDynamicArena;
@@ -89,7 +91,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
     q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
-    const int last_pos = positions[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int last_pos  = positions[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int row_first = positions[MultiBatch ? batch * full_width : 0];
     positions += column_base;
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
@@ -109,12 +112,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     if (valid_tokens == 0) return;
     if (positions[0] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
-    const int window             = last_pos + 1;
+    // Masked tail columns repeat the last live position; no key past it is loaded.
+    const int live_end           = last_pos + 1;
+    const int window             = causal_row_window(row_first, full_width, logical_capacity);
     const int active_split_count = partition.active(window);
     if (split >= active_split_count) return;
     const int logical_tiles = div_up(window, Bc);
     const int split_start   = (split * logical_tiles / active_split_count) * Bc;
     const int split_end     = min(((split + 1) * logical_tiles / active_split_count) * Bc, window);
+    const int load_end      = min(split_end, live_end);
     const int first_tile    = split_start;
     const int key_blocks    = div_up(split_end - first_tile, Bc);
 
@@ -224,7 +230,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int key = tile_k0 + key_l;
             auto* k_dst   = k_scale_s + key_l * kKVCacheNvfp4Groups;
             auto* v_dst   = v_scale_s + key_l * kKVCacheNvfp4Groups;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 cp_async<16>(k_dst, cache_k_scale + scale_offset);
@@ -243,7 +249,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int physical_byte = nvfp4_kv_code_swizzle(key_l, dc * 16);
             std::uint8_t* k_dst     = &k_nvfp4[key_l * CodeRowBytes + physical_byte];
             std::uint8_t* v_dst     = &v_nvfp4[key_l * CodeRowBytes + d / 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
@@ -270,7 +276,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const auto represented = kv_cache_nvfp4_dequant_f16x16(
                     &k_nvfp4[key_l * CodeRowBytes + nvfp4_kv_code_swizzle(key_l, d / 2)],
                     k_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]);
@@ -318,6 +324,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 causal_row_to_qt<Geometry>(row1, kv_head, q_head1, token1);
                 const int qabs0 = row0 < tile_tokens * Geometry::GroupSize ? positions[token0] : -1;
                 const int qabs1 = row1 < tile_tokens * Geometry::GroupSize ? positions[token1] : -1;
+                // Tree rows admit only a query column's ancestors among the block keys.
+                const std::uint32_t tree0 =
+                    qabs0 >= 0 ? causal_tree_mask<Tree>(tree_masks, batch, full_width,
+                                                        column_begin + token0)
+                               : ~0u;
+                const std::uint32_t tree1 =
+                    qabs1 >= 0 ? causal_tree_mask<Tree>(tree_masks, batch, full_width,
+                                                        column_begin + token1)
+                               : ~0u;
                 float bm0       = -CUDART_INF_F;
                 float bm1       = -CUDART_INF_F;
 #pragma unroll
@@ -326,19 +341,27 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     const int key0 = k0 + col0;
                     const int key1 = key0 + 1;
                     score[nt][0]   = row0 < tile_tokens * Geometry::GroupSize &&
-                                           key0 >= split_start && key0 < split_end && key0 <= qabs0
+                                             key0 >= split_start && key0 < split_end &&
+                                             key0 <= qabs0 &&
+                                             (!Tree || causal_tree_visible(key0, row_first, tree0))
                                          ? score[nt][0] * attention_scale
                                          : -CUDART_INF_F;
                     score[nt][1]   = row0 < tile_tokens * Geometry::GroupSize &&
-                                           key1 >= split_start && key1 < split_end && key1 <= qabs0
+                                             key1 >= split_start && key1 < split_end &&
+                                             key1 <= qabs0 &&
+                                             (!Tree || causal_tree_visible(key1, row_first, tree0))
                                          ? score[nt][1] * attention_scale
                                          : -CUDART_INF_F;
                     score[nt][2]   = row1 < tile_tokens * Geometry::GroupSize &&
-                                           key0 >= split_start && key0 < split_end && key0 <= qabs1
+                                             key0 >= split_start && key0 < split_end &&
+                                             key0 <= qabs1 &&
+                                             (!Tree || causal_tree_visible(key0, row_first, tree1))
                                          ? score[nt][2] * attention_scale
                                          : -CUDART_INF_F;
                     score[nt][3]   = row1 < tile_tokens * Geometry::GroupSize &&
-                                           key1 >= split_start && key1 < split_end && key1 <= qabs1
+                                             key1 >= split_start && key1 < split_end &&
+                                             key1 <= qabs1 &&
+                                             (!Tree || causal_tree_visible(key1, row_first, tree1))
                                          ? score[nt][3] * attention_scale
                                          : -CUDART_INF_F;
                     bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
@@ -399,7 +422,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int dc    = chunk - key_l * (D / 16);
                 const int d     = dc * 16;
                 const int key   = k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const auto represented = kv_cache_nvfp4_dequant_f16x16(
                         &v_nvfp4[key_l * CodeRowBytes + d / 2],
                         v_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]);
@@ -424,7 +447,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int dc    = chunk - key_l * (D / 16);
                 const int d     = dc * 16;
                 const int key   = k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const auto represented = kv_cache_nvfp4_dequant_f16x16(
                         &v_nvfp4[key_l * CodeRowBytes + d / 2],
                         v_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]);
@@ -486,6 +509,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
+    // The KV stream is done: a programmatic merge may begin launching as CTAs finish.
+    pdl::trigger_dependents();
 
     if (warp < RowTiles && lid == 0) {
         const int row0 = warp * 16 + gid;

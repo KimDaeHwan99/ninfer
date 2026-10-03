@@ -60,6 +60,8 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    if (text == "vq2") { return KvCacheStorage::Vq2; }
+    if (text == "k4v2") { return KvCacheStorage::Q4KeyVq2Value; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -86,9 +88,9 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--tp 1|2] [--devices N,N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
-           "       [--lm-head-draft]\n"
+           "       [--lm-head-draft] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
            "       [--ngram-draft-tokens 1..63] [--ngram-min-match 4..64]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -125,18 +127,44 @@ std::string usage_text(const char* argv0) {
            ")\n"
            "  --tp 1|2                 split the model across two GPUs (requires --devices A,B)\n"
            "  --devices A,B            the two CUDA devices of --tp 2\n"
-           "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4\n"
+           "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2\n"
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
+           "  --prefill-8bit-pv        INT8 and K4V2 KV: run prompt attention's P*V on 8-bit\n"
+           "                           Tensor Cores (up to 5-7 % faster long-prompt prefill,\n"
+           "                           but a measurable KL divergence from a BF16 KV\n"
+           "                           reference, so FP16 P*V is the default)\n"
+           "  --no-prefill-8bit-pv     NVFP4, K8V4 and VQ2 KV: run prompt attention's P*V in\n"
+           "                           FP16 instead of 8 bits (5-7 % slower long-prompt\n"
+           "                           prefill; the default 8-bit form stays within 1.1x\n"
+           "                           FP16's KL divergence from BF16 KV)\n"
            "  --use-original-nvfp4-prefill-kernel\n"
            "                           prefill NVFP4 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
+           "  --prefill-split-workspace-mib N\n"
+           "                           memory for splitting prompt attention across SMs\n"
+           "                           (default " +
+           std::to_string(kDefaultPrefillSplitWorkspaceMiB) +
+           "; 128-384 recommended). Less frees KV cache but\n"
+           "                           slows 1-2K-token chunks over long context (64: up\n"
+           "                           to 27% slower attention; 0: no splitting)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
            "  --draft-tokens N         draft tokens per round (mtp 1-5; dflash 1-15)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
+           "  --draft-tree-nodes auto|N\n"
+           "                           dflash2: verify a small tree of alternative drafts each\n"
+           "                           round instead of a single draft, so more drafted tokens\n"
+           "                           are accepted (same output distribution).\n"
+           "                           auto (recommended): measures speed as it runs and uses a\n"
+           "                           tree only when it is faster; artifacts without tree\n"
+           "                           support keep single drafts (with a warning).\n"
+           "                           N: a fixed tree of N tokens, draft tokens + 2 to 32 (a\n"
+           "                           single draft is draft tokens + 1; 16 suits\n"
+           "                           --draft-tokens 7). Seeded runs repeat exactly only with N\n"
+           "  --draft-tree-paths N     most branches per tree (2-8, default 8)\n"
            "  --no-cuda-graph          disable CUDA-graph decode rounds\n"
            "\n"
            "SAMPLING\n"
@@ -234,6 +262,10 @@ Options parse_options(int argc, char** argv) {
                 parse_u32(value(arg), "ngram-draft-tokens", true);
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
+        } else if (arg == "--draft-tree-nodes") {
+            product::apply_draft_tree_nodes(options.speculative, value(arg));
+        } else if (arg == "--draft-tree-paths") {
+            options.speculative.draft_tree_paths = parse_u32(value(arg), "draft-tree-paths");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {
@@ -276,6 +308,13 @@ Options parse_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
+        } else if (arg == "--prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::On;
+        } else if (arg == "--no-prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::Off;
+        } else if (arg == "--prefill-split-workspace-mib") {
+            options.prefill_split_workspace_mib =
+                parse_u32(value(arg), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--stop-token-id") {
@@ -339,6 +378,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
+    }
+    if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
+        throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {

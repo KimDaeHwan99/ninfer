@@ -1,17 +1,20 @@
 #pragma once
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
 
 #include "ops/softmax_attention/dense/causal_cache/int8/schedule.cuh"
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
+#include "ops/softmax_attention/common/causal_tree.cuh"
 
 namespace ninfer::ops::detail {
 
 // Native INT8 QK accumulates each G64 group in INT32, then applies Q/K scales in FP32.
-// PV dequantizes represented V to FP16 and accumulates in FP32.
+// PV dequantizes represented V to FP16 and accumulates in FP32. Tree instances also apply the
+// per-column ancestor masks of a verification tree; chain instances carry no mask arithmetic.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
-          bool ParallelQueries = false>
+          bool ParallelQueries = false, bool Tree = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void int8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -22,7 +25,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float scale, float* partial_acc,
-        float* partial_m, float* partial_l) {
+        float* partial_m, float* partial_l, const std::uint32_t* tree_masks) {
     constexpr int TokenTile            = Schedule::kTokenTile;
     constexpr int WarpsPerCta          = Schedule::kWarps;
     constexpr int KeyBlock             = Schedule::kKeyRows;
@@ -95,7 +98,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
     q += static_cast<std::int64_t>(256) * Geometry::QHeads * column_base;
-    const int last_pos = pos[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int last_pos  = pos[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int row_first = pos[MultiBatch ? batch * full_width : 0];
     pos += column_base;
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(256) * Geometry::KVHeads * column_base;
@@ -115,7 +119,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     if (valid_tokens == 0) return; // Merge writes exact zero for masked columns.
     if (pos[0] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
-    const int window             = last_pos + 1;
+    // Masked tail columns repeat the last live position; no key past it is loaded.
+    const int live_end           = last_pos + 1;
+    const int window             = causal_row_window(row_first, full_width, logical_capacity);
     const int active_split_count = partition.active(window);
     if (split >= active_split_count) return;
     const int logical_tiles    = div_up(window, Bc);
@@ -123,6 +129,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int end_owned_tile   = (split + 1) * logical_tiles / active_split_count;
     const int split_start      = first_owned_tile * Bc;
     const int split_end        = min(end_owned_tile * Bc, window);
+    const int load_end         = min(split_end, live_end);
     const int first_tile       = split_start;
     const int key_blocks       = div_up(split_end - first_tile, Bc);
 
@@ -280,7 +287,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
@@ -296,7 +303,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
@@ -384,6 +391,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             causal_row_to_qt<Geometry>(row1, kv_head, q_head1, token1);
             const int qabs0 = (row0 < tile_tokens * Geometry::GroupSize) ? pos[token0] : -1;
             const int qabs1 = (row1 < tile_tokens * Geometry::GroupSize) ? pos[token1] : -1;
+            const std::uint32_t tree0 =
+                qabs0 >= 0
+                    ? causal_tree_mask<Tree>(tree_masks, batch, full_width, column_begin + token0)
+                    : ~0u;
+            const std::uint32_t tree1 =
+                qabs1 >= 0
+                    ? causal_tree_mask<Tree>(tree_masks, batch, full_width, column_begin + token1)
+                    : ~0u;
+            const auto tree_visible = [&](int key, std::uint32_t mask) {
+                if constexpr (!Tree) {
+                    return true;
+                } else {
+                    return causal_tree_visible(key, row_first, mask);
+                }
+            };
             float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
@@ -392,19 +414,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int key0 = k0 + col0;
                 const int key1 = k0 + col1;
                 score[nt][0]   = (row0 < tile_tokens * Geometry::GroupSize && key0 >= split_start &&
-                                key0 < split_end && key0 <= qabs0)
+                                  key0 < split_end && key0 <= qabs0 && tree_visible(key0, tree0))
                                      ? score[nt][0] * scale
                                      : -CUDART_INF_F;
                 score[nt][1]   = (row0 < tile_tokens * Geometry::GroupSize && key1 >= split_start &&
-                                key1 < split_end && key1 <= qabs0)
+                                  key1 < split_end && key1 <= qabs0 && tree_visible(key1, tree0))
                                      ? score[nt][1] * scale
                                      : -CUDART_INF_F;
                 score[nt][2]   = (row1 < tile_tokens * Geometry::GroupSize && key0 >= split_start &&
-                                key0 < split_end && key0 <= qabs1)
+                                  key0 < split_end && key0 <= qabs1 && tree_visible(key0, tree1))
                                      ? score[nt][2] * scale
                                      : -CUDART_INF_F;
                 score[nt][3]   = (row1 < tile_tokens * Geometry::GroupSize && key1 >= split_start &&
-                                key1 < split_end && key1 <= qabs1)
+                                  key1 < split_end && key1 <= qabs1 && tree_visible(key1, tree1))
                                      ? score[nt][3] * scale
                                      : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
@@ -466,7 +488,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_swizzle(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const int grp = d >> 6;
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
@@ -535,6 +557,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
+    // The KV stream is done: a programmatic merge may begin launching as CTAs finish.
+    pdl::trigger_dependents();
 
     if (warp < RowTiles && lid == 0) {
         const int row0 = warp * 16 + gid;

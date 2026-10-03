@@ -831,9 +831,19 @@ Thinking is returned with an opaque compatibility signature; SSE emits its `sign
 before closing the block. Request lowering reconstructs the local prompt from the visible
 `thinking` text and treats `signature` as non-semantic transport metadata, so retained history
 remains usable across serve restarts.
-`display:"omitted"` is rejected because NInfer cannot provide Anthropic's
-encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
-closed-turn reasoning history. `output_config.effort` passes its protocol-validated value to the
+
+`thinking.display:"omitted"`, which current Claude Code sends on every request, returns each
+Thinking block with an empty `thinking` string and no `thinking_delta` events. Its `signature`
+(`signature_delta` when streaming) is `ninfer-reasoning.v1:` followed by the Base64 reasoning text,
+so the reasoning stays out of the visible transcript but comes back with the block the client
+echoes. When a replayed Thinking block has empty `thinking` and such a signature, request lowering
+restores the reasoning from it, so the prompt (and its prefix-cache identity) is the one
+`summarized` display would give; non-empty `thinking` text takes precedence, any other signature
+stays non-semantic metadata, and a malformed NInfer signature fails with
+`invalid_thinking_signature`. The signature is not encrypted or authenticated: this is a local
+trusted server, and the value is the same reasoning text `summarized` display shows. Count Tokens
+ignores `display`. `preserve_thinking` remains a NInfer extension for closed-turn reasoning
+history. `output_config.effort` passes its protocol-validated value to the
 selected template, substituting the nearest value the template accepts as described above.
 
 User-defined tools support `name`, `description`, object `input_schema`, and `input_examples`.
@@ -919,9 +929,13 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
-| `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--use-original-int8-prefill-kernel` | prefill INT8-KV prompt attention with the original kernel at the requested `--prefill-chunk`. Without it INT8 KV uses the fast kernel (FP16 per-tile PV accumulation) and rounds `--prefill-chunk` down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090: `4096` runs as `3584`); requires `--kv-dtype int8` (startup rejects it with any other KV format) | off |
-| `--use-original-nvfp4-prefill-kernel` | prefill NVFP4-KV prompt attention with the tiled kernel. Without it a chunk that sees more than 2048 keys uses the fast kernel, which runs QK on block-scaled FP4 Tensor Cores directly over the stored K codes (Q as two NVFP4 terms), decodes V in registers with FP16 per-tile PV accumulation, and splits the chunk's keys across CTAs when its row blocks alone would leave SMs idle (at most 64 MiB of workspace); shorter chunks keep the tiled kernel. Requires `--kv-dtype nvfp4` (startup rejects it with any other KV format) | off |
+| `--prefill-chunk N` | text-prefill chunk; with INT8, NVFP4, FP8, K8V4, VQ2 or K4V2 KV (unless an original INT8 or NVFP4 prompt kernel is selected) it is rounded down to whole prompt-attention waves, 896 tokens for the 24-head model on RTX 5090 (`4096` runs as `3584`) | `1024` |
+| `--prefill-round-robin` | rotate prefill units over the requests with staged prefill, starting after the lane the previous unit served, and while another request is active advance at most 1024 prompt tokens per unit (896, one attention wave, where `--prefill-chunk` is rounded to waves) ([execution behavior](#execution-behavior)); effective only with `--max-concurrency` above 1 | lowest lane first, whole chunks |
+| `--use-original-int8-prefill-kernel` | prefill INT8-KV prompt attention with the original kernel at the requested `--prefill-chunk`. Without it INT8 KV uses the fast kernel (FP16 per-tile PV accumulation; a chunk whose row blocks alone would leave SMs idle splits its keys across CTAs within `--prefill-split-workspace-mib`) and rounds `--prefill-chunk` down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090: `4096` runs as `3584`); requires `--kv-dtype int8` (startup rejects it with any other KV format) | off |
+| `--prefill-8bit-pv` | force prompt attention's P×V onto 8-bit Tensor Cores where its kernel has both forms (the fast INT8 and NVFP4 prompt kernels, K8V4's tiled kernel and the VQ2 and K4V2 prompt kernel; no effect on BF16 or FP8 KV or with `--use-original-*-prefill-kernel`). INT8 KV: each row's probabilities, scaled by the V group scale, become 8-bit codes per 64-key tile against the exact stored V codes, and probabilities below half a code step of their tile's largest round to zero; up to 5 % less long-prompt prefill time, but about twice the KL divergence from a BF16 KV reference that FP16 P×V has at 64K context, so INT8 defaults to FP16. K4V2 KV: the VQ prompt kernel's integer form, over the same tile's INT8 V rows, removes 5.3-7.2 % of prefill time at 64K-128K tokens but raises that divergence 1.09x overall and 1.11x in the 32-64K bucket, so K4V2 defaults to FP16 as well | INT8, K4V2 |
+| `--no-prefill-8bit-pv` | force FP16 P×V (closest to exact attention) for NVFP4, K8V4 and VQ2 KV too. Their 8-bit forms are the defaults because they are numerically equivalent or nearly so against a BF16 KV reference on a model with BF16 activations: NVFP4 and K8V4 E4M3 P×V (probabilities against each tile's own row maximum, decoded V under a per-tile power-of-two shift, block-scaled E4M3 Tensor Cores with FP32 accumulation) stays within 1.1x FP16's at every context length, and VQ2's integer form within 1.03x; all three remove 5-7 % of end-to-end long-prompt prefill time (up to a fifth of prompt attention) | NVFP4, K8V4, VQ2 |
+| `--use-original-nvfp4-prefill-kernel` | prefill NVFP4-KV prompt attention with the tiled kernel. Without it a chunk that sees more than 768 keys uses the fast kernel (the MX-FP8 tiled kernel with NVFP4 keys), which runs QK on block-scaled FP4 Tensor Cores directly over the stored K codes (Q as two NVFP4 terms), decodes each V tile once per CTA with FP16 per-tile PV accumulation, and splits the chunk's keys across CTAs when that is cheaper than leaving SMs idle (within `--prefill-split-workspace-mib`); shorter chunks keep the tiled kernel. Requires `--kv-dtype nvfp4` (startup rejects it with any other KV format) | off |
+| `--prefill-split-workspace-mib N` | workspace in MiB, `0..16384`, that the FP32 partials of one prompt-attention launch may take when it splits its keys across SMs (the INT8 and NVFP4 fast prompt kernels, FP8 and K8V4 KV, and the VQ2 and K4V2 prompt kernels); a launch that would need more runs fewer splits. Less frees KV cache but slows prompt chunks of about 1-2K tokens over long context, such as follow-up turns and `--prefill-round-robin` steps. Per attention layer against unlimited, 1024-2048-token chunks take 17-25 % longer at `64` over 32K-128K cached keys, 2-5 % at `128`, and under 1 % from `192`; 3-4K-token chunks over 128K keys take up to 5 % longer below `384`. `0` turns splitting off (short chunks over long context up to 3× slower). With 4096-token chunks the startup workspace is about 515 MiB at the default, 380 MiB at `64` and 810 MiB unlimited (FP8 and K8V4 used no limit before). BF16 KV and the original INT8 and NVFP4 kernels ignore it | `256` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
@@ -933,13 +947,17 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--request-log-max-mib N` | rotate the request log once it reaches `N` MiB ([Structured request log](#structured-request-log)); requires `--request-log-jsonl` | one file without a size limit |
+| `--request-log-keep N` | rotated request-log files kept (`0..1000`); requires `--request-log-max-mib` | `4` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage; `vq2` and `k4v2` are the 2-bit and 4-bit-K vector-quantized formats ([CLI](cli.md#context-and-memory)) | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
-| `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter, `1..63`; above `15` requires `--max-concurrency 1`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
+| `--draft-tree-nodes auto\|LIST` | DFlash2 tree verification, each row's tree built on the device from the drafter's candidate lattice; works with every `--kv-dtype`. `auto` (recommended) lets every all-neural round of up to four rows choose the chain or a tree of `draft tokens + 5` or `+ 9` columns from measured round time and acceptance at its batch size and context length; on an artifact whose GDN input projections cannot verify trees it keeps chain verification and logs a warning. A LIST fixes the column count by batch size: entry *c* (anchor included, `draft tokens + 2..32`) applies to rounds of *c* rows, the last entry repeats for larger batches and `0` keeps chain verification; see [tree verification](maintainer/tree-verification.md) | off |
+| `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` | `8` |
+| `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter, `1..63`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
 | `--ngram-min-match N` | minimum matched tokens for an n-gram proposal, `4..64` | `12` |
 | `--ngram-archive-mib N` | RAM archive that keeps n-gram sources across the requests of a conversation; requires `--ngram-draft-tokens`; `0` keeps drafting request-local | `0` |
 | `--ngram-session-mib N` | one conversation's share of the n-gram archive; no effect without `--ngram-archive-mib` | `128` |
@@ -1055,6 +1073,18 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
+`--request-log-max-mib N` rotates the file by size; without it the file grows without limit. When
+`FILE` reaches `N` MiB (at the record that crosses the limit, so a file can exceed it by one record)
+it is renamed `FILE.1`, older files move up to `FILE.2` .. `FILE.K` for `--request-log-keep K`
+(default `4`), the oldest beyond `K` is deleted, and a new `FILE` is started; with `K = 0` the full
+file is deleted instead. A file already at the limit when the server starts is rotated before it
+writes. Every new file begins with a verbatim copy of this server's `server_start` record (same
+`server_instance_id` and timestamp), so each retained file can be read on its own; a reader that
+combines files should count one start per `server_instance_id`. If the rename fails, for example
+because another process holds `FILE` open without delete sharing on Windows, the server logs a
+warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
+checked against the model artifact path.
+
 Every line is one `ninfer_serve_request_log` schema-v25 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
@@ -1081,7 +1111,10 @@ counts once in `duplicate_parameters_repaired` for each repeat instead of demoti
 Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
 `trailing_content`, and `truncated_tail`. `truncated_tail` occurs only with `--tolerant-tool-calls`:
 with a nonzero `structured_call_count` the recovered calls were returned structurally (a discarded
-suffix or a call cut at the region end), and with none the region was returned as text. These
+suffix or a call cut at the region end), and with none the region was returned as text.
+`tolerant_recovered` is true when `--tolerant-tool-calls` turned output the strict parser rejects
+into structured calls: a recovered `truncated_tail`, or a kept call whose opener (a dropped `<` or
+keyword, a missing `>` after the name) was repaired or whose name is not a declared tool. These
 counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
@@ -1092,7 +1125,10 @@ derived downstream from raw token counts and seconds instead of rounded stderr s
 `drafted_tokens`, and `accepted_tokens` whose proposal came from n-gram copy drafting, and the
 `ngram_archive_rounds`, `ngram_archive_drafted_tokens`, and `ngram_archive_accepted_tokens` counters
 are the part of those whose copy source was the retained draft archive (see [n-gram
-drafting](ngram.md)). The `speculative.ngram_archive` object reports that archive at the end of the
+drafting](ngram.md)). With DFlash2 tree verification (`--draft-tree-nodes`), `tree_rounds` counts
+rounds that verified a tree, `tree_side_rounds` those whose accepted path left the main chain, and
+`tree_side_accepted_tokens` the drafts those paths accepted after leaving it, which a chain round
+would not have accepted; `drafted_tokens` counts every verified tree column. The `speculative.ngram_archive` object reports that archive at the end of the
 request: `enabled` when the server has one (`--ngram-archive-mib`), `bound` when the request was
 bound to a draft session, `published` when its input and output were published into it,
 `generation` as the session's latest completed generation, `sources` and `session_bytes` as the
@@ -1120,8 +1156,14 @@ the KV sizing reserved, and `cuda_graph_measured_bytes` the Device memory graph 
 actually took at startup (`0` without CUDA Graphs); the startup log warns when the second exceeds
 the first.
 
-`server_start.engine.original_int8_prefill_kernel` and `original_nvfp4_prefill_kernel` record
-`--use-original-int8-prefill-kernel` and `--use-original-nvfp4-prefill-kernel`. `ngram_draft_window` and
+`server_start.engine.original_int8_prefill_kernel`, `prefill_8bit_pv`,
+`prefill_split_workspace_mib` and `original_nvfp4_prefill_kernel` record
+`--use-original-int8-prefill-kernel`, the `--prefill-8bit-pv` / `--no-prefill-8bit-pv` choice as
+`"auto"`, `"on"` or `"off"`, `--prefill-split-workspace-mib` and
+`--use-original-nvfp4-prefill-kernel`. `draft_tree_nodes` (eight
+entries, one per batch size, all zero for `auto`), `draft_tree_auto` and `draft_tree_paths`
+record `--draft-tree-nodes` and `--draft-tree-paths`; `draft_tree_auto` is the resolved value,
+false when the artifact cannot verify trees. `ngram_draft_window` and
 `ngram_min_match` record `--ngram-draft-tokens` (`0` disables n-gram drafting) and
 `--ngram-min-match`; `ngram_archive_bytes` and `ngram_session_bytes` are the draft-archive budgets
 from `--ngram-archive-mib` (`0` keeps drafting request-local) and `--ngram-session-mib`; and
@@ -1207,7 +1249,16 @@ processed by one model traversal and, when graphs are enabled, one exact-batch C
 A request joins that batch only after its staged prefill finishes; while other requests are
 prefilling, waiting requests may still be admitted to free lanes, so prefill of one request can
 overlap the prefill and decode of the others (each prefill unit advances exactly one staged lane
-per worker boundary). When a request completes or is cancelled, the next boundary rebuilds the
+per worker boundary). The lowest-numbered lane with staged prefill is served first, so a short
+prompt staged beside a long one may wait for the whole long prefill, and every unit is a whole
+`--prefill-chunk`, which a waiting decode round also waits for. `--prefill-round-robin` serves the
+prefilling lanes in turn, and while any other request is active (prefilling or decoding) each unit
+advances at most 1024 prompt tokens (896, one attention wave, where `--prefill-chunk` is rounded to
+waves), so
+another request waits at most one such unit. A prompt alone still prefills in whole chunks. The
+narrower units use the workspace already reserved for `--prefill-chunk`, so they leave KV capacity
+unchanged, but they make a long prompt's own prefill slower while it shares the GPU, and outputs
+can differ slightly from a whole-chunk prefill, as they do between chunk sizes. When a request completes or is cancelled, the next boundary rebuilds the
 batch without an empty row.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation

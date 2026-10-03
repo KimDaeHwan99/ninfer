@@ -24,6 +24,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/speculative_tree.h"
 #include <algorithm>
 #include <initializer_list>
 #include <limits>
@@ -65,6 +66,77 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
         throw std::overflow_error(label);
     }
     return static_cast<std::int32_t>(value);
+}
+
+bool tree_table_enabled(const std::array<std::uint32_t, kMaximumConcurrency>& nodes) {
+    return std::any_of(nodes.begin(), nodes.end(), [](std::uint32_t n) { return n != 0; });
+}
+
+// Whether every GDN layer's input projection is a single FP8 or NVFP4 parent: tree convolution
+// reads each column's ancestors from that parent's materialized projection.
+bool tree_verification_supported(const execution::Parameters& parameters) {
+    for (const auto& block : parameters.text.layers) {
+        const auto* gdn = std::get_if<execution::GdnParameters>(&block.mixer);
+        if (gdn == nullptr) { continue; }
+        const auto* single = std::get_if<ops::SingleProjectionWeight>(&gdn->projection);
+        if (single == nullptr || (single->weight.qtype != QType::NVFP4 &&
+                                  single->weight.qtype != QType::FP8_E4M3FN_ROW_BF16)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The tree widths the options select: their fixed table, or the automatic widths for rounds of
+// up to kDraftTreeAutoMaxBatch rows. Automatic mode on a target that cannot verify trees resolves
+// to chain verification.
+TreeWidthPlan resolve_tree_widths(const execution::Parameters& parameters,
+                                  const EngineOptions& options) {
+    TreeWidthPlan plan{.fixed = options.speculative.draft_tree_nodes};
+    if (options.speculative.draft_tree_auto && tree_verification_supported(parameters)) {
+        const auto widths = draft_tree_auto_widths(options.speculative.draft_tokens);
+        plan.automatic.assign(widths.begin(), widths.end());
+        plan.automatic_max_batch = std::min(kDraftTreeAutoMaxBatch, options.max_concurrency);
+    }
+    return plan;
+}
+
+bool plan_has_tree(const SequencePlanImpl& plan) {
+    return std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
+                       [](const SpeculativeRoundShape& shape) {
+                           return shape.kind == SpeculativeRoundKind::Tree;
+                       });
+}
+
+// The speculative round families an engine captures. Neural rounds verify at the drafter's window
+// and n-gram copy rounds at the n-gram window, for every backend.
+std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions& options,
+                                                            const TreeWidthPlan& tree_widths) {
+    const SpeculativeOptions& spec = options.speculative;
+    std::vector<SpeculativeRoundShape> shapes;
+    if (spec.backend == SpeculativeBackend::None) { return shapes; }
+    shapes.push_back({SpeculativeRoundKind::Neural, spec.draft_tokens});
+    if (spec.ngram_draft_tokens != 0) {
+        // Copy rounds take the narrowest n-gram family that holds their longest copy, so short
+        // copies do not pay for the whole window. Narrower families lie strictly between the
+        // neural window (rows without a copy keep their neural proposal) and the n-gram window.
+        for (const std::uint32_t narrow : {7U, 15U, 31U}) {
+            if (narrow > spec.draft_tokens && narrow < spec.ngram_draft_tokens) {
+                shapes.push_back({SpeculativeRoundKind::Ngram, narrow});
+            }
+        }
+        shapes.push_back({SpeculativeRoundKind::Ngram, spec.ngram_draft_tokens});
+    }
+    // One tree family per distinct tree width.
+    for (const std::uint32_t nodes : tree_widths.widths()) {
+        const SpeculativeRoundShape shape{SpeculativeRoundKind::Tree, nodes - 1U};
+        if (std::none_of(shapes.begin(), shapes.end(), [&](const SpeculativeRoundShape& other) {
+                return other.kind == shape.kind && other.verify_drafts == shape.verify_drafts;
+            })) {
+            shapes.push_back(shape);
+        }
+    }
+    return shapes;
 }
 
 std::uint32_t page_count(std::uint32_t capacity) {
@@ -186,6 +258,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             };
         }
     }
+    if (kv_storage_has_exact_window(plan.kv_storage)) {
+        state_image_spec.kv_window = qwen3_5::KVWindowStateSpec{
+            .layers   = config.full_attention_layers + (plan.features.mtp() ? 1U : 0U),
+            .kv_heads = dimension(config.attention->num_key_value_heads),
+        };
+    }
     out.state_images = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
@@ -305,12 +383,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
-    // Prefill chunks run the selected prompt kernel, whose fast NVFP4 form may split keys into
-    // workspace (see execution/text.cpp).
-    const ops::CausalAttentionExecutionEnvelope prefill_envelope{
-        .min_visible_keys   = 1,
-        .max_visible_keys   = plan.capacity,
-        .fast_prompt_kernel = plan.fast_prefill_kernel};
+    // Prefill chunks run the selected prompt kernel, which may split keys into workspace (see
+    // execution/text.cpp).
+    const ops::CausalAttentionExecutionEnvelope prefill_envelope =
+        plan.prompt_attention.envelope(1, plan.capacity);
     const ops::CausalAttentionExecutionEnvelope verify_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -345,18 +421,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last,
                                  bool wide_verification = false) {
-        scratch(layout,
-                ops::linear_add_workspace_capacity_bytes(
-                    p.weight.qtype, p.weight.n, p.weight.k,
-                    execution::residual_projection_policy(p, wide_verification), first, last));
+        // A round's narrower families may resolve the ordinary policy at the same columns.
+        const auto bytes = [&](bool wide) {
+            return ops::linear_add_workspace_capacity_bytes(
+                p.weight.qtype, p.weight.n, p.weight.k,
+                execution::residual_projection_policy(p, wide), first, last);
+        };
+        scratch(layout, wide_verification ? std::max(bytes(true), bytes(false)) : bytes(false));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
-        const bool wide_verification =
-            wide_residual_verification(phase, batch_size, min_width, max_width);
+        const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
         for (const auto& block : parameters.text.layers) {
             {
                 auto stage = layout.scope();
@@ -385,7 +463,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                             gdn, *config.gdn, batch_size, min_width, max_width));
                     } else if (path == GdnWorkspacePath::ReplayRecord) {
                         scratch(layout, execution::gdn_record_workspace_bytes(
-                                            gdn, *config.gdn, batch_size, min_width, max_width));
+                                            gdn, *config.gdn, batch_size, min_width, max_width,
+                                            plan_has_tree(plan)));
                     } else {
                         (void)workspace::gdn_prefill_conv(layout, config, last);
                         scratch(layout,
@@ -404,8 +483,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
-            scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last, false, split,
-                                                           wide_verification));
+            scratch(layout,
+                    std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false, split,
+                                                            wide_verification),
+                             execution::ffn_workspace_bytes(block.ffn, first, last, false, split,
+                                                            false)));
         }
         if (!plan.causal_scoring) {
             // Prefill projects only the chunk's last column; a split head stages exactly that.
@@ -509,6 +591,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        // Top tokens and candidates: ids and log-probabilities of each.
+        for (const DType dtype : {DType::I32, DType::FP32, DType::I32, DType::FP32}) {
+            matrix(causal_score, dtype, static_cast<std::int32_t>(kMaximumScoreTopTokens),
+                   static_cast<std::int32_t>(kCausalScoreTile));
+        }
         head_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
         out.causal_score = finish(causal_score);
     }
@@ -679,6 +766,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     }
                     const auto mask_columns = proposal_drafts * batch;
                     matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
+                    // A proposal landing in another (wider) frame keeps the lattice's candidates
+                    // apart from the frame's column candidates.
+                    matrix(layout, DType::I32, dimension(draft->dflash2->selector_top_k),
+                           mask_columns);
                     matrix(layout, DType::FP32, dimension(draft->dflash2->selector_top_k),
                            mask_columns);
                     const auto& head = plan.proposal_head == ProposalHead::Optimized
@@ -691,8 +782,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                            mask_columns);
                     linear_scratch(layout, parameters.draft->selector->hidden_projection,
                                    mask_columns, mask_columns);
+                    // Staged chain drafts and laws before their copy into another frame.
+                    matrix(layout, DType::I32, 1, mask_columns);
+                    matrix(layout, DType::FP32, dimension(draft->dflash2->selector_top_k),
+                           mask_columns);
                     scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
                                         proposal_drafts, proposal_drafts, batch, batch));
+                    if (plan_has_tree(plan)) {
+                        // The tree build always runs over the full lattice.
+                        scratch(layout, ops::candidate_selector_tree_workspace_capacity_bytes(
+                                            proposal_drafts, batch, batch));
+                    }
                     return finish(layout);
                 }
                 {
@@ -729,6 +829,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 }
                 matrix(layout, DType::BF16, dimension(config.hidden_size), proposal_drafts * batch);
                 matrix(layout, DType::BF16, dimension(config.hidden_size), proposal_drafts * batch);
+                // Staged drafts before their copy into another round's frame.
+                matrix(layout, DType::I32, 1, proposal_drafts * batch);
                 if (plan.proposal_head == ProposalHead::Optimized) {
                     matrix(layout, DType::BF16, dimension(parameters.proposal->rows),
                            proposal_drafts * batch);
@@ -751,7 +853,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
                 target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, verify, verify, verify_envelope);
-                const std::size_t accept =
+                std::size_t accept =
                     draft->dflash2.has_value()
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
@@ -759,6 +861,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), drafts,
                               drafts, batch, batch);
+                for (const SpeculativeRoundShape& shape : plan.round_shapes) {
+                    if (shape.kind != SpeculativeRoundKind::Tree) { continue; }
+                    accept = std::max(
+                        accept,
+                        ops::speculative_accept_sparse_tree_workspace_capacity_bytes(
+                            dimension(parameters.model.resources().public_token_count),
+                            static_cast<std::int32_t>(shape.verify_drafts + 1U), batch, batch));
+                }
                 const std::size_t proposal = dflash_proposal_capacity(
                     static_cast<std::int32_t>(plan.neural_draft_window) + 1, batch);
                 out.dflash_round =
@@ -863,6 +973,33 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
+    const bool tree_table = tree_table_enabled(options.speculative.draft_tree_nodes);
+    if (tree_table || options.speculative.draft_tree_auto) {
+        if (options.speculative.backend != SpeculativeBackend::DFlash2) {
+            throw std::invalid_argument("DFlash2 tree verification requires the DFlash2 backend");
+        }
+        if (tree_table && options.speculative.draft_tree_auto) {
+            throw std::invalid_argument("automatic DFlash2 tree widths take no fixed table");
+        }
+        std::vector<std::uint32_t> widths(options.speculative.draft_tree_nodes.begin(),
+                                          options.speculative.draft_tree_nodes.end());
+        if (options.speculative.draft_tree_auto) {
+            const auto automatic = draft_tree_auto_widths(options.speculative.draft_tokens);
+            widths.assign(automatic.begin(), automatic.end());
+        }
+        for (const std::uint32_t nodes : widths) {
+            if (nodes == 0) { continue; }
+            ops::validate_speculative_tree_shape(
+                {static_cast<std::int32_t>(nodes),
+                 static_cast<std::int32_t>(options.speculative.draft_tokens),
+                 static_cast<std::int32_t>(options.speculative.draft_tree_paths)});
+        }
+        // A fixed table needs trees; automatic mode falls back to chains (resolve_tree_widths).
+        if (tree_table && !tree_verification_supported(parameters)) {
+            throw std::invalid_argument("DFlash2 tree verification requires single FP8 or NVFP4 "
+                                        "GDN input projections");
+        }
+    }
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
     }
@@ -870,13 +1007,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
           options.speculative.backend != SpeculativeBackend::DFlash &&
           options.speculative.backend != SpeculativeBackend::Mtp) ||
-         options.speculative.ngram_draft_tokens > 63 ||
-         options.speculative.ngram_min_match < 4 || options.speculative.ngram_min_match > 64 ||
-         (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1))) {
-        throw std::invalid_argument(
-            "ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64; the GDN conv-record "
-            "workspace admits at most 16 verification columns for a multi-request batch, so K "
-            "above 15 requires concurrency one");
+         options.speculative.ngram_draft_tokens > 63 || options.speculative.ngram_min_match < 4 ||
+         options.speculative.ngram_min_match > 64)) {
+        throw std::invalid_argument("ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64");
     }
 }
 
@@ -894,9 +1027,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
-    impl->fast_prefill_kernel = inputs.fast_prefill_kernel;
+    impl->concurrent_prefill_chunk = inputs.concurrent_prefill_chunk;
+    impl->prompt_attention = inputs.prompt_attention;
     impl->draft_window        = inputs.draft_window;
     impl->neural_draft_window = inputs.neural_draft_window;
+    impl->round_shapes        = inputs.round_shapes;
+    impl->tree_widths         = inputs.tree_widths;
+    impl->draft_tree_paths    = inputs.draft_tree_paths;
     impl->ngram_draft_window  = inputs.ngram_draft_window;
     impl->ngram_min_match     = inputs.ngram_min_match;
     impl->speculative_backend = inputs.speculative_backend;
@@ -950,26 +1087,28 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             executables = static_cast<std::uint64_t>(
                               graph_topology_classes(ordinary_graph_profiles(impl->capacity))) *
                           impl->max_concurrency;
-        } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            // Each MTP family (mtp_graph_families) is captured at its own width for every batch
-            // size, on the one frame viewed at that width.
-            for (const MtpGraphFamily& family :
-                 mtp_graph_families(impl->neural_draft_window, impl->ngram_draft_window)) {
-                executables += static_cast<std::uint64_t>(graph_topology_classes(
-                                   mtp_graph_profiles(impl->capacity, family.verify_drafts,
-                                                      family.ar_depth))) *
-                               impl->max_concurrency;
-            }
         } else {
-            // Each DFlash family's profiles are captured at the family's own window for every
-            // batch size, on the one frame viewed at that width.
-            for (const std::uint32_t window :
-                 {impl->neural_draft_window, impl->ngram_draft_window}) {
-                if (window == 0) { continue; }
-                executables += static_cast<std::uint64_t>(graph_topology_classes(
-                                   dflash_graph_profiles(impl->speculative_backend,
-                                                         impl->capacity, window))) *
-                               impl->max_concurrency;
+            // Each speculative round family's profiles are captured at the family's own width for
+            // every batch size, on the one frame viewed at that width.
+            // Every MTP round proposes the next round's drafts at the configured neural depth.
+            const std::uint32_t ar_depth = impl->neural_draft_window;
+            for (const SpeculativeRoundShape& shape : impl->round_shapes) {
+                const auto profiles =
+                    impl->speculative_backend == SpeculativeBackend::Mtp
+                        ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
+                        : dflash_graph_profiles(impl->speculative_backend, impl->capacity,
+                                                shape.verify_drafts);
+                // A tree family serves only the batch sizes that may verify its width, and the
+                // plain neural family only those that may verify a chain.
+                std::uint32_t batch_sizes = 0;
+                for (std::uint32_t b = 1; b <= impl->max_concurrency; ++b) {
+                    batch_sizes += shape.kind == SpeculativeRoundKind::Tree
+                                       ? impl->tree_widths.tree(b, shape.verify_drafts + 1U)
+                                       : shape.kind == SpeculativeRoundKind::Ngram ||
+                                             impl->tree_widths.chain(b);
+                }
+                executables +=
+                    static_cast<std::uint64_t>(graph_topology_classes(profiles)) * batch_sizes;
             }
         }
         impl->graph_allowance_bytes = checked_add(
@@ -1053,21 +1192,52 @@ bool uses_fast_int8_prefill(const EngineOptions& options) {
     return options.kv_cache == KvCacheStorage::Int8Group64 && !options.original_int8_prefill_kernel;
 }
 
+static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
+              ops::kCausalPromptSplitWorkspaceDefaultBytes);
+
 // INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
-bool uses_fast_prefill_kernel(const EngineOptions& options) {
-    return uses_fast_int8_prefill(options) ||
-           (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
-            !options.original_nvfp4_prefill_kernel);
+// Those kernels, K8V4's tiled kernel and the VQ2 and K4V2 prompt kernel run their PV in 8 bits
+// when prefill_8bit_pv asks for it or leaves the choice to the KV format.
+PromptAttention prompt_attention(const EngineOptions& options) {
+    const bool fast = uses_fast_int8_prefill(options) ||
+                      (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
+                       !options.original_nvfp4_prefill_kernel);
+    const bool pv8_capable = fast || options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value ||
+                             options.kv_cache == KvCacheStorage::Vq2 ||
+                             options.kv_cache == KvCacheStorage::Q4KeyVq2Value;
+    const bool pv8_auto = options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
+                          options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value ||
+                          options.kv_cache == KvCacheStorage::Vq2;
+    const bool pv8 = options.prefill_8bit_pv == PrefillPv8::On ||
+                     (options.prefill_8bit_pv == PrefillPv8::Auto && pv8_auto);
+    return {.fast = fast,
+            .pv8  = pv8 && pv8_capable,
+            .split_workspace_bytes = std::size_t{options.prefill_split_workspace_mib} << 20};
+}
+// The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
+// run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use
+// other tiles.
+bool prefill_attention_runs_waves(const EngineOptions& options) {
+    switch (options.kv_cache) {
+    case KvCacheStorage::Int8Group64: return !options.original_int8_prefill_kernel;
+    case KvCacheStorage::Nvfp4Group16: return !options.original_nvfp4_prefill_kernel;
+    case KvCacheStorage::Fp8E4M3Row256:
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+    case KvCacheStorage::Vq2:
+    case KvCacheStorage::Q4KeyVq2Value: return true;
+    case KvCacheStorage::BFloat16: return false;
+    }
+    return false;
 }
 } // namespace
 
-// Every chunk but a prompt's last one has the effective width, so with the fast prefill kernel it
-// is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of a
-// partial last wave.
-std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
-                                      const EngineOptions& options) {
-    const std::uint32_t requested = std::min(options.prefill_chunk, options.max_context);
-    if (!uses_fast_int8_prefill(options)) { return requested; }
+// Every chunk but a prompt's last one has the effective width, so with a prompt-attention kernel of
+// whole-SM row blocks it is rounded down to whole prompt-attention waves, keeping each full chunk's
+// attention free of a partial last wave.
+std::uint32_t prefill_step_width(const execution::Parameters& parameters,
+                                 const EngineOptions& options, std::uint32_t requested) {
+    requested = std::min(requested, options.max_context);
+    if (!prefill_attention_runs_waves(options)) { return requested; }
     const auto& attention = *parameters.model.config().text.attention;
     const auto wave = static_cast<std::uint32_t>(ops::causal_softmax_attention_prompt_wave_tokens(
         {static_cast<std::int32_t>(attention.head_dim),
@@ -1076,29 +1246,54 @@ std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
     return requested < wave ? requested : requested / wave * wave;
 }
 
+std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
+                                      const EngineOptions& options) {
+    return prefill_step_width(parameters, options, options.prefill_chunk);
+}
+
+// A Concurrent prefill step (beside other active requests with --prefill-round-robin) advances at
+// most this many prompt tokens, within the same workspace as the full chunk.
+constexpr std::uint32_t kConcurrentPrefillTokens = 1024;
+
+std::uint32_t effective_concurrent_prefill_chunk(const execution::Parameters& parameters,
+                                                 const EngineOptions& options) {
+    return prefill_step_width(parameters, options,
+                              std::min(options.prefill_chunk, kConcurrentPrefillTokens));
+}
+
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
+    TreeWidthPlan tree_widths = resolve_tree_widths(parameters, options);
+    const std::vector<SpeculativeRoundShape> round_shapes =
+        speculative_round_shapes(options, tree_widths);
+    std::uint32_t draft_window = 0;
+    for (const SpeculativeRoundShape& shape : round_shapes) {
+        draft_window = std::max(draft_window, shape.verify_drafts);
+    }
     SequencePlanningInputs inputs{
-        .parameters          = &parameters,
-        .neural_draft_window = options.speculative.draft_tokens,
-        .ngram_draft_window  = options.speculative.ngram_draft_tokens,
-        .ngram_min_match     = options.speculative.ngram_min_match,
-        .capacity            = options.max_context,
-        .max_concurrency     = options.max_concurrency,
-        .prefill_chunk       = effective_prefill_chunk(parameters, options),
-        .fast_prefill_kernel = uses_fast_prefill_kernel(options),
-        .draft_window =
-            std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens),
-        .speculative_backend        = options.speculative.backend,
-        .kv_storage                 = options.kv_cache,
-        .proposal_head              = options.speculative.proposal_head,
-        .features                   = models::load_options(options),
-        .use_cuda_graph             = options.use_cuda_graph,
-        .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
-        .device                     = options.device,
-        .context_cache              = options.context_cache,
+        .parameters               = &parameters,
+        .neural_draft_window      = options.speculative.draft_tokens,
+        .round_shapes             = round_shapes,
+        .tree_widths              = std::move(tree_widths),
+        .draft_tree_paths         = options.speculative.draft_tree_paths,
+        .ngram_draft_window       = options.speculative.ngram_draft_tokens,
+        .ngram_min_match          = options.speculative.ngram_min_match,
+        .capacity                 = options.max_context,
+        .max_concurrency          = options.max_concurrency,
+        .prefill_chunk            = effective_prefill_chunk(parameters, options),
+        .concurrent_prefill_chunk = effective_concurrent_prefill_chunk(parameters, options),
+        .prompt_attention         = prompt_attention(options),
+        .draft_window             = draft_window,
+        .speculative_backend      = options.speculative.backend,
+        .kv_storage               = options.kv_cache,
+        .proposal_head            = options.speculative.proposal_head,
+        .features                 = models::load_options(options),
+        .use_cuda_graph           = options.use_cuda_graph,
+        .causal_scoring           = options.purpose == EnginePurpose::CausalScoring,
+        .device                   = options.device,
+        .context_cache            = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

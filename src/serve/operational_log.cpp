@@ -138,6 +138,10 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::Vq2:
+        return "vq2";
+    case ninfer::KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
     }
     return "unknown";
 }
@@ -298,6 +302,11 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         out << " | ngram " << product::format_pretty_count(metrics.ngram_accepted_tokens) << '/'
             << product::format_pretty_count(metrics.ngram_drafted_tokens) << " accepted, "
             << product::format_pretty_count(metrics.ngram_rounds) << " rounds";
+    }
+    if (metrics.tree_rounds != 0) {
+        out << " | trees " << product::format_pretty_count(metrics.tree_rounds) << " rounds, "
+            << product::format_pretty_count(metrics.tree_side_accepted_tokens)
+            << " side-branch drafts";
     }
     if (metrics.ngram_archive.enabled) {
         out << " | archive " << (metrics.ngram_archive.bound ? "bound" : "unbound");
@@ -546,6 +555,12 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         }
     } else {
         logger_->info("context cache | root only");
+    }
+
+    if (product::draft_tree_enabled(engine.speculative)) {
+        logger_->info("draft trees | {} | up to {} paths",
+                      product::draft_tree_nodes_text(engine.speculative),
+                      engine.speculative.draft_tree_paths);
     }
 
     if (service.options().enable_vision) {

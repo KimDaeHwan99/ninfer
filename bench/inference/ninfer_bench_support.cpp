@@ -56,7 +56,9 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
-    throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
+    if (text == "vq2") { return KvCacheStorage::Vq2; }
+    if (text == "k4v2") { return KvCacheStorage::Q4KeyVq2Value; }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, vq2, or k4v2");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -178,6 +180,9 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
         out.ngram_rounds += in.ngram_rounds;
         out.ngram_drafted_tokens += in.ngram_drafted_tokens;
         out.ngram_accepted_tokens += in.ngram_accepted_tokens;
+        out.tree_rounds += in.tree_rounds;
+        out.tree_side_rounds += in.tree_side_rounds;
+        out.tree_side_accepted_tokens += in.tree_side_accepted_tokens;
         if (out.accepted_per_position.size() < in.accepted_per_position.size()) {
             out.accepted_per_position.resize(in.accepted_per_position.size());
         }
@@ -239,6 +244,9 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
         << indent << "  \"ngram_rounds\": " << stats.ngram_rounds << ",\n"
         << indent << "  \"ngram_drafted_tokens\": " << stats.ngram_drafted_tokens << ",\n"
         << indent << "  \"ngram_accepted_tokens\": " << stats.ngram_accepted_tokens << ",\n"
+        << indent << "  \"tree_rounds\": " << stats.tree_rounds << ",\n"
+        << indent << "  \"tree_side_rounds\": " << stats.tree_side_rounds << ",\n"
+        << indent << "  \"tree_side_accepted_tokens\": " << stats.tree_side_accepted_tokens << ",\n"
         << indent << "  \"acceptance_rate\": ";
     if (stats.drafted_tokens == 0) {
         out << "null";
@@ -307,16 +315,30 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-        << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
+        << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>  KV cache storage (default: bf16)\n"
         << "  --use-original-int8-prefill-kernel  original INT8-KV prompt kernel at the\n"
         << "                              requested chunk (default: fast kernel, wave-aligned\n"
         << "                              chunks); requires --kv-dtype int8\n"
+        << "  --prefill-8bit-pv           INT8 and K4V2 KV: 8-bit P*V in the prompt kernel\n"
+        << "                              (default FP16; faster but a measurable KL divergence\n"
+        << "                              from a BF16 KV reference)\n"
+        << "  --no-prefill-8bit-pv        NVFP4, K8V4 and VQ2 KV: FP16 P*V (default 8-bit,\n"
+        << "                              5-7 % faster at long context)\n"
         << "  --use-original-nvfp4-prefill-kernel  tiled NVFP4-KV prompt kernel (default:\n"
         << "                              fast kernel); requires --kv-dtype nvfp4\n"
+        << "  --prefill-split-workspace-mib <n>  prompt-attention split workspace (default: "
+        << kDefaultPrefillSplitWorkspaceMiB << ";\n"
+        << "                              128-384 recommended, 0 = no splitting)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
         << "  --ngram-min-match <n>      copy admission 4..64 (default: 12)\n"
+        << "  --draft-tree-nodes <auto|list>  DFlash2 tree verification (default: off): auto\n"
+           "                             picks a tree or the single draft each round from\n"
+           "                             measured speed (recommended); a list fixes tree sizes\n"
+           "                             in tokens by batch size, e.g. 16,12,12,0 (last entry\n"
+           "                             repeats, 0 = single draft)\n"
+        << "  --draft-tree-paths <n>     most branches per tree 2..8 (default: 8)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires a speculative "
            "backend\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
@@ -373,6 +395,13 @@ BenchOptions parse_args(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
+        } else if (arg == "--prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::On;
+        } else if (arg == "--no-prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::Off;
+        } else if (arg == "--prefill-split-workspace-mib") {
+            options.prefill_split_workspace_mib =
+                parse_u32(value("--prefill-split-workspace-mib"), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--spec") {
@@ -387,6 +416,11 @@ BenchOptions parse_args(int argc, char** argv) {
                 parse_u32(value("--ngram-min-match"), "ngram-min-match");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--draft-tree-nodes") {
+            product::apply_draft_tree_nodes(options.speculative, value("--draft-tree-nodes"));
+        } else if (arg == "--draft-tree-paths") {
+            options.speculative.draft_tree_paths =
+                parse_u32(value("--draft-tree-paths"), "draft-tree-paths");
         } else if (arg == "--device") {
             options.device = parse_nonnegative(value("--device"), "device");
         } else if (arg == "--no-cuda-graph") {
@@ -513,7 +547,8 @@ std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& spec
 
 std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& speculative) {
     product::validate_speculative_cli_options(speculative);
-    const auto widest = std::max(speculative.draft_tokens, speculative.ngram_draft_tokens);
+    const auto widest =
+        std::max(product::speculative_verify_drafts(speculative), speculative.ngram_draft_tokens);
     return speculative.backend == SpeculativeBackend::None ? 3 : 2 * (widest + 1) + 1;
 }
 
@@ -624,11 +659,15 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
         << " original_int8_prefill_kernel=" << (env.original_int8_prefill_kernel ? "on" : "off")
+        << " prefill_8bit_pv=" << prefill_pv8_name(env.prefill_8bit_pv)
+        << " prefill_split_workspace_mib=" << env.prefill_split_workspace_mib
         << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
+        << " draft_tree=" << product::draft_tree_nodes_text(env.speculative) << '/'
+        << env.speculative.draft_tree_paths
         << " ngram_draft_tokens=" << env.speculative.ngram_draft_tokens
         << " ngram_min_match=" << env.speculative.ngram_min_match
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
@@ -751,6 +790,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"original_int8_prefill_kernel\": "
         << (env.original_int8_prefill_kernel ? "true" : "false") << ",\n"
+        << "    \"prefill_8bit_pv\": \"" << prefill_pv8_name(env.prefill_8bit_pv) << "\""
+        << ",\n"
+        << "    \"prefill_split_workspace_mib\": " << env.prefill_split_workspace_mib << ",\n"
         << "    \"original_nvfp4_prefill_kernel\": "
         << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
@@ -944,6 +986,10 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "nvfp4";
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case KvCacheStorage::Vq2:
+        return "vq2";
+    case KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
     }
     return "unknown";
 }

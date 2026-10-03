@@ -14,18 +14,35 @@
 namespace ninfer::ops {
 
 inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
+// Default CausalAttentionExecutionEnvelope::prompt_split_workspace_bytes.
+inline constexpr std::size_t kCausalPromptSplitWorkspaceDefaultBytes = std::size_t{256} << 20;
 
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
     // Run prompt-route launches over an INT8-G64 or NVFP4-G16 cache on the fast prompt kernel
-    // (each warp keeps its query rows, scores and output in registers; FP16 per-tile PV
-    // accumulation; NVFP4 also decodes V in registers and runs QK on block-scaled FP4 Tensor Cores
-    // with a two-term NVFP4 Q) instead of the storage's tiled kernel. NVFP4 takes it only over more
-    // than 2048 visible keys. Other routes and cache formats ignore it, and it never changes the
-    // route. Over NVFP4 it can change the workspace: the fast kernel may split a single-row launch's
-    // keys across CTAs, so workspace planning and execution must use the same hint.
+    // (INT8: each warp keeps its query rows, scores and output in registers with FP16 per-tile PV
+    // accumulation; NVFP4: the MXFP8 tiled kernel with block-scaled FP4 QK on a two-term NVFP4 Q)
+    // instead of the storage's tiled kernel. NVFP4 takes it only over more than 768 visible keys.
+    // Other routes and cache formats ignore it, and it never changes the route.
     bool fast_prompt_kernel = false;
+    // Run prompt-route PV on 8-bit Tensor Cores, a precision change:
+    //   * INT8-G64 with fast_prompt_kernel: each probability times its key's V group scale is
+    //     rounded to a u8 code against that row's largest such product in the 64-key tile, and the
+    //     stored INT8 V codes are multiplied exactly with INT32 accumulation.
+    //   * NVFP4-G16 with fast_prompt_kernel (over more than 768 visible keys) and K8V4's tiled
+    //     kernel: probabilities are rounded to E4M3 against the tile's own row maximum, V decodes
+    //     to E4M3 under a per-tile power-of-two shift, and PV accumulates in FP32 on block-scaled
+    //     E4M3 Tensor Cores.
+    // Other routes and cache formats ignore it.
+    bool fast_prompt_pv8 = false;
+    // Workspace the FP32 split partials of one prompt-route launch of the fast INT8 or NVFP4
+    // prompt kernel, FP8 or K8V4's tiled kernel, or a VQ2 or K4V2 prompt launch may take (the
+    // last two plan their splits with the fast INT8 prompt kernel). These kernels split a launch's
+    // keys across CTAs when its row blocks alone would leave SMs idle; a launch whose split count
+    // would need more runs fewer splits. The split count changes only rounding. It sizes the
+    // workspace, so workspace planning and execution must use the same value.
+    std::size_t prompt_split_workspace_bytes = kCausalPromptSplitWorkspaceDefaultBytes;
 };
 
 struct ContextAttentionExecutionEnvelope {
@@ -57,6 +74,17 @@ struct ContextAttentionExecutionEnvelope {
  * It does not quantize or round q, probabilities, partial sums or decoded vectors to copy a
  * kernel's private arithmetic. Newly appended rows cross their specified persistent codec
  * boundary before attention observes them.
+ *
+ * The vector-quantized formats (Vq2, Q4KeyVq2Value) store R*K and R*V and keep an exact
+ * recent-key window. A query at position q reads key j:
+ *   - when j < kKVWindowSinkTokens or j >= q - kKVWindowRecentTokens: its exact INT8-G64 row,
+ *     which for a key appended by this call is the INT8-G64 codes of its rotated input row, and
+ *     for an older key (or a cached-only call's own key) its window slot when the slot tag matches
+ *     position j and the stored codes of j, and its stored codes otherwise;
+ *   - otherwise: its stored codes (codebook or level times the FP16 row scale).
+ * The rule depends on positions only, so a context reads the same keys however it was split into
+ * calls. Without a window every key reads its stored codes. The oracle decodes exactly these
+ * persistent values.
  *
  * Kernels may select native BF16/FP16/INT8/FP8 operands, internal reductions, staging precision
  * and decomposition. These are qualified implementation profiles, not extra public tensor
@@ -121,7 +149,7 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * either contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
  * dense/masked topology is chosen by the caller and never inferred by copying device metadata to
  * the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8 accepts
- * W=1..16.
+ * W=1..64.
  *
  * Let Vb be W for dense input or valid_columns[b] otherwise. For live column j<Vb with absolute
  * position p=positions[j,b], query head h attends cache rows [0,p] through table row
@@ -138,8 +166,10 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
  * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
  * With fixed tensor views, geometry and cache storage, calls with W<=16 remain CUDA Graph
- * update-compatible across valid envelopes. Live row lengths determine the KV work partition within
- * each capture. Inputs, output, every cache plane/table, and live workspace suballocations are
+ * update-compatible across valid envelopes. Within each capture, a row's KV work partition is
+ * determined by its first position, W and the envelope. For W<=256 it does not depend on Vb, so the
+ * result of a live column is bit-identical however many trailing columns are masked. Inputs,
+ * output, every cache plane/table, and live workspace suballocations are
  * pairwise non-overlapping. The Op overwrites every addressed cache row but owns no cache
  * allocation, frontier, request identity, or commit authority.
  */
@@ -147,6 +177,24 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
+                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                              Tensor& out, cudaStream_t stream);
+
+/**
+ * Speculative verification-tree form of the append-and-attend Op above, for every KV storage.
+ *
+ * tree_masks is either empty (the causal Op above) or contiguous device I32 [W,B], 2<=W<=32,
+ * valid_columns non-empty. Row b's first column sits at F = positions[0,b]; its column j attends
+ * cache row r in [0,positions[j,b]] only when r<F or bit r-F of tree_masks[j,b] is set: bit a
+ * admits the block row appended by column a. A tree names each column's ancestors and itself
+ * (ninfer/ops/speculative_tree.h); the chain triangle is the causal Op. Grouped and parallel
+ * verification routes apply the masks; a width on the prompt (tiled) route rejects them.
+ */
+void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              const Tensor& positions, const Tensor& valid_columns,
+                              const Tensor& kv_table_rows, const Tensor& tree_masks,
+                              AttentionHeadGeometry geometry, float scale,
+                              PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, cudaStream_t stream);
 

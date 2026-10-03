@@ -6,6 +6,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
 
@@ -114,7 +115,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   The 27B registered form has x [5120,W,B], Q4 q/k weight [4096,5120], one Q5 value/z parent
  *   [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,W,B],
  *   value/z [6144,W,B], and I32 selectors [B]. B=1 accepts every positive W; B=2..8 accepts
- *   W=1..16. `valid_columns` is empty for a dense invocation or I32 [B] for a mixed-width batch.
+ *   W=1..64. `valid_columns` is empty for a dense invocation or I32 [B] for a mixed-width batch.
  *   A mixed-width invocation has B>=1 and every valid extent lies in [1,W].
  *
  * Numeric:
@@ -147,7 +148,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
  * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], and FP8_E4M3FN_ROW_BF16 RowScale
  * [16384,5120], all in q/k/value/z row order. All policies permit Q8 A16. NVFP4 uses A16
  * under A16Only/AllowA8; AllowA4 may use A4. FP8 may use A8 under AllowA8/AllowA4. B=1 accepts
- * every positive W for FP8; the batched domain is B=2..8 and W=1..16. Tensor operands, the complete
+ * every positive W for FP8; the batched domain is B=2..8 and W=1..64. Tensor operands, the complete
  * FP8 parent, and live workspace must be mutually non-overlapping, except that the read-only
  * initial_state_slots and snapshot_base_slots selectors may alias each other; same-row state-slot
  * overlap remains governed by the snapshot state contract.
@@ -161,7 +162,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 
 /**
  * Applies the A16-only single-parent form. FP8 accepts every positive W for dense B=1; the batched
- * domain is B=2..8 and W=1..16.
+ * domain is B=2..8 and W=1..64.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
@@ -230,6 +231,22 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream);
+
+/**
+ * Verification-tree form of the single-parent record-producing Op (FP8 and NVFP4 parents) over a
+ * width T in [2,32]. tree_rows is I32 [kSpeculativeTreeRowWords,B]: column c of row b convolves
+ * the projected inputs of its three nearest ancestors in that row's tree (conv history past the
+ * anchor) and its own, in the chain form's order, so each column sees the inputs of its own root
+ * path and a chain row gets the chain form over its valid prefix. Records hold every column's
+ * projected input. Projection uses the Op's materialized routes; workspace follows the record
+ * capacity query.
+ */
+void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
+                                const Tensor& conv_weight, const Tensor& conv_states,
+                                const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                const Tensor& tree_rows, Tensor& conv_record, Tensor& query,
+                                Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
+                                WorkspaceArena& workspace, cudaStream_t stream);
 
 /** Applies the A16-only single-parent record-producing form. */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

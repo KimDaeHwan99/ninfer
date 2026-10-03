@@ -36,35 +36,41 @@ that is distinct from the DFlash2 companion in supported Qwen3.8-27B artifacts.
 Ngram does not convert one drafter into another. `--ngram-draft-tokens 0` disables the
 feature; the minimum match defaults to 12 and its supported enabled range is 4..64.
 
-At `--max-concurrency > 1` each round is a batch of up to `--max-concurrency` active requests.
-The GDN conv-record workspace behind the recurrent state admits at most 16 verification columns
-once the batch holds more than one request, so a verify width above 15 is admitted only at
-`--max-concurrency 1`. This caps the ngram width the same way for every backend;
-`--ngram-draft-tokens 15` is the widest value usable with concurrency.
+At `--max-concurrency > 1` each round is a batch of up to `--max-concurrency` active requests,
+and every width up to 63 is available at any concurrency. A copy round verifies every row of the
+batch at its family's width, so a wide family costs each row of the round, including rows
+without a copy; the narrower copy families below keep short copies cheap. ReplaySSM records
+grow with the widest window times `--max-concurrency`.
 
 With DFlash and DFlash2 every round verifies at its provider's own window for any batch size: an
 all-neural round runs at the neural window, and a round in which at least one row has a copy
 proposal runs at the ngram window. The decode frame is allocated at the wider of the two windows
 and viewed densely at the round's width. In a multi-request ngram round the neural drafter also
-runs and each row with a copy proposal takes it, so a row without a match keeps its neural
-proposal for that round. The narrower window records GDN replay transitions through a narrowed
+runs, at its own width, and each row with a copy proposal takes it, so a row without a match keeps
+its neural proposal for that round. The narrower window records GDN replay transitions through a narrowed
 view of the same record storage. DFlash and DFlash2 retain an append buffer sized for the widest
 provider: a narrow neural round must catch up target features from a preceding wide copy round.
 
-MTP verifies every round at the frame's native width (the wider of the neural and ngram windows);
-unused columns are masked, and a row with a copy proposal and a row without one each use their
-own proposal in the same round.
+MTP follows the same rule: an all-neural round verifies at `--draft-tokens`, a round with at
+least one copy proposal at the ngram window, and in a multi-request copy round a row without a
+copy verifies its MTP proposal. Every MTP round drafts the next round at `--draft-tokens`.
 
 Larger widths can reduce target rounds on long copy spans but increase per-round attention,
 projection, replay and workspace costs, so measure both short and long contexts; the longest
-supported width need not be fastest. Output budgets do not select a different ngram arithmetic
-shape.
+supported width need not be fastest. Copy rounds therefore verify at the narrowest captured
+width that holds their longest copy: besides `--ngram-draft-tokens`, the Engine captures copy
+families at 7, 15 and 31 drafts when those lie strictly between the neural and ngram windows.
+Output budgets do not select a different ngram arithmetic shape: a copy is sized by the window and context room only, and the output budget limits the
+drafts the round then verifies.
 
 The mixed-FP8 27B target retains 16-bit activations for FP8 residual projections
-during 17..64-column single-request verification. Its ordinary narrow path uses
-that precision already; crossing the core's 22/25-column A8 thresholds otherwise
-adds another quantization change. Weight and KV formats and prefill are unchanged.
-This does not promise identical floating-point results between different widths.
+in 17..64-column verification rows, whether the round verifies one request or
+several. Its ordinary narrow single-request path uses that precision already;
+crossing the core's 22/25-column A8 thresholds would otherwise change a row's
+quantization with the round it shares, and the error a shared 8-bit round leaves in
+the KV and GDN state can flip a later greedy near-tie. Narrower multi-request rounds
+still cross those thresholds. Weight and KV formats and prefill are unchanged. This
+does not promise identical floating-point results between different widths.
 
 ## Operation
 
@@ -259,9 +265,14 @@ execution. This test also skips without an artifact.
 single-lane run on a concurrency>1 engine is token-identical to a graph-mode
 single-request reference, that two concurrent copy lanes each reproduce an exact
 source prefix over a long soak, and that two concurrent free-form lanes stay
-non-degenerate over hundreds of tokens. Passing width `0` runs the free-form pair with
-ngram disabled as a baseline. Cross-lane token identity is deliberately not required:
-batched lanes are prefetched independently and need not share every round, so a
-batch-size change alone can move a greedy near-tie (the ngram-disabled baseline
-diverges the same way). `NINFER_NGRAM_TEST_MAX_CONTEXT` (default 4096) and
-`NINFER_NGRAM_TEST_NO_GRAPH` adjust the shared-GPU footprint and graph mode.
+non-degenerate over hundreds of tokens. Copy requests stop at the model's end of turn:
+on some artifacts ending the turn is a near-tie inside the synthetic file that moves with
+the verification width's rounding, so an early end of turn passes when the copy before it
+is an exact source prefix of at least 64 tokens (256 in the soak). An artifact whose model
+ends these copies sooner even without speculation fails on that length, not on a prefix
+mismatch. Passing width `0` runs the free-form pair with ngram disabled as a baseline.
+Cross-lane token identity is deliberately not required: batched lanes are prefetched
+independently and need not share every round, so a batch-size change alone can move a
+greedy near-tie (the ngram-disabled baseline diverges the same way).
+`NINFER_NGRAM_TEST_MAX_CONTEXT` (default 4096) and `NINFER_NGRAM_TEST_NO_GRAPH` adjust
+the shared-GPU footprint and graph mode.

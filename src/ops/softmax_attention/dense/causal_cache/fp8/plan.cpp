@@ -13,8 +13,7 @@ constexpr int kGroupedPrefillMaxWidth = 80;
 Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
                                         CausalAttentionExecutionEnvelope envelope) {
     if ((heads != 24 && heads != 16 && heads != 12) || width < 1 || batch < 1 || batch > 8 ||
-        (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
-        envelope.min_visible_keys > envelope.max_visible_keys ||
+        envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("FP8 attention: invalid plan inputs");
     constexpr int grouped_limit = Fp8KvCausalPlan::kTokenTile;
@@ -27,7 +26,8 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
                 width,
                 batch,
                 envelope,
-                mxfp8_tiled_partition(heads, width, envelope.max_visible_keys, kFp8TiledQueryRows)};
+                mxfp8_tiled_partition(heads, width, envelope.max_visible_keys,
+                                      envelope.prompt_split_workspace_bytes, kFp8TiledQueryRows)};
     const int tiles =
         family == Fp8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
@@ -40,7 +40,16 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
         1, std::clamp(budget / independent_tiles, 1, CausalKvPartition::kMaxSplits)};
     // Bound partial traffic by keeping enough KV work in each split.
     partition.key_shift = (width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0);
-    partition.capacity  = partition.active(envelope.max_visible_keys);
+    // Multi-column rows of the 24/4 geometry may split down to 64 keys, so short rows fill
+    // the GPU; the live count is then balanced to the fewest splits that keep the largest
+    // number of 64-key tiles per split. Rows long enough to saturate the target at the
+    // 256-key minimum keep its count (and so its partition).
+    if (heads == 24 && width > 1) {
+        partition.key_shift     = 6;
+        partition.balance_shift = 6;
+        partition.balance_limit = partition.target << 8;
+    }
+    partition.capacity  = partition.bound(envelope.max_visible_keys);
     return {family, heads, width, batch, envelope, partition};
 }
 
@@ -57,7 +66,8 @@ std::size_t fp8_kv_workspace_bytes(int heads, int batch, int min_width, int max_
     }
     return std::max(maximum, mxfp8_tiled_workspace_bytes(
                                  heads, std::max(min_width, kGroupedPrefillMaxWidth + 1), max_width,
-                                 envelope.max_visible_keys, kFp8TiledQueryRows));
+                                 envelope.max_visible_keys, envelope.prompt_split_workspace_bytes,
+                                 kFp8TiledQueryRows));
 }
 
 } // namespace ninfer::ops::detail

@@ -16,7 +16,8 @@ were tried and reverted.
 
 Scope: an alternative to NInfer's prefix-reuse, checkpoint-retention and cache-pressure
 system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_120a`), with
-`max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4),
+`max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4, K4V2,
+VQ2),
 and every speculative backend (none, MTP, DFlash, DFlash2).
 
 Coexistence rules:
@@ -62,7 +63,7 @@ Hybrid mode configures itself: the only capacity a deployment chooses is `--host
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve was tried and reverted, §16.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
-| §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart; `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `ninfer_ngram_concurrent_real` runs on Hybrid with `NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
+| §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart, cancellation mid-prefill (with and without DFlash2); `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `ninfer_ngram_concurrent_real` runs on Hybrid with `NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
 
 ## 0. Summary
 
@@ -169,9 +170,14 @@ Per token, all full-attention layers, K+V including scales (from paged-kv §4.3)
 | FP8-row256 | 516 B | 32.3 KiB | 2.02 MiB | 10.1 KiB | 0.63 MiB |
 | K8V4 | 402 B | 25.1 KiB | 1.57 MiB | 7.9 KiB | 0.49 MiB |
 | NVFP4-G16 | 288 B | 18.0 KiB | 1.13 MiB | 5.6 KiB | 0.35 MiB |
+| K4V2 | 196 B | 12.3 KiB | 0.77 MiB | 3.8 KiB | 0.24 MiB |
+| VQ2 | 132 B | 8.3 KiB | 0.52 MiB | 2.6 KiB | 0.16 MiB |
 
 MTP adds one layer's worth of pages to the bundle (+1/16 for 27B). A DFlash draft with
-full-attention layers adds its own BF16 pool.
+full-attention layers adds its own BF16 pool. K4V2 and VQ2 also keep an exact recent-key window
+in every StateImage (paged-kv §9.3): 1088 × KV heads × 536 B per attention layer, about 39.7 MB
+for 27B with MTP (17 layers × 4 heads), so their checkpoint images are that much larger than the
+other profiles'.
 
 ### 3.2 State image
 
@@ -1461,6 +1467,7 @@ None of these were A/B tested; each is a correctness, behavior or log fix.
 | The chunk function takes the restore's layer events itself (`PrefillContext::take_layer_ready`), so program code never holds the view | §6.5 | Hardening. A deterministic test of the fix above was asked for, but the retired-batch path is timing-dependent and a dangling view reading a recycled handle can pass a token-equality check, so a test would need a product seam or AddressSanitizer. Moving the lookup inside the chunk call instead leaves no place for program code to take the view early |
 | A stop fails running and queued requests and answers them before the save (`Engine::stop()`; `ninfer-serve` stops on Ctrl+C pressed twice within 5 s) | §5.5 | The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later. Answering them only after the cleanup that saves made each 503 wait for the whole save (408 blocks and 4 snapshots, 1,438 MiB: both 503s 392 ms after the stop, as the 0.3 s save ended); they are now answered first (8 ms after the stop, 447 ms before the save ended), and the `persist` real test checks that the file is not yet saved when the running generation is answered |
 | One Ctrl+C during the stop exits without saving and deletes the unfinished file (`PrefixCacheSaveControl`); the line reads `Press Ctrl+C again to exit without saving` | §5.5 | Leaving during the save needed another confirmed pair of presses, and `_Exit` left a partial `.tmp` of up to the Host tier's size beside the previous file until the next save |
+| A cancellation, and a failed admission's rollback, wait for the Device before the lane's pages, state image and execution row return to the pools or move into the index (2026-10-01, upstream `75a89050`) | §7.7 | A non-final prefill step returns without waiting, so a cancel can arrive with the lane's next chunk still queued. The block-table shadow already waited for its own queued copies; the wait now covers everything the lane releases. Not reproduced as a failure. The `cancel-prefill` and `cancel-prefill-dflash2` real scenarios cancel after the first reported chunk (the cancel landed at 1,024 of 3,172 prompt tokens): the lane's next request matches a run without the cancellation, and a request extending the cancelled prompt resumes from its published prefix and matches an uncached run |
 
 ### 16.5 Changes from upstream's TTFT campaign (2026-09-30)
 

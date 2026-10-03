@@ -187,6 +187,8 @@ public:
     // resolved the Host state slots, Host KV bytes and long-anchor count here, so a reader that
     // reports or enforces capacity must take them from the plan rather than from raw options.
     [[nodiscard]] const ContextCacheOptions& context_cache_options() const noexcept;
+    // Whether automatic DFlash2 tree widths are active: requested and verifiable by the target.
+    [[nodiscard]] bool draft_tree_auto() const noexcept;
 
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.
@@ -832,6 +834,7 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    bool completes_service_unit           = true;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<CaptureOffer> capture;
@@ -985,8 +988,8 @@ public:
     // capabilities, model state and one immutable pending transaction at a time.
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPrompt& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
-                                                  std::uint32_t first_target);
+    [[nodiscard]] ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                           const ScoreOptions& options);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -1021,7 +1024,8 @@ public:
     // waiting, when no transfer is in flight. A failed transfer surfaces at the next progress.
     [[nodiscard]] bool wait_context_transfer() noexcept;
     [[nodiscard]] PrefillProgress
-    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr,
+                    runtime::PrefillStepWidth width = runtime::PrefillStepWidth::Nominal);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,

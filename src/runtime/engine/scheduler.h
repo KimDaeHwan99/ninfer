@@ -4,6 +4,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/engine/admission_policy.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -266,25 +267,26 @@ public:
 
     [[nodiscard]] bool has_prefill_lane() const noexcept { return prefill_lanes_ != 0; }
 
-    // Deterministic execution order: lowest lane index first. Prefill units are short
-    // (one chunk), so strictly round-robining by index gives every staged request a fair
-    // share of the single execution stream without tracking per-lane progress.
+    // Lowest lane index owning staged prefill.
     [[nodiscard]] std::optional<std::uint32_t> select_prefill_lane() const noexcept {
         if (prefill_lanes_ == 0) { return std::nullopt; }
         return static_cast<std::uint32_t>(std::countr_zero(prefill_lanes_));
     }
 
-    // Lowest lane index owning staged prefill that is ready to advance. A lane that is
-    // temporarily offering an active capture (capture_pending) is skipped so a pending
-    // transaction on one lane cannot starve prefill on the others.
+    // Lane owning staged prefill that is ready to advance: the lowest index, or with round-robin
+    // the first after the lane the previous prefill unit served, so a prompt staged beside a long
+    // one waits one unit rather than the whole long prefill. A lane that is temporarily offering
+    // an active capture (capture_pending) is skipped so a pending transaction on one lane cannot
+    // starve prefill on the others.
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     select_runnable_prefill_lane(std::uint32_t max_concurrency, const Slots& slots) const {
-        std::uint64_t mask = prefill_lanes_;
-        while (mask != 0) {
-            const std::uint32_t lane = static_cast<std::uint32_t>(std::countr_zero(mask));
-            mask &= mask - 1U;
-            if (lane >= max_concurrency || slots[lane] == nullptr ||
+        const std::uint32_t lanes = std::min<std::uint32_t>(max_concurrency, kMaximumConcurrency);
+        const std::uint32_t start =
+            round_robin_ && last_prefill_lane_ ? *last_prefill_lane_ + 1U : 0U;
+        for (std::uint32_t offset = 0; offset < lanes; ++offset) {
+            const std::uint32_t lane = (start + offset) % lanes;
+            if ((prefill_lanes_ & (1ULL << lane)) == 0 || slots[lane] == nullptr ||
                 slots[lane]->capture_pending) {
                 continue;
             }
@@ -292,6 +294,13 @@ public:
         }
         return std::nullopt;
     }
+
+    void set_prefill_round_robin(bool enabled) noexcept { round_robin_ = enabled; }
+
+    [[nodiscard]] bool prefill_round_robin() const noexcept { return round_robin_; }
+
+    // The lane a prefill unit has just served; round-robin selection starts after it.
+    void record_prefill_served(std::uint32_t lane) noexcept { last_prefill_lane_ = lane; }
 
     [[nodiscard]] std::optional<std::uint64_t> protection_epoch() const noexcept {
         return protection_ ? std::optional<std::uint64_t>(protection_->epoch_id) : std::nullopt;
@@ -400,12 +409,15 @@ public:
 
     void reset() noexcept {
         prefill_lanes_ = 0;
+        last_prefill_lane_.reset();
         fifo_head_id_.reset();
         protection_.reset();
     }
 
 private:
     std::uint64_t prefill_lanes_ = 0;  // bit i set when lane i owns staged prefill
+    bool round_robin_            = false;
+    std::optional<std::uint32_t> last_prefill_lane_;
     std::optional<std::uint64_t> fifo_head_id_;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

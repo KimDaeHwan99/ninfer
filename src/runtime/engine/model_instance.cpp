@@ -96,6 +96,9 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument(
             "the original INT8 prefill kernel requires the INT8 KV cache (--kv-dtype int8)");
     }
+    if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
+        throw std::invalid_argument("Engine prefill_split_workspace_mib must be in [0,16384]");
+    }
     if (options.original_nvfp4_prefill_kernel && options.kv_cache != KvCacheStorage::Nvfp4Group16) {
         throw std::invalid_argument(
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
@@ -219,12 +222,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
          options.speculative.ngram_session_bytes > options.speculative.ngram_archive_bytes)) {
         throw std::invalid_argument("ngram session capacity must be between 1 MiB and the total "
                                     "archive capacity");
-    }
-    // A speculative decode frame is allocated at the wider of the neural and ngram draft windows
-    // and cannot be narrowed for batch>1, and the GDN conv-record workspace admits at most 16
-    // verification columns for a multi-request batch.
-    if (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1) {
-        throw std::invalid_argument("ngram draft widths above 15 require engine concurrency one");
     }
     const std::uint32_t concurrency = options.max_concurrency;
     if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
@@ -412,6 +409,8 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     // on the same capacity instead of a silently divergent default.
     EngineOptions resolved = options;
     resolved.context_cache = sequence.context_cache_options();
+    // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
+    resolved.speculative.draft_tree_auto = sequence.draft_tree_auto();
     instance->frontend.publish_long_anchor_limit(
         resolved.context_cache.max_long_anchors_per_continuation.value_or(0));
     instance->kv_capacity_resolution = resolution;

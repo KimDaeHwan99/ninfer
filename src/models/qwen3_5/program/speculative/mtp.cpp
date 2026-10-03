@@ -22,7 +22,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     }
     state.execution.work.reset();
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.text_kv, state.execution.state_images, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
@@ -79,17 +79,14 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         if (next_k == 0 || next_k > kMtpDecodeMaximumDrafts) {
             throw std::logic_error("MTP neural proposal width is outside its supported domain");
         }
-        auto frame = state.frame.current_drafts.ne[0] == static_cast<std::int32_t>(k) &&
-                             state.frame.next_drafts.ne[1] == static_cast<std::int32_t>(next_k)
-                         ? state.frame
-                         : state.frame.narrowed(k, next_k);
+        auto frame               = state.frame.narrowed(k, next_k);
         const std::int32_t width = static_cast<std::int32_t>(k) + 1;
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
-                         {}, state.execution.linear_attention, state.execution.io,
+                         {}, state.execution.state_images, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache);
         card.set_tensor_parallel(state.execution.tensor_parallel);
@@ -165,8 +162,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 static_cast<std::int32_t>(state.text_cache.max_context()),
                 static_cast<std::int32_t>(next_k), state.execution.device.stream);
             card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
-                                          target_rope, licensed_counts, mtp_rows, envelopes.batch,
-                                          alignment_hidden);
+                                          target_rope, licensed_counts, mtp_rows,
+                                          state_destinations, envelopes.batch, alignment_hidden);
             ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
                                                     state.execution.device.stream);
 
@@ -192,7 +189,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                     {dimension(state.execution.parameters.model.config().text.hidden_size), 1,
                      batch_size});
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                              mtp_rows, envelopes.ar[step], next_hidden_batch);
+                                              mtp_rows, state_destinations, envelopes.ar[step],
+                                              next_hidden_batch);
                 card.mtp_propose_batch(next_hidden, proposal_logits, next);
                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                            cudaMemcpyDeviceToDevice,

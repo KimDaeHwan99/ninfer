@@ -1,10 +1,12 @@
 // Real-artifact scenarios for the hybrid prefix cache (docs/maintainer/hybrid-prefix-cache-spec.md
 // §13.3). Requires NINFER_TEST_ARTIFACT; NINFER_HYBRID_REAL_SCENARIO selects one scenario.
 
+#include "kv_cache_storage.h"
 #include "ninfer/engine.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +15,7 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -29,23 +32,6 @@ constexpr std::uint32_t kBlock = 64;
 // NINFER_HYBRID_KV_DTYPE selects the KV storage every scenario runs with (default bf16), so the
 // Host tier's page records and restores are exercised for each profile.
 ninfer::KvCacheStorage kv_storage = ninfer::KvCacheStorage::BFloat16;
-
-bool select_kv_storage(std::string_view name) {
-    if (name == "bf16") {
-        kv_storage = ninfer::KvCacheStorage::BFloat16;
-    } else if (name == "int8") {
-        kv_storage = ninfer::KvCacheStorage::Int8Group64;
-    } else if (name == "fp8") {
-        kv_storage = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    } else if (name == "nvfp4") {
-        kv_storage = ninfer::KvCacheStorage::Nvfp4Group16;
-    } else if (name == "k8v4") {
-        kv_storage = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
-    } else {
-        return false;
-    }
-    return true;
-}
 
 // Deterministic ordinary-vocabulary tokens; the content only has to be reproducible.
 std::vector<ninfer::TokenId> synthetic_tokens(std::size_t count, std::uint32_t seed) {
@@ -463,6 +449,147 @@ int exercise_interleaved(const char* artifact) {
     return failures;
 }
 
+// Round-robin prefill: a short prompt submitted just after a long one is served between the long
+// prompt's units, so its first token comes first, and while it decodes the long prompt advances in
+// narrower units than its whole chunks. The default lowest-lane order is the control: the short
+// prompt waits for the whole long prefill and the long prompt takes whole chunks.
+int exercise_round_robin(const char* artifact) {
+    const std::vector<ninfer::TokenId> long_prompt  = synthetic_tokens(3700, 11);
+    const std::vector<ninfer::TokenId> short_prompt = synthetic_tokens(200, 12);
+    std::uint64_t lowest_lane_units                 = 0;
+    int failures                                    = 0;
+    for (const bool round_robin : {false, true}) {
+        ninfer::EngineOptions options =
+            hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+        options.max_concurrency     = 2;
+        options.prefill_chunk       = 2048;
+        options.prefill_round_robin = round_robin;
+        ninfer::Engine engine(options);
+        ninfer::GenerationHandle first =
+            engine.submit(engine.prepare_tokens(long_prompt), greedy(8));
+        ninfer::GenerationHandle second =
+            engine.submit(engine.prepare_tokens(short_prompt), greedy(64));
+        const ninfer::GenerationResult long_result  = first.wait();
+        const ninfer::GenerationResult short_result = second.wait();
+        const char* mode                            = round_robin ? "round-robin" : "lowest lane";
+        if (long_result.generated_token_ids.size() != 8 ||
+            short_result.generated_token_ids.size() != 64) {
+            std::cerr << "round-robin (" << mode << "): generated "
+                      << long_result.generated_token_ids.size() << " and "
+                      << short_result.generated_token_ids.size() << " tokens, expected 8 and 64\n";
+            ++failures;
+        }
+        const bool short_first =
+            short_result.timings.first_token_seconds < long_result.timings.first_token_seconds;
+        const std::uint64_t units = long_result.engine_timing.prefill_units;
+        std::cout << "round-robin (" << mode << "): short first token "
+                  << short_result.timings.first_token_seconds << " s, long "
+                  << long_result.timings.first_token_seconds << " s, long prefill units " << units
+                  << '\n';
+        if (!round_robin) {
+            lowest_lane_units = units;
+            if (short_first) {
+                std::cerr << "round-robin (lowest lane): the short prompt was served before the "
+                             "long prefill finished\n";
+                ++failures;
+            }
+        } else if (!short_first || units <= lowest_lane_units) {
+            std::cerr << "round-robin: short first token "
+                      << short_result.timings.first_token_seconds << " s, long "
+                      << long_result.timings.first_token_seconds << " s; long prefill units "
+                      << units << " against " << lowest_lane_units << " in whole chunks\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+// Requests cancellation once the first prefill chunk is reported. Non-final prefill steps return
+// without waiting for the Device, so the cancellation usually reaches the Program with a later
+// chunk still queued.
+class CancelAfterFirstChunk final : public ninfer::OutputSink {
+public:
+    void start(ninfer::GenerationStart) override {}
+
+    void progress(ninfer::PromptProgress progress) override {
+        if (progress.processed_prompt_tokens != 0) { requested_.store(true); }
+    }
+
+    void timing(ninfer::GenerationTimingObservation) override {}
+
+    void publish(ninfer::OutputDelta) override {}
+
+    [[nodiscard]] bool requested() const { return requested_.load(); }
+
+private:
+    std::atomic<bool> requested_{false};
+};
+
+// A request cancelled mid-prefill frees its lane and publishes its committed prefix. The lane's
+// next request, on an unrelated prompt, must generate what it generates on an Engine that never
+// saw the cancellation, and a request extending the cancelled prompt must resume from that prefix
+// and generate what an uncached run generates.
+int exercise_cancel_prefill(const char* artifact, ninfer::SpeculativeBackend backend) {
+    const std::vector<ninfer::TokenId> prompt = synthetic_tokens(6 * kPrefillChunk + 100, 11);
+    std::vector<ninfer::TokenId> extended     = prompt;
+    const std::vector<ninfer::TokenId> suffix = synthetic_tokens(60, 12);
+    extended.insert(extended.end(), suffix.begin(), suffix.end());
+    const std::vector<ninfer::TokenId> unrelated = synthetic_tokens(2 * kPrefillChunk + 30, 13);
+    const ninfer::EngineOptions options = hybrid_options(artifact, backend, 16384, 1ULL << 30, 8);
+
+    std::vector<ninfer::TokenId> extended_uncached;
+    std::vector<ninfer::TokenId> unrelated_alone;
+    {
+        ninfer::Engine engine(options);
+        extended_uncached =
+            engine.generate(engine.prepare_tokens(extended), greedy(16)).generated_token_ids;
+        unrelated_alone =
+            engine.generate(engine.prepare_tokens(unrelated), greedy(16)).generated_token_ids;
+    }
+    ninfer::Engine engine(options);
+    CancelAfterFirstChunk sink;
+    ninfer::GenerationHandle handle =
+        engine.submit(engine.prepare_tokens(prompt), greedy(16),
+                      ninfer::OutputConsumerMode::Streaming, {.prompt_progress = true});
+    const ninfer::GenerationResult cancelled =
+        handle.wait(&sink, ninfer::CancellationView([&sink] { return sink.requested(); }));
+    const ninfer::GenerationResult next =
+        engine.generate(engine.prepare_tokens(unrelated), greedy(16));
+    const ninfer::GenerationResult resumed =
+        engine.generate(engine.prepare_tokens(extended), greedy(16));
+
+    const char* name = backend == ninfer::SpeculativeBackend::DFlash2 ? "cancel-prefill-dflash2"
+                                                                      : "cancel-prefill";
+    int failures     = 0;
+    if (cancelled.finish_reason != ninfer::FinishReason::Cancelled ||
+        !cancelled.generated_token_ids.empty()) {
+        std::cerr << name << ": the request was not cancelled during prefill (reason="
+                  << static_cast<int>(cancelled.finish_reason)
+                  << " generated=" << cancelled.generated_token_ids.size() << ")\n";
+        ++failures;
+    }
+    std::cout << name << ": the extended prompt resumed at " << resumed.reused_prompt_tokens
+              << " of the cancelled request's " << prompt.size() << " prompt tokens\n";
+    if (next.generated_token_ids != unrelated_alone) {
+        std::cerr << name << ": the lane's next request generated different tokens than alone\n";
+        ++failures;
+    }
+    if (resumed.reused_prompt_tokens == 0 || resumed.reused_prompt_tokens % kBlock != 0 ||
+        resumed.reused_prompt_tokens > prompt.size()) {
+        std::cerr << name << ": the extended prompt reused " << resumed.reused_prompt_tokens
+                  << " tokens, expected the cancelled request's committed prefix\n";
+        ++failures;
+    }
+    if (resumed.generated_token_ids.size() != 16 ||
+        resumed.generated_token_ids != extended_uncached) {
+        std::cerr << name << ": the extended prompt resumed from the cancelled prefix ("
+                  << resumed.reused_prompt_tokens
+                  << " tokens) generated different tokens than an uncached run\n";
+        ++failures;
+    }
+    return failures;
+}
+
 ninfer::ChatMessage text_message(ninfer::ChatRole role, std::string text) {
     ninfer::ChatMessage message;
     message.role = role;
@@ -634,13 +761,17 @@ int main() {
         return 77;
     }
     if (const char* storage = std::getenv("NINFER_HYBRID_KV_DTYPE");
-        storage != nullptr && *storage != '\0' && !select_kv_storage(storage)) {
-        std::cerr << "unknown NINFER_HYBRID_KV_DTYPE " << storage << '\n';
-        return 1;
+        storage != nullptr && *storage != '\0') {
+        try {
+            kv_storage = ninfer::test::parse_kv_cache_storage(storage);
+        } catch (const std::invalid_argument&) {
+            std::cerr << "unknown NINFER_HYBRID_KV_DTYPE " << storage << '\n';
+            return 1;
+        }
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 11> kScenarios{"all",
+    constexpr std::array<std::string_view, 14> kScenarios{"all",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
                                                           "restore-exact-dflash2",
@@ -650,7 +781,10 @@ int main() {
                                                           "persist",
                                                           "turns-protocol",
                                                           "coalesce",
-                                                          "interleaved"};
+                                                          "interleaved",
+                                                          "round-robin",
+                                                          "cancel-prefill",
+                                                          "cancel-prefill-dflash2"};
     if (std::find(kScenarios.begin(), kScenarios.end(), scenario) == kScenarios.end()) {
         std::cerr << "unknown NINFER_HYBRID_REAL_SCENARIO " << scenario << '\n';
         return 1;
@@ -672,6 +806,13 @@ int main() {
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
+        if (all || scenario == "round-robin") { failures += exercise_round_robin(artifact); }
+        if (all || scenario == "cancel-prefill") {
+            failures += exercise_cancel_prefill(artifact, ninfer::SpeculativeBackend::None);
+        }
+        if (all || scenario == "cancel-prefill-dflash2") {
+            failures += exercise_cancel_prefill(artifact, ninfer::SpeculativeBackend::DFlash2);
+        }
         if (all || scenario == "coalesce") {
             failures += exercise_coalesce(artifact, 6 * kPrefillChunk, true);
             failures += exercise_coalesce(artifact, 3000, false);

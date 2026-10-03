@@ -60,11 +60,22 @@ struct BatchedGeneratedRound {
     ExecutionTiming timing;
 };
 
+// Width of one staged prefill step. Nominal advances a whole prefill chunk, one planned service
+// unit. Concurrent advances at most the Program's narrower concurrent width, so other active
+// requests wait less; the chunk it belongs to completes over several steps.
+enum class PrefillStepWidth : std::uint8_t {
+    Nominal,
+    Concurrent,
+};
+
 struct PrefillStepResult {
     BeginSummary summary;
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // False when a Concurrent step stopped inside its prefill chunk: the step consumed no
+    // service unit, and a later step finishes the chunk.
+    bool completes_service_unit = true;
     ExecutionTiming timing;
 };
 

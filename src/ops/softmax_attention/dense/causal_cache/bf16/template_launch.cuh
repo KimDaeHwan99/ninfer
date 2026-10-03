@@ -53,8 +53,12 @@ void launch_bf16_kv_grouped_mma(const CausalAttentionOperands& p, Bf16KvCacheVie
     if constexpr (Input::writes_cache) {
         if (!input.k || !input.v) throw std::invalid_argument("BF16 grouped append requires K/V");
     }
-    {
-        constexpr auto kernel = bf16_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input>;
+    // Only verification rows carry a tree: masked rows of the grouped append route.
+    constexpr bool TreeCapable = Masked && Input::writes_cache;
+    if (!TreeCapable && cache.tree_masks)
+        throw std::invalid_argument("BF16 grouped attention: this route has no tree");
+    const auto launch = [&]<bool Tree>() {
+        constexpr auto kernel = bf16_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, Tree>;
         constexpr int bytes   = sizeof(Bf16KvGroupedStorage<G, S>);
         int dynamic           = 0;
         if constexpr (bytes > 48 * 1024) dynamic = bf16_kv_dynamic_shared<bytes, kernel>();
@@ -62,9 +66,17 @@ void launch_bf16_kv_grouped_mma(const CausalAttentionOperands& p, Bf16KvCacheVie
                         partition.capacity, p.batch);
         kernel<<<grid, S::kThreads, dynamic, stream>>>(
             p.q, input, p.positions, cache.keys, cache.values, cache.tables, cache.valid_columns,
-            cache.table_rows, cache.table_stride, p.width, p.scale, partition, partials);
+            cache.table_rows, cache.table_stride, p.width, p.visible_capacity, p.scale, partition,
+            partials, cache.tree_masks);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if constexpr (TreeCapable) {
+        if (cache.tree_masks) {
+            launch.template operator()<true>();
+            return;
+        }
     }
-    CUDA_CHECK(cudaGetLastError());
+    launch.template operator()<false>();
 }
 
 template <class G, class S, bool MultiBatch, bool Masked, bool Writable>
@@ -76,7 +88,7 @@ void launch_bf16_kv_merge(const CausalAttentionOperands& p, Bf16KvCacheView<Writ
     const dim3 grid(G::QHeads, div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
     bf16_kv_merge_kernel<G, S, MultiBatch, Masked><<<grid, S::kThreads, 0, stream>>>(
         partials.acc, partials.maximum, partials.sum, p.positions, cache.valid_columns, p.width,
-        p.batch, partition, p.out);
+        p.batch, p.visible_capacity, partition, p.out);
     CUDA_CHECK(cudaGetLastError());
 }
 

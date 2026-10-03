@@ -213,6 +213,22 @@ int main() {
         slots[1]->capture_pending = false;
         failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::optional(1U),
                           "runnable staged-prefill lane selection changed");
+        // By default the lowest lane keeps the stream even after a unit served it.
+        scheduler.record_prefill_served(1);
+        failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::optional(1U),
+                          "default staged-prefill selection is not lowest lane first");
+        // Round-robin starts after the lane the previous unit served and wraps around.
+        scheduler.set_prefill_round_robin(true);
+        failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::optional(2U),
+                          "round-robin staged prefill did not rotate past the lane it served");
+        scheduler.record_prefill_served(2);
+        failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::optional(1U),
+                          "round-robin staged prefill did not wrap to the first runnable lane");
+        slots[1]->capture_pending = true;
+        failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::optional(2U),
+                          "round-robin staged prefill selected a capture owner");
+        slots[1]->capture_pending = false;
+        scheduler.set_prefill_round_robin(false);
         slots[1]->capture_pending = true;
         slots[2].reset();
         failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::nullopt,
@@ -231,6 +247,23 @@ int main() {
     scheduler.reset();
     failures +=
         check(!scheduler.has_prefill_lane(), "scheduler reset did not clear staged-prefill lanes");
+    {
+        // A reset forgets the lane last served, so round-robin restarts at the lowest lane.
+        std::array<std::shared_ptr<SchedulerRequest>, 3> slots{};
+        slots[1] = std::make_shared<SchedulerRequest>();
+        slots[2] = std::make_shared<SchedulerRequest>();
+        scheduler.set_prefill_round_robin(true);
+        scheduler.set_prefill_lane(1);
+        scheduler.set_prefill_lane(2);
+        scheduler.record_prefill_served(1);
+        scheduler.reset();
+        scheduler.set_prefill_lane(1);
+        scheduler.set_prefill_lane(2);
+        failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::optional(1U),
+                          "scheduler reset kept the lane the last prefill unit served");
+        scheduler.reset();
+        scheduler.set_prefill_round_robin(false);
+    }
 
     std::array<std::shared_ptr<SchedulerRequest>, ninfer::kMaximumConcurrency> slots{};
     slots[0]                      = std::make_shared<SchedulerRequest>();

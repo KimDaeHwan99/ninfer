@@ -1,6 +1,7 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/operands.h"
-#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_tiled_plan.h"
+#include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_prompt_launch.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -12,8 +13,7 @@ constexpr int kGroupedPrefillMaxWidth = 192;
 Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
                                             CausalAttentionExecutionEnvelope envelope) {
     if ((heads != 24 && heads != 16 && heads != 12) || width < 1 || batch < 1 || batch > 8 ||
-        (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
-        envelope.min_visible_keys > envelope.max_visible_keys ||
+        envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("NVFP4 attention: invalid plan inputs");
     constexpr int grouped_limit = Nvfp4KvCausalPlan::kTokenTile;
@@ -34,7 +34,16 @@ Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
         1, std::clamp(budget / independent_tiles, 1, CausalKvPartition::kMaxSplits)};
     // Bound partial traffic by keeping enough KV work in each split.
     partition.key_shift = (row_tiles <= 2 ? 7 : 8) - (heads == 16 ? 1 : 0);
-    partition.capacity  = partition.active(envelope.max_visible_keys);
+    // Multi-column rows of the 24/4 geometry may split down to 64 keys, so short rows fill
+    // the GPU; the live count is then balanced to the fewest splits that keep the largest
+    // number of 64-key tiles per split. Rows long enough to saturate the target at the
+    // 256-key minimum keep its count (and so its partition).
+    if (heads == 24 && row_tiles > 2) {
+        partition.key_shift     = 6;
+        partition.balance_shift = 6;
+        partition.balance_limit = partition.target << 8;
+    }
+    partition.capacity  = partition.bound(envelope.max_visible_keys);
     return {family, heads, width, batch, query_tile, envelope, partition};
 }
 
@@ -49,12 +58,13 @@ std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int ma
         (void)allocate_causal_partials(layout, heads, width, splits, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
-    // The fast prompt kernel may split a prompt-route launch's keys across CTAs.
+    // The fast prompt kernel publishes FP32 split partials for the merge.
     if (envelope.fast_prompt_kernel && batch == 1 && max_width > kGroupedPrefillMaxWidth &&
         nvfp4_fast_prompt_applies(envelope.max_visible_keys))
-        maximum = std::max(maximum, rotated_fast_prompt_workspace_bytes(
+        maximum = std::max(maximum, mxfp8_tiled_workspace_bytes(
                                         heads, std::max(min_width, kGroupedPrefillMaxWidth + 1),
-                                        max_width, envelope.max_visible_keys));
+                                        max_width, envelope.max_visible_keys,
+                                        envelope.prompt_split_workspace_bytes));
     return maximum;
 }
 

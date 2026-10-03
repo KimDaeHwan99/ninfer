@@ -784,9 +784,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                                plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
     plan->transfer_requirements.reserve(4);
     const auto add_state_transfer = [&](runtime::ContextTransferDirection direction,
-                                        bool dflash_local_only = false) {
-        const TransferWork work = dflash_local_only
-                                      ? dflash_local_transfer_work(state_images->host_layout())
+                                        bool fork_local_only = false) {
+        const TransferWork work = fork_local_only
+                                      ? fork_local_transfer_work(state_images->host_layout())
                                       : state_image_transfer_work(state_images->host_layout());
         plan->transfer_requirements.push_back(runtime::ContextTransferRequirement{
             .resource   = runtime::ContextResourceClass::State,
@@ -856,9 +856,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             (plan->source_mode == runtime::PrivateSourceMode::Retain && !splits_private_both) ||
             (plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
              plan->state_fork_required);
-        if (is_masked_draft_backend(speculative_backend) && forks_device_state &&
+        if (state_images->has_fork_local() && forks_device_state &&
             selected_state_residency != StateReplicaResidency::HostOnly) {
-            // DFlash has lane-local recurrent state which is copied eagerly when a retained
+            // DFlash lane-local state and the exact KV window are copied eagerly when a retained
             // checkpoint forks. The copy completes on the compute stream in the publication
             // boundary, so it contributes candidate cost without turning the plan into an
             // asynchronous materialization.

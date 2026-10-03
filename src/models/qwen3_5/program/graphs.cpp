@@ -185,9 +185,12 @@ void ProgramImpl::prepare_graphs() {
             }
             cache.page_pool().zero_pages(pages, device.stream);
         };
+    // capture_tree selects a DFlash2 tree round: rows whose whole tree fits verify a tree of
+    // capture_drafts + 1 columns built from capture_proposal_drafts main-chain proposals.
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
                                             std::uint32_t capture_drafts,
-                                            std::uint32_t capture_proposal_drafts) {
+                                            std::uint32_t capture_proposal_drafts,
+                                            bool capture_tree = false) {
         if (batch_size == 0 || batch_size > max_concurrency) {
             throw std::logic_error("CUDA Graph representative batch is invalid");
         }
@@ -220,11 +223,13 @@ void ProgramImpl::prepare_graphs() {
         if (io.dflash_decode) {
             *dflash_host_ingress = {};
             *dflash_host_egress  = {};
-            const std::uint32_t extent =
-                std::min(capture_proposal_drafts, capacity - frontier - 1U);
             const std::uint32_t width = capture_drafts + 1U;
+            const bool tree_row       = capture_tree && capacity - frontier - 1U >= capture_drafts;
+            const std::uint32_t extent =
+                tree_row ? capture_drafts
+                         : std::min(capture_proposal_drafts, capacity - frontier - 1U);
             for (std::uint32_t row = 0; row < batch_size; ++row) {
-                for (std::uint32_t step = 0; step < capture_proposal_drafts; ++step) {
+                for (std::uint32_t step = 0; step < capture_drafts; ++step) {
                     const auto base = row * capture_drafts * ops::kSparseSpeculativeCandidates +
                                       step * ops::kSparseSpeculativeCandidates;
                     dflash_host_ingress->ngram_q[base] = 1.0F;
@@ -240,14 +245,18 @@ void ProgramImpl::prepare_graphs() {
                 dflash_host_ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
                 dflash_host_ingress->proposal_valid_columns[row] =
-                    static_cast<std::int32_t>(capture_proposal_drafts + 1U);
+                    static_cast<std::int32_t>((speculative_backend == SpeculativeBackend::DFlash2
+                                                   ? capture_proposal_drafts
+                                                   : std::min(extent, capture_proposal_drafts)) +
+                                              1U);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
                 for (std::uint32_t column = 0; column < width; ++column) {
-                    dflash_host_ingress->target_rope_positions[row * width + column] =
-                        checked_i32(frontier + std::min(column, extent),
-                                    "graph representative DFlash target RoPE position");
+                    // The device adds a tree column's depth to the anchor position.
+                    const std::uint32_t offset = tree_row ? 0U : std::min(column, extent);
+                    dflash_host_ingress->target_rope_positions[row * width + column] = checked_i32(
+                        frontier + offset, "graph representative DFlash target RoPE position");
                 }
                 dflash_host_ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
                 dflash_host_ingress->dflash_kv_table_rows[row]    = static_cast<std::int32_t>(row);
@@ -312,13 +321,13 @@ void ProgramImpl::prepare_graphs() {
                                         tensor_parallel,
                                         parameters,
                                         work,
-                                        state_images->linear(),
+                                        *state_images,
                                         replay_records ? &*replay_records : nullptr,
                                         io,
                                         prefill_hidden,
                                         prefill_chunk,
                                         proposal_head,
-                                        fast_prefill_kernel};
+                                        prompt_attention};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -355,78 +364,92 @@ void ProgramImpl::prepare_graphs() {
         }
     }
 
-    if (speculative_backend == SpeculativeBackend::Mtp) {
-        // Neural rounds verify at the neural window; a copy-drafting engine with another window
-        // also captures a family at that window. Both run on the one frame viewed at their width
-        // (MtpDecodeState::narrowed) and record through a ReplaySSM view of the same width.
-        for (const MtpGraphFamily& family :
-             mtp_graph_families(neural_draft_window, ngram_draft_window)) {
-            const std::uint32_t verify_drafts = family.verify_drafts;
-            const std::uint32_t ar_depth      = family.ar_depth;
-            const auto prepare_family         = [&, verify_drafts](std::uint32_t frontier,
-                                                           std::uint32_t batch_size) {
-                prepare_representative(frontier, batch_size, verify_drafts, verify_drafts);
-            };
-            auto& graph_family          = family.ngram ? ngram_graphs : mtp_graphs;
-            const auto planned_profiles = mtp_graph_profiles(capacity, verify_drafts, ar_depth);
-            validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
-            execution::ExecutionCore core = execution_core();
-            core.replay_records           = round_replay_records(verify_drafts);
-            execution::MtpBatchContext mtp_state{core,
-                                                 decoder->text_kv,
-                                                 *decoder->mtp_cache(),
-                                                 *io.mtp_decode,
-                                                 *mtp_host_ingress,
-                                                 *mtp_host_egress,
-                                                 state_images->continuation_hidden_store()};
-            mtp_state.neural_proposal_drafts      = ar_depth;
-            const GraphExecutionProfile code_warm = planned_profiles.front();
-            prepare_family(code_warm.min, 1);
-            device.synchronize();
-            execution::mtp_decode_batch(
-                mtp_state, 1, verify_drafts,
-                mtp_causal_attention_envelopes(code_warm.max, verify_drafts, capacity, ar_depth),
-                nullptr);
-            device.synchronize();
+    for (SpeculativeRoundFamily& family : round_families) {
+        if (speculative_backend != SpeculativeBackend::Mtp) { break; }
+        // Each family verifies at its own window, on the frame viewed at that width, and records
+        // ReplaySSM transitions through the record view of the same width. Every round proposes
+        // the next round's drafts at the configured MTP depth.
+        const std::uint32_t verify_drafts = family.shape.verify_drafts;
+        const std::uint32_t ar_depth      = neural_draft_window;
+        const auto prepare_family         = [&, verify_drafts](std::uint32_t frontier,
+                                                       std::uint32_t batch_size) {
+            prepare_representative(frontier, batch_size, verify_drafts, verify_drafts);
+        };
+        auto& graph_family          = family.graphs;
+        const auto planned_profiles = mtp_graph_profiles(capacity, verify_drafts, ar_depth);
+        validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+        execution::ExecutionCore mtp_core = execution_core();
+        mtp_core.replay_records           = round_replay_records(verify_drafts);
+        execution::MtpBatchContext mtp_state{mtp_core,
+                                             decoder->text_kv,
+                                             *decoder->mtp_cache(),
+                                             *io.mtp_decode,
+                                             *mtp_host_ingress,
+                                             *mtp_host_egress,
+                                             state_images->continuation_hidden_store()};
+        mtp_state.neural_proposal_drafts      = ar_depth;
+        const GraphExecutionProfile code_warm = planned_profiles.front();
+        prepare_family(code_warm.min, 1);
+        device.synchronize();
+        execution::mtp_decode_batch(
+            mtp_state, 1, verify_drafts,
+            mtp_causal_attention_envelopes(code_warm.max, verify_drafts, capacity, ar_depth),
+            nullptr);
+        device.synchronize();
 
-            graph_family.profiles.reserve(planned_profiles.size() * max_concurrency);
-            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-                for (const GraphExecutionProfile planned : planned_profiles) {
-                    graph_family.profiles.emplace_back();
-                    DecodeGraphProfile& profile    = graph_family.profiles.back();
-                    profile.batch_size             = batch_size;
-                    profile.min_execution_frontier = planned.min;
-                    profile.max_execution_frontier = planned.max;
-                    profile.topology_class =
-                        planned.topology_class * max_concurrency + (batch_size - 1U);
-                    execution::capture_mtp_decode_batch(
-                        mtp_state, static_cast<std::int32_t>(batch_size), verify_drafts,
-                        mtp_causal_attention_envelopes(planned.max, verify_drafts, capacity,
-                                                       ar_depth),
-                        profile.definition);
-                }
+        graph_family.profiles.reserve(planned_profiles.size() * max_concurrency);
+        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+            for (const GraphExecutionProfile planned : planned_profiles) {
+                graph_family.profiles.emplace_back();
+                DecodeGraphProfile& profile    = graph_family.profiles.back();
+                profile.batch_size             = batch_size;
+                profile.min_execution_frontier = planned.min;
+                profile.max_execution_frontier = planned.max;
+                profile.topology_class =
+                    planned.topology_class * max_concurrency + (batch_size - 1U);
+                execution::capture_mtp_decode_batch(
+                    mtp_state, static_cast<std::int32_t>(batch_size), verify_drafts,
+                    mtp_causal_attention_envelopes(planned.max, verify_drafts, capacity, ar_depth),
+                    profile.definition);
             }
-            instantiate_graph_family(graph_family, family.ngram ? "ngram MTP" : "MTP", device,
-                                     prepare_family);
         }
+        instantiate_graph_family(
+            graph_family, family.shape.kind == SpeculativeRoundKind::Ngram ? "ngram MTP" : "MTP",
+            device, prepare_family);
     }
     if (is_masked_draft_backend(speculative_backend)) {
-        for (const bool ngram : {false, true}) {
-            if (ngram && ngram_draft_window == 0) { continue; }
+        for (SpeculativeRoundFamily& family : round_families) {
             // Every family verifies at its own window for every batch size, on the one frame
             // viewed at that width, and records ReplaySSM transitions through the record view of
             // the same width. A batch>1 ngram round also runs the drafter so rows without a copy
             // keep their neural proposal.
-            const std::uint32_t family_window = ngram ? ngram_draft_window : neural_draft_window;
+            const bool ngram                  = family.shape.kind == SpeculativeRoundKind::Ngram;
+            const bool tree                   = family.shape.kind == SpeculativeRoundKind::Tree;
+            const std::uint32_t family_window = family.shape.verify_drafts;
+            // A tree family serves only the batch sizes that may verify its width, and the plain
+            // neural family only those that may verify a chain; a family serving none is not
+            // captured.
+            const auto serves = [&](std::uint32_t batch_size) {
+                return tree ? tree_widths.tree(batch_size, family_window + 1U)
+                            : ngram || tree_widths.chain(batch_size);
+            };
+            bool used = false;
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                used = used || serves(batch_size);
+            }
+            if (!used) { continue; }
+            // The drafter always proposes at its own width; a tree family builds each row's tree
+            // into its wider frame.
             const auto prepare_family = [&](std::uint32_t frontier, std::uint32_t batch_size) {
-                prepare_representative(frontier, batch_size, family_window, family_window);
+                prepare_representative(frontier, batch_size, family_window, neural_draft_window,
+                                       tree);
             };
             const auto family_core = [&] {
                 execution::ExecutionCore core = execution_core();
                 core.replay_records           = round_replay_records(family_window);
                 return core;
             };
-            auto& graph_family = ngram ? ngram_graphs : dflash_graphs;
+            auto& graph_family = family.graphs;
             const auto planned_profiles =
                 dflash_graph_profiles(speculative_backend, capacity, family_window);
             validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
@@ -445,6 +468,8 @@ void ProgramImpl::prepare_graphs() {
                     state_images->continuation_hidden_store()};
                 warm_state.ngram                  = ngram;
                 warm_state.neural_proposal_drafts = neural_draft_window;
+                warm_state.tree                   = tree;
+                warm_state.tree_paths             = draft_tree_paths;
                 execution::dflash_decode_batch(warm_state, 1, family_window,
                                                dflash_envelopes(code_warm.min, code_warm.max),
                                                code_warm_target, nullptr);
@@ -453,6 +478,7 @@ void ProgramImpl::prepare_graphs() {
 
             graph_family.profiles.reserve(planned_profiles.size() * max_concurrency);
             for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                if (!serves(batch_size)) { continue; }
                 execution::DFlashBatchContext dflash_state{
                     family_core(),        decoder->text_kv,
                     *dflash,              *io.dflash_decode,
@@ -460,6 +486,8 @@ void ProgramImpl::prepare_graphs() {
                     state_images->continuation_hidden_store()};
                 dflash_state.ngram                  = ngram;
                 dflash_state.neural_proposal_drafts = neural_draft_window;
+                dflash_state.tree                   = tree;
+                dflash_state.tree_paths             = draft_tree_paths;
                 for (const GraphExecutionProfile planned : planned_profiles) {
                     graph_family.profiles.emplace_back();
                     DecodeGraphProfile& profile    = graph_family.profiles.back();
@@ -479,8 +507,8 @@ void ProgramImpl::prepare_graphs() {
                         profile.definition);
                 }
             }
-            instantiate_graph_family(graph_family, ngram ? "ngram" : "DFlash", device,
-                                     prepare_family);
+            instantiate_graph_family(graph_family, ngram ? "ngram" : (tree ? "tree" : "DFlash"),
+                                     device, prepare_family);
         }
     }
 

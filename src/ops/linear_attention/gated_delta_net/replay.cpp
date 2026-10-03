@@ -106,8 +106,7 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t rows        = q.ne[3];
     const bool registered_heads    = (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
                                   (qk_heads == 8 && value_heads == 24);
-    if (!registered_heads || width < 2 || width > 64 || rows <= 0 || rows > kMaximumRows ||
-        (width > 16 && rows != 1)) {
+    if (!registered_heads || width < 2 || width > 64 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
     if (states.ne[3] <= 0) {
@@ -265,8 +264,7 @@ void require_records_disjoint_from_states(const GdnReplayRecords& records,
 detail::gated_delta_net::GdnReplayFoldKernelRows
 validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                    std::span<const GdnReplayFoldRow> rows) {
-    if (rows.empty() || rows.size() > static_cast<std::size_t>(records.spec.record_capacity) ||
-        (records.spec.width > 16 && rows.size() != 1)) {
+    if (rows.empty() || rows.size() > static_cast<std::size_t>(records.spec.record_capacity)) {
         throw std::invalid_argument("gdn_replay_fold: active row count is out of range");
     }
     detail::gated_delta_net::GdnReplayFoldKernelRows packed{};
@@ -307,6 +305,24 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
     detail::gated_delta_net::launch_recurrent_record(q, k, v, g, beta, scale, ssm_states,
                                                      valid_columns, initial_state_slots, key_record,
                                                      value_record, gate_record, out, stream);
+}
+
+void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   const Tensor& ssm_states, const Tensor& valid_columns,
+                                   const Tensor& initial_state_slots, const Tensor& tree_rows,
+                                   Tensor& key_record, Tensor& value_record, Tensor& gate_record,
+                                   Tensor& out, cudaStream_t stream) {
+    if (valid_columns.data == nullptr || q.ne[2] < 2 || q.ne[2] > kSpeculativeTreeMaxNodes) {
+        throw std::invalid_argument("gated_delta_net_replay_record: a tree needs valid columns "
+                                    "and a width of at most 32");
+    }
+    validate_speculative_tree_rows(tree_rows, q.ne[3], "gated_delta_net_replay_record");
+    validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+                           key_record, value_record, gate_record, out);
+    detail::gated_delta_net::launch_recurrent_tree_record(
+        q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, tree_rows,
+        key_record, value_record, gate_record, out, stream);
 }
 
 GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,

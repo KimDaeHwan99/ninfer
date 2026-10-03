@@ -58,14 +58,12 @@ void verify_profiles() {
         }
     }
     for (const auto phase : {qwen::TextPhase::Prefill, qwen::TextPhase::Verify}) {
-        for (int batch : {0, 1, 2, 4, 8}) {
-            for (int first : {1, 6, 16, 17, 21, 22, 24, 25, 31, 32, 33, 48, 63, 64, 65, 96}) {
-                for (int last : {first, 64, 65}) {
-                    const bool expected = phase == qwen::TextPhase::Verify && batch == 1 &&
-                                          first >= 17 && first <= last && last <= 64;
-                    require(qwen::wide_residual_verification(phase, batch, first, last) == expected,
-                            "wide residual precision escaped its phase/batch/width domain");
-                }
+        for (int first : {1, 6, 16, 17, 21, 22, 24, 25, 31, 32, 33, 48, 63, 64, 65, 96}) {
+            for (int last : {first, 64, 65}) {
+                const bool expected = phase == qwen::TextPhase::Verify && first >= 17 &&
+                                      first <= last && last <= 64;
+                require(qwen::wide_residual_verification(phase, first, last) == expected,
+                        "wide residual precision escaped its phase/width domain");
             }
         }
     }
@@ -87,14 +85,30 @@ void verify_profiles() {
     }
 }
 
-// The CUDA Graph allowance at max concurrency 1: a fixed driver share plus a fixed share for each
-// executable, one per topology class of the one family captured.
-std::size_t expected_family_bytes(unsigned capacity, unsigned verify, unsigned neural) {
+// One executable per topology class of one captured family.
+std::size_t family_executables(unsigned capacity, unsigned verify, unsigned neural) {
     std::set<std::uint32_t> classes;
     for (const auto& profile : mtp_graph_profiles(capacity, verify, neural)) {
         classes.insert(profile.topology_class);
     }
-    return (64ULL << 20) + classes.size() * (4ULL << 20);
+    return classes.size();
+}
+
+// The CUDA Graph allowance at max concurrency 1: a fixed driver share plus a fixed share for each
+// executable. MTP captures its neural family at the neural window and, with ngram drafting, copy
+// families at 7, 15 and 31 drafts strictly between the two windows and at the ngram window; every
+// round drafts at the neural depth.
+std::size_t expected_allowance(unsigned capacity, unsigned neural, unsigned ngram) {
+    std::size_t executables = family_executables(capacity, neural, neural);
+    if (ngram != 0) {
+        for (const unsigned narrow : {7U, 15U, 31U}) {
+            if (narrow > neural && narrow < ngram) {
+                executables += family_executables(capacity, narrow, neural);
+            }
+        }
+        executables += family_executables(capacity, ngram, neural);
+    }
+    return (64ULL << 20) + executables * (4ULL << 20);
 }
 
 void verify_real_plan(const char* artifact) {
@@ -128,13 +142,9 @@ void verify_real_plan(const char* artifact) {
                     const auto pages = planner.capacity_curve().minimum_main_page_groups;
                     bytes[graphs] = std::move(planner).finalize(pages).device_reservation_bytes();
                 }
-                // One MTP family is captured at the frame's native width (the wider of the neural
-                // and ngram windows) with the frame's AR depth.
-                const unsigned draft_window = std::max(neural, ngram);
-                const unsigned ar_depth     = std::min(draft_window, 5U);
-                const auto expected = expected_family_bytes(capacity, draft_window, ar_depth);
+                const auto expected = expected_allowance(capacity, neural, ngram);
                 require(bytes[1] >= bytes[0] && bytes[1] - bytes[0] == expected,
-                        "planned graph allowance does not cover the native-width provider family");
+                        "planned graph allowance does not cover the MTP round families");
                 ++cases;
             }
         }

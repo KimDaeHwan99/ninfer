@@ -2203,7 +2203,7 @@ bool ProgramImpl::compose_pressure_candidate(
             }
             ++details.demand.reservation_credit.device.state_slots;
 
-            if (is_masked_draft_backend(speculative_backend)) {
+            if (state_images->has_fork_local()) {
                 const auto copy = std::find_if(
                     details.transfer_requirements.begin(), details.transfer_requirements.end(),
                     [](const runtime::ContextTransferRequirement& requirement) {

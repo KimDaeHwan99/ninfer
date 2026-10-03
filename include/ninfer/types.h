@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,9 @@ inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 // Pinned Host tier of the hybrid prefix cache when --host-cache-mib is not given.
 inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
+// Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
+inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
+inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -38,7 +42,31 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
     Nvfp4Group16,
     Fp8KeyNvfp4Value,
+    // Rotated 2-bit eight-value vector codes for K and V plus an exact INT8 recent-key window.
+    Vq2,
+    // Rotated 4-bit Lloyd-Max K codes, 2-bit vector V codes and the same exact recent-key window.
+    Q4KeyVq2Value,
 };
+
+// How prompt attention runs P*V where its kernel has an 8-bit form (the fast INT8 and NVFP4
+// prompt kernels, K8V4's tiled kernel and the VQ2 and K4V2 prompt kernel). Auto keeps FP16 P*V
+// for INT8 and K4V2 KV, whose 8-bit forms cost measurable KL divergence against FP16's at 64K
+// context, and uses the 8-bit form for NVFP4, K8V4 and VQ2 KV, where it is numerically equivalent
+// or nearly so (see the README).
+enum class PrefillPv8 : std::uint8_t {
+    Auto,
+    On,
+    Off,
+};
+
+[[nodiscard]] constexpr const char* prefill_pv8_name(PrefillPv8 policy) noexcept {
+    switch (policy) {
+    case PrefillPv8::Auto: return "auto";
+    case PrefillPv8::On: return "on";
+    case PrefillPv8::Off: return "off";
+    }
+    return "auto";
+}
 
 enum class EnginePurpose : std::uint8_t {
     Generation,
@@ -80,6 +108,15 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash2,
 };
 
+// Automatic DFlash2 tree verification considers, besides the chain, trees of these many columns
+// (anchor included) for all-neural rounds of at most kDraftTreeAutoMaxBatch rows.
+inline constexpr std::uint32_t kDraftTreeAutoMaxBatch = 4;
+
+[[nodiscard]] constexpr std::array<std::uint32_t, 2>
+draft_tree_auto_widths(std::uint32_t draft_tokens) noexcept {
+    return {draft_tokens + 5U, draft_tokens + 9U};
+}
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
@@ -89,6 +126,17 @@ struct SpeculativeOptions {
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
+    // DFlash2 tree verification by batch size: entry c-1 is the column count (anchor included,
+    // draft_tokens+2..32) a neural round of c rows verifies per row as a draft tree built from the
+    // drafter's lattice; zero keeps that batch size on chain verification. All zero disables trees.
+    std::array<std::uint32_t, kMaximumConcurrency> draft_tree_nodes{};
+    // Automatic DFlash2 tree verification (draft_tree_nodes all zero): each all-neural round
+    // verifies a chain or one of draft_tree_auto_widths, whichever measured round time and
+    // same-text acceptance favour at its batch size and context length. A target whose GDN input
+    // projections cannot verify trees resolves this to false (chain verification).
+    bool draft_tree_auto = false;
+    // Most root-to-leaf paths a tree row may hold, 2..8.
+    std::uint32_t draft_tree_paths = 8;
     // CPU-only retention, separate from KV. Zero keeps request-local drafting.
     std::size_t ngram_archive_bytes = 0;
     std::size_t ngram_session_bytes = 128ULL << 20;
@@ -291,11 +339,29 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Opt-in: prefill units rotate round-robin over the lanes with staged prefill, starting after
+    // the lane the previous unit served, and while another request is active each unit advances
+    // at most 1024 prompt tokens (rounded like prefill_chunk). False serves the lowest such lane
+    // first in whole chunks, so a prompt staged beside a long one may wait for the whole long
+    // prefill.
+    bool prefill_round_robin           = false;
     // INT8 KV prefills with the fast prompt-attention kernel and rounds prefill_chunk down to whole
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
     // it requires the INT8 KV cache.
     bool original_int8_prefill_kernel  = false;
-    // NVFP4 KV prefills over more than 2048 visible keys with the fast prompt-attention kernel
+    // Prompt attention's P*V form where its kernel has both: the fast INT8 kernel's 8-bit form
+    // rounds each probability (times its key's V group scale) to a u8 code per 64-key tile and
+    // multiplies the stored V codes exactly, and the fast NVFP4 and the K8V4 prompt kernels round
+    // probabilities and decoded V to E4M3; both are faster long-prompt prefill for a precision
+    // change of P (and NVFP4/K8V4 V). BF16 and FP8 KV and the original INT8 and NVFP4 prompt
+    // kernels have only FP16 P*V, which this setting leaves alone.
+    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
+    // Workspace (MiB, [0,16384]) the FP32 partials of one prompt-attention launch may take when
+    // it splits its keys across SMs (the INT8 and NVFP4 fast prompt kernels, FP8 and K8V4).
+    // Larger budgets speed up prompt chunks of about 1-2K tokens over long cached context and take
+    // device memory from the KV cache; BF16 KV and the original INT8/NVFP4 kernels ignore it.
+    std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
+    // NVFP4 KV prefills over more than 768 visible keys with the fast prompt-attention kernel
     // (block-scaled FP4 QK). True selects the tiled NVFP4 prompt kernel; it requires the NVFP4
     // KV cache.
     bool original_nvfp4_prefill_kernel = false;
@@ -501,6 +567,8 @@ struct ToolCallParseDiagnostics {
     std::uint32_t schema_mismatch_arguments       = 0;
     std::uint32_t duplicate_parameters_repaired   = 0;
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
+    // Tolerant tool-call mode turned output the strict parser rejects into structured calls.
+    bool tolerant_recovered = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
@@ -866,6 +934,11 @@ struct SpeculativeStats {
     std::uint64_t ngram_archive_rounds          = 0;
     std::uint64_t ngram_archive_drafted_tokens  = 0;
     std::uint64_t ngram_archive_accepted_tokens = 0;
+    // Tree-verified rounds, those whose accepted path left the main chain, and the drafts those
+    // paths accepted after leaving it (what the main chain alone would not have accepted).
+    std::uint64_t tree_rounds               = 0;
+    std::uint64_t tree_side_rounds          = 0;
+    std::uint64_t tree_side_accepted_tokens = 0;
 };
 
 struct ThinkingBudgetStats {
@@ -1032,6 +1105,31 @@ struct VisionWorkspaceMemorySummary {
     std::size_t handoff_capacity_bytes    = 0;
     std::size_t handoff_active_bytes      = 0;
     std::size_t handoff_peak_bytes        = 0;
+};
+
+// Most tokens Engine::score_tokens returns per scored position for each distribution output.
+inline constexpr std::uint32_t kMaximumScoreTopTokens = 64;
+
+// Distribution outputs of Engine::score_tokens beyond every target token's log-probability. All
+// log-probabilities are over the model's public tokens.
+struct ScoreOptions {
+    // The top_k most probable tokens of every scored position, in [0,64].
+    std::uint32_t top_k = 0;
+    // The log-probabilities of candidates_per_position given tokens at every scored position, in
+    // [0,64]: candidates holds them position-major (scored positions x candidates_per_position).
+    std::uint32_t candidates_per_position = 0;
+    std::vector<TokenId> candidates;
+};
+
+struct ScoreResult {
+    // log p(tokens[i] | tokens[0..i)) for every scored position i.
+    std::vector<float> logprobs;
+    // Position-major (scored positions x top_k): most probable first, equal logits by ascending
+    // token id.
+    std::vector<TokenId> top_ids;
+    std::vector<float> top_logprobs;
+    // Position-major (scored positions x candidates_per_position), in the candidates' order.
+    std::vector<float> candidate_logprobs;
 };
 
 struct MemorySummary {

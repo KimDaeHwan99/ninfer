@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/common/causal_operands.h"
 
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
@@ -42,11 +43,13 @@ __launch_bounds__(256) __global__
     void causal_natural_merge_kernel(const float* partial_acc, const float* partial_m,
                                      const float* partial_l, const std::int32_t* positions,
                                      const std::int32_t* valid_columns, std::int32_t tokens,
-                                     std::int32_t batch_size, CausalKvPartition partition,
-                                     __nv_bfloat16* out) {
+                                     std::int32_t batch_size, std::int32_t visible_capacity,
+                                     CausalKvPartition partition, __nv_bfloat16* out) {
     static_assert(Geometry::kHeadDim == kCausalHeadDim);
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
     static_assert(!InverseRotation || DChunk == kCausalHeadDim);
+    // Every path, including the masked-column early exit, follows the producer's completion.
+    pdl::wait_for_dependencies();
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
     const int flat_column = static_cast<int>(blockIdx.z);
@@ -63,7 +66,7 @@ __launch_bounds__(256) __global__
         if (batch >= batch_size) return;
     }
     if constexpr (MultiBatch) positions += static_cast<std::int64_t>(batch) * tokens;
-    const int window  = positions[tokens - 1] + 1;
+    const int window  = causal_row_window(positions[0], tokens, visible_capacity);
     int output_column = token;
     if constexpr (MultiBatch) output_column += batch * tokens;
     if constexpr (Masked) {
@@ -115,10 +118,14 @@ void launch_causal_natural_merge(const CausalAttentionOperands& p,
                                  CausalPartialView partial, cudaStream_t stream) {
     static_assert(S::kThreads == 256);
     const dim3 grid(G::QHeads, div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
-    causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>
-        <<<grid, S::kThreads, 0, stream>>>(partial.acc, partial.maximum, partial.sum, p.positions,
-                                           valid_columns, p.width, p.batch, partition, p.out);
-    CUDA_CHECK(cudaGetLastError());
+    // A captured merge launches as a programmatic dependent of the attention kernel, which
+    // triggers it once its KV loop ends; the merge waits for the partials before any access.
+    CUDA_CHECK(pdl::launch_consumer(
+        pdl::LaunchConfig{grid, dim3(S::kThreads), 0, stream},
+        causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>,
+        static_cast<const float*>(partial.acc), static_cast<const float*>(partial.maximum),
+        static_cast<const float*>(partial.sum), p.positions, valid_columns, p.width, p.batch,
+        p.visible_capacity, partition, p.out));
 }
 
 } // namespace ninfer::ops::detail

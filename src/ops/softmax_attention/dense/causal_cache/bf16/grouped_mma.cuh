@@ -3,6 +3,8 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
+#include "ops/softmax_attention/common/causal_partition.h"
+#include "ops/softmax_attention/common/causal_tree.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -40,15 +42,17 @@ bf16_kv_load_grouped_tile(__nv_bfloat16* key_tile, __half* value_tile, const __n
 }
 
 // Packed-query tiles and KV partitions are independent grid axes. Each KV row
-// has one append owner; all query CTAs read new rows from the immutable inputs.
-template <class G, class S, bool MultiBatch, bool Masked, class Input>
+// has one append owner; all query CTAs read new rows from the immutable inputs. Tree instances
+// also apply the per-row ancestor masks of speculative verification trees.
+template <class G, class S, bool MultiBatch, bool Masked, class Input, bool Tree = false>
 __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     void bf16_kv_grouped_mma_kernel(const __nv_bfloat16* q, Input input, const int* positions,
                                     typename Bf16KvCacheView<Input::writes_cache>::Key* cache_k,
                                     typename Bf16KvCacheView<Input::writes_cache>::Value* cache_v,
                                     const int* tables, const int* validity, const int* table_rows,
-                                    int table_stride, int runtime_width, float scale,
-                                    Bf16KvPartition partition, CausalPartialView partial) {
+                                    int table_stride, int runtime_width, int visible_capacity,
+                                    float scale, Bf16KvPartition partition,
+                                    CausalPartialView partial, const std::uint32_t* tree_masks) {
     const int width = S::kFixedWidth ? S::kFixedWidth : runtime_width;
     constexpr int D = G::kHeadDim, M = S::kQueryRows, N = S::kKeyRows;
     constexpr int NK = N / S::kWarpsKV, QKNt = NK / 8, QKKs = D / 16;
@@ -97,8 +101,10 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         }
     };
     if (row_begin >= live * G::GroupSize) return;
-    const int first = positions[0], window = positions[live - 1] + 1;
-    const auto work = partition.live(window);
+    // Masked tail columns count toward the partition, but no key past the live ones is loaded.
+    const int first = positions[0], live_end = positions[live - 1] + 1;
+    const int window = causal_row_window(first, width, visible_capacity);
+    const auto work  = partition.live(window);
     if (split >= work.splits) return;
     const int start     = split * work.keys_per_split;
     const int stop      = min(window, start + work.keys_per_split);
@@ -119,8 +125,9 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
             }
         }
     }
-    const int last_token = min(live, div_up(row_begin + M, G::GroupSize)) - 1;
-    const int end        = min(stop, positions[last_token] + 1);
+    const int last_token = min(width, div_up(row_begin + M, G::GroupSize)) - 1;
+    const int end        = min(stop, first + last_token + 1);
+    const int load_end   = min(end, live_end);
     if (start >= end) {
         neutral();
         return;
@@ -154,6 +161,9 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     const int tokens[2] = {rows[0] / G::GroupSize, rows[1] / G::GroupSize};
     const int qabs[2]   = {tokens[0] < live ? positions[tokens[0]] : -1,
                          tokens[1] < live ? positions[tokens[1]] : -1};
+    const std::uint32_t tree[2] = {
+        tokens[0] < live ? causal_tree_mask<Tree>(tree_masks, batch, width, tokens[0]) : ~0u,
+        tokens[1] < live ? causal_tree_mask<Tree>(tree_masks, batch, width, tokens[1]) : ~0u};
     int page_window = -Storage::kPageWindow;
     for (int k0 = start; k0 < end; k0 += N) {
         const int logical_page = k0 >> kPagedKVPageShift;
@@ -166,8 +176,8 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
             __syncthreads();
         }
         bf16_kv_load_grouped_tile<G, S>(k_s, v_s, cache_k, cache_v, input,
-                                        storage->pages[logical_page - page_window], head, k0, end,
-                                        first, tid);
+                                        storage->pages[logical_page - page_window], head, k0,
+                                        load_end, first, tid);
         cp_commit();
         cp_wait<0>();
         __syncthreads();
@@ -192,7 +202,9 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int key = k0 + warp_kv * NK + n * 8 + 2 * lid + (j & 1);
-                if (key >= end || key > qabs[j / 2]) score[n][j] = -CUDART_INF_F;
+                if (key >= end || key > qabs[j / 2] ||
+                    (Tree && !causal_tree_visible(key, first, tree[j / 2])))
+                    score[n][j] = -CUDART_INF_F;
                 maximum[j / 2] = fmaxf(maximum[j / 2], score[n][j]);
             }
         }

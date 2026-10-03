@@ -19,26 +19,42 @@ void launch_fp8_kv_grouped_mma(const CausalAttentionOperands& p, Fp8KvCacheView<
         Masked != (cache.valid_columns != nullptr) || partition.capacity < 1 ||
         partition.target > CausalKvPartition::kMaxSplits || partition.target < 1 ||
         partition.key_shift < 6 || partition.key_shift > 12 ||
-        partition.capacity != partition.active(p.visible_capacity) || !partial.acc ||
+        partition.capacity != partition.bound(p.visible_capacity) || !partial.acc ||
         !partial.maximum || !partial.sum)
         throw std::invalid_argument("FP8 grouped attention: invalid schedule/partials");
     if constexpr (Input::writes_cache)
         if (!input.k || !input.v) throw std::invalid_argument("FP8 append requires K/V");
-    constexpr auto kernel =
-        fp8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries>;
-    constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
-    if constexpr (S::kDynamicArena) {
-        const cudaError_t status =
+    // Only verification rows carry a tree: masked rows of three or more columns on the
+    // grouped append route, or on the parallel route after a separate append.
+    constexpr bool TreeCapable =
+        Masked && (Input::writes_cache || ParallelQueries) && S::kTokenTile >= 3;
+    if (!TreeCapable && cache.tree_masks)
+        throw std::invalid_argument("FP8 grouped attention: this route has no tree");
+    const auto launch = [&]<bool Tree>() {
+        constexpr auto kernel =
+            fp8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, Tree>;
+        constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
+        if constexpr (S::kDynamicArena) {
+            const cudaError_t status =
             ::ninfer::set_kernel_max_dynamic_shared_memory<kernel>(bytes);
-        CUDA_CHECK(status);
+            CUDA_CHECK(status);
+        }
+        const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
+                        partition.capacity, p.batch);
+        kernel<<<grid, S::kThreads, bytes, stream>>>(
+            p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
+            cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
+            p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum,
+            cache.tree_masks);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if constexpr (TreeCapable) {
+        if (cache.tree_masks) {
+            launch.template operator()<true>();
+            return;
+        }
     }
-    const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
-                    partition.capacity, p.batch);
-    kernel<<<grid, S::kThreads, bytes, stream>>>(
-        p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
-        cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
-        p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum);
-    CUDA_CHECK(cudaGetLastError());
+    launch.template operator()<false>();
 }
 
 } // namespace ninfer::ops::detail

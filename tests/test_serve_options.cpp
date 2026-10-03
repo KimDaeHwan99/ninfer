@@ -1,6 +1,8 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -87,8 +89,6 @@ int main() {
               "ngram and neural widths were not kept separate");
     for (const auto& tail : std::vector<std::vector<std::string>>{{"--ngram-draft-tokens", "64"},
                                                                   {"--ngram-min-match", "3"},
-                                                                  {"--max-concurrency", "2",
-                                                                   "--ngram-draft-tokens", "63"},
                                                                   {"--spec", "none"}}) {
         std::vector<std::string> arguments{"ninfer-serve",
                                            "model.ninfer",
@@ -105,25 +105,18 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "unsupported ngram configuration admitted");
     }
-    // ngram with concurrency>1 is admitted for every backend when the width fits the batch>1
-    // graph domain: 1..63 at concurrency one, at most 15 above it, whatever the backend.
+    // ngram with concurrency>1 is admitted for every backend at every width 1..63.
     for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
-        const auto concurrent =
-            parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
-                   "--ngram-draft-tokens", "15", "--max-concurrency", "4"});
-        failures += check(concurrent.speculative.ngram_draft_tokens == 15 &&
-                              concurrent.max_concurrency == 4,
-                          "ngram with concurrency>1 was not admitted");
+        for (const std::string width : {"15", "31", "63"}) {
+            const auto concurrent =
+                parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
+                       "--ngram-draft-tokens", width, "--max-concurrency", "4"});
+            failures += check(concurrent.speculative.ngram_draft_tokens ==
+                                      static_cast<std::uint32_t>(std::stoul(width)) &&
+                                  concurrent.max_concurrency == 4,
+                              "ngram with concurrency>1 was not admitted");
+        }
     }
-    const auto mtp_wide_concurrent = [&] {
-        bool rejected = false;
-        try {
-            (void)parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
-                         "--ngram-draft-tokens", "63", "--max-concurrency", "4"});
-        } catch (const std::invalid_argument&) { rejected = true; }
-        return rejected;
-    }();
-    failures += check(mtp_wide_concurrent, "wide MTP ngram with concurrency>1 was admitted");
 
     const auto mtp_ngram = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                   "3", "--ngram-draft-tokens", "15"});
@@ -162,14 +155,6 @@ int main() {
             } catch (const std::invalid_argument&) { rejected = true; }
             failures += check(rejected, "unsupported neural/ngram pair admitted");
         }
-        // The GDN conv-record workspace caps a multi-request verify at 16 columns, so any backend
-        // rejects an ngram width above 15 once concurrency exceeds one.
-        bool wide_rejected = false;
-        try {
-            (void)parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
-                         "--ngram-draft-tokens", "63", "--max-concurrency", "2"});
-        } catch (const std::invalid_argument&) { wide_rejected = true; }
-        failures += check(wide_rejected, "wide ngram with concurrency>1 admitted");
         const auto wide_single =
             parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
                    "--ngram-draft-tokens", "63", "--max-concurrency", "1"});
@@ -180,6 +165,51 @@ int main() {
                    "--ngram-draft-tokens", "0", "--max-concurrency", "8"});
         failures += check(disabled.speculative.ngram_draft_tokens == 0,
                           "disabled ngram changed multi-slot configuration");
+    }
+    // DFlash2 tree table: entry c applies to rounds of c rows and the last entry to larger batches.
+    using TreeTable  = std::array<std::uint32_t, ninfer::kMaximumConcurrency>;
+    const auto table = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens",
+                              "7", "--draft-tree-nodes", "20,12,10,0", "--max-concurrency", "8"});
+    failures += check(table.speculative.draft_tree_nodes == TreeTable{20, 12, 10, 0, 0, 0, 0, 0} &&
+                          table.speculative.draft_tree_paths == 8,
+                      "tree table or default path cap changed");
+    const auto single =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--draft-tree-nodes", "9", "--draft-tree-paths", "2"});
+    failures += check(single.speculative.draft_tree_nodes == TreeTable{9, 9, 9, 9, 9, 9, 9, 9} &&
+                          single.speculative.draft_tree_paths == 2,
+                      "a single tree entry did not apply to every batch size");
+    const auto tree_auto = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                  "--draft-tokens", "7", "--draft-tree-nodes", "auto"});
+    failures += check(tree_auto.speculative.draft_tree_auto &&
+                          tree_auto.speculative.draft_tree_nodes == TreeTable{},
+                      "auto did not select automatic tree widths");
+    const auto replaced =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--draft-tree-nodes", "auto", "--draft-tree-nodes", "12"});
+    failures += check(!replaced.speculative.draft_tree_auto &&
+                          replaced.speculative.draft_tree_nodes ==
+                              TreeTable{12, 12, 12, 12, 12, 12, 12, 12},
+                      "a later tree table did not replace auto");
+    for (const auto& tail : std::vector<std::vector<std::string>>{
+             {"--draft-tree-nodes", "8"}, // below draft tokens + 2
+             {"--draft-tree-nodes", "33"},
+             {"--draft-tree-nodes", "12,,0"},
+             {"--draft-tree-nodes", "12,12,12,12,12,12,12,12,12"},
+             {"--draft-tree-nodes", "12x"},
+             {"--draft-tree-nodes", "12", "--draft-tree-paths", "1"},
+             {"--draft-tree-nodes", "12", "--draft-tree-paths", "9"},
+             {"--draft-tree-nodes", "12", "--spec", "dflash"},
+             {"--draft-tree-nodes", "auto", "--spec", "dflash"},
+             {"--draft-tree-nodes", "Auto"}}) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer",   "--spec",
+                                           "dflash2",      "--draft-tokens", "7"};
+        arguments.insert(arguments.end(), tail.begin(), tail.end());
+        bool rejected = false;
+        try {
+            (void)parse(arguments);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "unsupported tree table admitted");
     }
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.speculative.ngram_draft_tokens == 0,
@@ -234,9 +264,17 @@ int main() {
     const ServeOptions k8v4 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "k8v4"});
     failures += check(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value,
                       "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "vq2"}).kv_cache ==
+                          ninfer::KvCacheStorage::Vq2,
+                      "--kv-dtype vq2 did not select 2-bit vector KV");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "k4v2"}).kv_cache ==
+                          ninfer::KvCacheStorage::Q4KeyVq2Value,
+                      "--kv-dtype k4v2 did not select 4-bit K / 2-bit V KV");
     const std::string kv_help = serve_usage_text("ninfer-serve");
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
-                          kv_help.find("k8v4") != std::string::npos,
+                          kv_help.find("k8v4") != std::string::npos &&
+                          kv_help.find("vq2") != std::string::npos &&
+                          kv_help.find("k4v2") != std::string::npos,
                       "serve help omits a production KV storage mode");
 
     const ServeOptions model_alias =
@@ -740,6 +778,42 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--request-log-jsonl") != std::string::npos,
               "serve help omits --request-log-jsonl");
+    failures += check(
+        !logged.prefill_round_robin &&
+            parse({"ninfer-serve", "model.ninfer", "--prefill-round-robin"}).prefill_round_robin &&
+            serve_usage_text("ninfer-serve").find("--prefill-round-robin") != std::string::npos,
+        "--prefill-round-robin must be an opt-in serve option");
+    failures += check(logged.request_log_rotation.max_bytes == 0 &&
+                          logged.request_log_rotation.keep == kDefaultRequestLogKeep,
+                      "the request log must not rotate unless --request-log-max-mib is given");
+    const ServeOptions rotating =
+        parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl", "requests.jsonl",
+               "--request-log-max-mib", "256", "--request-log-keep", "0"});
+    failures += check(rotating.request_log_rotation.max_bytes == (256ULL << 20) &&
+                          rotating.request_log_rotation.keep == 0,
+                      "--request-log-max-mib/--request-log-keep did not set the rotation");
+    for (const std::vector<std::string>& arguments : std::vector<std::vector<std::string>>{
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "0"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "-1"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "17592186044416"},
+             {"--request-log-max-mib", "64"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-keep", "2"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "64",
+              "--request-log-keep", "1001"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "64",
+              "--request-log-keep", "two"}}) {
+        std::vector<std::string> command{"ninfer-serve", "model.ninfer"};
+        command.insert(command.end(), arguments.begin(), arguments.end());
+        bool rejected = false;
+        try {
+            (void)parse(command);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an invalid request-log rotation option was accepted");
+    }
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--request-log-max-mib") != std::string::npos &&
+                  serve_usage_text("ninfer-serve").find("--request-log-keep") != std::string::npos,
+              "serve help omits the request-log rotation options");
     bool secret_present    = false;
     bool redaction_present = false;
     for (const std::string& argument : logged.startup_argv) {
@@ -765,6 +839,32 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--use-original-nvfp4-prefill-kernel") !=
                           std::string::npos,
                       "serve help omits --use-original-nvfp4-prefill-kernel");
+    failures += check(archive.prefill_8bit_pv == ninfer::PrefillPv8::Auto,
+                      "8-bit prefill P*V must default to auto");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--no-prefill-8bit-pv"}).prefill_8bit_pv ==
+                          ninfer::PrefillPv8::Off,
+                      "--no-prefill-8bit-pv was not preserved");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-8bit-pv"}).prefill_8bit_pv ==
+                          ninfer::PrefillPv8::On,
+                      "--prefill-8bit-pv was not preserved");
+    failures += check(serve_usage_text("ninfer-serve").find("--no-prefill-8bit-pv") !=
+                              std::string::npos &&
+                          serve_usage_text("ninfer-serve").find("--prefill-8bit-pv") !=
+                              std::string::npos,
+                      "serve help omits the 8-bit prefill P*V flags");
+    failures += check(archive.prefill_split_workspace_mib == ninfer::kDefaultPrefillSplitWorkspaceMiB,
+                      "the prompt split workspace must default to its product default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-split-workspace-mib", "0"})
+                              .prefill_split_workspace_mib == 0,
+                      "--prefill-split-workspace-mib 0 was not preserved");
+    failures += check(serve_usage_text("ninfer-serve").find("--prefill-split-workspace-mib") !=
+                          std::string::npos,
+                      "serve help omits --prefill-split-workspace-mib");
+    bool split_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefill-split-workspace-mib", "16385"});
+    } catch (const std::invalid_argument&) { split_rejected = true; }
+    failures += check(split_rejected, "a prompt split workspace above 16384 MiB was accepted");
     bool fast_flag_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--fast-prefill-kernel"});

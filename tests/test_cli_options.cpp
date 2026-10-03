@@ -172,9 +172,16 @@ int run_tests() {
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "k8v4"});
     failures += check(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value,
                       "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "vq2"})
+                              .kv_cache == ninfer::KvCacheStorage::Vq2,
+                      "--kv-dtype vq2 did not select 2-bit vector KV");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "k4v2"})
+                              .kv_cache == ninfer::KvCacheStorage::Q4KeyVq2Value,
+                      "--kv-dtype k4v2 did not select 4-bit K / 2-bit V KV");
     const std::string help = ninfer::cli::usage_text("ninfer-cli");
     failures +=
-        check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos,
+        check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos &&
+                  help.find("vq2") != std::string::npos && help.find("k4v2") != std::string::npos,
               "CLI help omits a production KV storage mode");
     failures += check(!k8v4.original_int8_prefill_kernel,
                       "the CLI original INT8 prefill kernel must default off");
@@ -192,6 +199,33 @@ int run_tests() {
                       "--use-original-nvfp4-prefill-kernel was not parsed");
     failures += check(help.find("--use-original-nvfp4-prefill-kernel") != std::string::npos,
                       "CLI help omits --use-original-nvfp4-prefill-kernel");
+    failures += check(k8v4.prefill_8bit_pv == ninfer::PrefillPv8::Auto,
+                      "the CLI 8-bit prefill P*V must default to auto");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype",
+                             "k8v4", "--no-prefill-8bit-pv"})
+                          .prefill_8bit_pv == ninfer::PrefillPv8::Off,
+                      "--no-prefill-8bit-pv was not parsed");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype",
+                             "int8", "--prefill-8bit-pv"})
+                          .prefill_8bit_pv == ninfer::PrefillPv8::On,
+                      "--prefill-8bit-pv was not parsed");
+    failures += check(help.find("--no-prefill-8bit-pv") != std::string::npos &&
+                          help.find("--prefill-8bit-pv") != std::string::npos,
+                      "CLI help omits the 8-bit prefill P*V flags");
+    failures +=
+        check(k8v4.prefill_split_workspace_mib == ninfer::kDefaultPrefillSplitWorkspaceMiB,
+              "the CLI prompt split workspace must default to its product default");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--prefill-split-workspace-mib", "384"})
+                              .prefill_split_workspace_mib == 384,
+                      "--prefill-split-workspace-mib was not parsed");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--prefill-split-workspace-mib", "16385"});
+                      }),
+                      "a CLI prompt split workspace above 16384 MiB was accepted");
+    failures += check(help.find("--prefill-split-workspace-mib") != std::string::npos,
+                      "CLI help omits --prefill-split-workspace-mib");
     const ninfer::cli::Options logging =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,

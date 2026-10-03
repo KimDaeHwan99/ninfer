@@ -26,7 +26,8 @@ set(ninfer_op_tests
   scatter_bf16_batch
   target_logprobs
   position
-  tensor_parallel)
+  tensor_parallel
+  top_logprobs)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
@@ -59,6 +60,14 @@ ninfer_add_op_test(ninfer_sliding_window_attention_test
 
 ninfer_add_op_test(ninfer_kv_cache_append_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_append.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_kv_cache_vq_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_vq.cu"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_vq_attention_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vq_attention.cu"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_rmsnorm_rope_test
@@ -99,6 +108,11 @@ ninfer_add_op_test(ninfer_mtp_round_test
 ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round.cpp"
   LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_speculative_tree_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_tree.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_speculative_tree_test PROPERTIES TIMEOUT 600)
 
 ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"

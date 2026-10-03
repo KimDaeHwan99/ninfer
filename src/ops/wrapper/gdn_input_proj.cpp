@@ -72,7 +72,8 @@ struct ConvGeometry {
 
 ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
     constexpr std::int32_t kMaximumBatch = 8;
-    constexpr std::int32_t kMaximumWidth = 16;
+    // A multi-request call admits the verification widths; one request also admits prefill.
+    constexpr std::int32_t kMaximumWidth = 64;
     const std::int32_t width             = x.ne[1];
     const std::int32_t batch             = x.ne[2];
     if (width <= 0 || batch <= 0 || batch > kMaximumBatch || (batch > 1 && width > kMaximumWidth)) {
@@ -88,8 +89,7 @@ ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
     constexpr std::int32_t kMaximumWidth = 64;
     const std::int32_t width             = x.ne[1];
     const std::int32_t batch             = x.ne[2];
-    if (width < kMinimumWidth || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch ||
-        (batch > 1 && width > 16)) {
+    if (width < kMinimumWidth || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch) {
         throw std::invalid_argument("gdn_input_proj_conv_record: unsupported B/T domain");
     }
     require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_record", "x");
@@ -239,7 +239,7 @@ void require_parent_nonoverlap(const Weight& weight,
 void require_snapshot_capacity_domain(std::int32_t batch_size, std::int32_t min_width,
                                       std::int32_t max_width) {
     constexpr std::int32_t kMaximumBatch = 8;
-    constexpr std::int32_t kMaximumWidth = 16;
+    constexpr std::int32_t kMaximumWidth = 64;
     if (batch_size <= 0 || batch_size > kMaximumBatch || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumWidth)) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: invalid B/W domain");
@@ -252,7 +252,7 @@ void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_wi
     constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 64;
     if (batch_size <= 0 || batch_size > kMaximumBatch || min_width < kMinimumWidth ||
-        max_width < min_width || max_width > kMaximumWidth || (batch_size > 1 && max_width > 16)) {
+        max_width < min_width || max_width > kMaximumWidth) {
         throw std::invalid_argument("gdn_input_proj_conv_record workspace: invalid B/T domain");
     }
 }
@@ -608,8 +608,15 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    const Tensor& initial_state_slots, Tensor& conv_record,
                                    Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                    LinearPolicy policy, WorkspaceArena& workspace,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const Tensor* tree_rows = nullptr) {
     validate_policy(policy);
+    if (tree_rows != nullptr) {
+        if (x.ne[1] < 2 || x.ne[1] > kSpeculativeTreeMaxNodes) {
+            throw std::invalid_argument(
+                "gdn_input_proj_conv_record: a tree's width must be in [2,32]");
+        }
+        validate_speculative_tree_rows(*tree_rows, x.ne[2], "gdn_input_proj_conv_record");
+    }
 
     if (weight.qtype == QType::NVFP4 && weight.n != kGdnShardRows) {
         constexpr std::int32_t kHidden     = 5120;
@@ -640,6 +647,14 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                                   conv_record, query, key, value, z, workspace);
 
+        if (tree_rows != nullptr) {
+            auto scope = workspace.scope();
+            gdn_input_proj(x, weight, conv_record, z, policy, workspace, stream);
+            detail::gdn_projected_conv_record_tree_launch(conv_record, conv_weight, conv_states,
+                                                          valid_columns, initial_state_slots,
+                                                          *tree_rows, query, key, value, stream);
+            return;
+        }
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
         if (plan.schedule == detail::Nvfp4GdnConvScheduleId::Materialized && geometry.batch > 1) {
@@ -733,12 +748,16 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
             &x,           &conv_weight, &conv_states, &valid_columns, &initial_state_slots,
             &conv_record, &query,       &key,         &value,         &z};
         require_parent_nonoverlap(weight, tensors, workspace, "fp8 gdn_input_proj_conv_record");
-        detail::fp8_gdn_record_dispatch(x, weight, conv_weight, conv_states, valid_columns,
-                                        initial_state_slots, conv_record, query, key, value, z,
-                                        policy, workspace, stream);
+        detail::fp8_gdn_record_dispatch(tree_rows, x, weight, conv_weight, conv_states,
+                                        valid_columns, initial_state_slots, conv_record, query, key,
+                                        value, z, policy, workspace, stream);
         return;
     }
 
+    if (tree_rows != nullptr) {
+        throw std::invalid_argument(
+            "gdn_input_proj_conv_record: a verification tree requires an FP8 or NVFP4 parent");
+    }
     constexpr std::int32_t kHidden    = 2048;
     constexpr std::int32_t kQueryRows = 2048;
     constexpr std::int32_t kKeyRows   = 2048;
@@ -1118,6 +1137,17 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, conv_record, query, key,
                                   value, z, policy, workspace, stream);
+}
+
+void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
+                                const Tensor& conv_weight, const Tensor& conv_states,
+                                const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                const Tensor& tree_rows, Tensor& conv_record, Tensor& query,
+                                Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
+                                WorkspaceArena& workspace, cudaStream_t stream) {
+    dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
+                                  valid_columns, initial_state_slots, conv_record, query, key,
+                                  value, z, policy, workspace, stream, &tree_rows);
 }
 
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

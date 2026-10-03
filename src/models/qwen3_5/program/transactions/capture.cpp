@@ -224,7 +224,7 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
     if (assessment.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot) {
         assessment.transfer_requirements.push_back(state_transfer_requirement(
             state_images->host_layout(), runtime::ContextTransferDirection::DeviceToHost));
-    } else if (is_masked_draft_backend(speculative_backend)) {
+    } else if (state_images->has_fork_local()) {
         assessment.transfer_requirements.push_back(state_transfer_requirement(
             state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice, true));
     }
@@ -251,7 +251,7 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         if (assessment.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot) {
             recovery.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::HostToDevice));
-        } else if (is_masked_draft_backend(speculative_backend)) {
+        } else if (state_images->has_fork_local()) {
             recovery.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice,
                 true));
@@ -718,12 +718,12 @@ void ProgramImpl::enqueue_active_capture_transfers(ActiveCaptureTransaction& tra
         stop_context_transfer_timer(runtime::ContextResourceClass::State);
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::State);
-    } else if (is_masked_draft_backend(speculative_backend)) {
+    } else if (state_images->has_fork_local()) {
         const StateImageSelectors state_fork =
             state_store->selectors(transaction.source_state, transaction.destination_state);
         start_context_transfer_timer(runtime::ContextResourceClass::State);
-        state_images->copy_dflash_local(state_fork.source, state_fork.destination,
-                                        device.transfer_stream);
+        state_images->copy_fork_local(state_fork.source, state_fork.destination,
+                                      device.transfer_stream);
         stop_context_transfer_timer(runtime::ContextResourceClass::State);
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::State);

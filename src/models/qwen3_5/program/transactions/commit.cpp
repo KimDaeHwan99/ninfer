@@ -49,6 +49,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
     out.summary                 = step.summary;
     out.processed_prompt_tokens = step.processed_prompt_tokens;
     out.complete                = step.complete;
+    out.completes_service_unit  = step.completes_service_unit;
     out.timing                  = step.timing;
     if (step.complete) {
         const std::array<std::uint32_t, 1> lanes{lane};
@@ -143,6 +144,11 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         return StartResult{.sequence = handle};
     } catch (...) {
         if (destination && *destination < max_concurrency) {
+            // Startup may have queued uploads, a restore or a fork before a later check failed.
+            // Complete them before the lane's buffers, pages and execution row return to the pools.
+            try {
+                device.synchronize();
+            } catch (...) {}
             const std::uint32_t lane = *destination;
             if (active_continuations[lane] < continuation_capacity) {
                 clear_lane_best_effort(active_sequence(lane), requests[lane]);
@@ -344,9 +350,9 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 const std::uint32_t count           = std::min(prefill_chunk, end - cursor);
                 const StateImageSelectors selectors = state_selectors(sequence);
                 execution::PrefillContext schedule_state{
-                    {device, tensor_parallel, parameters, work, state_images->linear(),
+                    {device, tensor_parallel, parameters, work, *state_images,
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head, fast_prefill_kernel},
+                     proposal_head, prompt_attention},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,
@@ -768,6 +774,10 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
     }
     SequenceState& state = active_sequence(lane);
     const std::uint32_t continuation_index = active_continuations[lane];
+    // A non-final prefill step returns without waiting, so a cancellation can arrive with the
+    // lane's chunk, uploads or initialization still queued. Settle them before the lane's buffers,
+    // pages and execution row return to the pools or move into the prefix cache.
+    device.synchronize();
     if (hybrid_) {
         // The committed state is publishable as an endpoint when no model unit is in flight.
         out.timings     = request.timings;

@@ -42,6 +42,10 @@ std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }
 
+bool SequencePlan::draft_tree_auto() const noexcept {
+    return impl_ != nullptr && impl_->tree_widths.automatic_mode();
+}
+
 const ContextCacheOptions& SequencePlan::context_cache_options() const noexcept {
     static const ContextCacheOptions empty;
     return impl_ != nullptr ? impl_->context_cache : empty;
@@ -397,14 +401,16 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
     return impl_->plan_request(PreparedPromptAccess::view(prompt), options);
 }
 
-std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
+ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                  const ScoreOptions& options) {
     PreparedPromptData data = PreparedPromptAccess::take(std::move(prompt));
-    if (!peer_) { return impl_->causal_score(std::move(data), first_target); }
+    if (!peer_) { return impl_->causal_score(std::move(data), first_target, options); }
     PreparedPromptData peer_data = data.tensor_parallel_peer_copy();
-    std::vector<float> local, peer;
-    on_ranks([&] { peer = peer_->causal_score(std::move(peer_data), first_target); },
-             [&] { local = impl_->causal_score(std::move(data), first_target); });
-    require_same(local == peer, "causal scores");
+    ScoreResult local, peer;
+    on_ranks([&] { peer = peer_->causal_score(std::move(peer_data), first_target, options); },
+             [&] { local = impl_->causal_score(std::move(data), first_target, options); });
+    require_same(local.logprobs == peer.logprobs && local.top_ids == peer.top_ids,
+                 "causal scores");
     return local;
 }
 
@@ -542,16 +548,17 @@ bool Program::wait_context_transfer() noexcept {
 }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
-                                         runtime::ExecutionTiming* failed_timing) {
-    if (!peer_) { return impl_->advance_prefill(sequence, failed_timing); }
+                                         runtime::ExecutionTiming* failed_timing,
+                                         runtime::PrefillStepWidth width) {
+    if (!peer_) { return impl_->advance_prefill(sequence, failed_timing, width); }
     const SequenceHandle peer_handle = peer_sequence(sequence);
     runtime::ExecutionTiming peer_failed;
     std::optional<PrefillProgress> local, peer;
     on_ranks([&] {
-                 peer.emplace(peer_->advance_prefill(peer_handle,
-                                                     failed_timing ? &peer_failed : nullptr));
+                 peer.emplace(peer_->advance_prefill(
+                     peer_handle, failed_timing ? &peer_failed : nullptr, width));
              },
-             [&] { local.emplace(impl_->advance_prefill(sequence, failed_timing)); });
+             [&] { local.emplace(impl_->advance_prefill(sequence, failed_timing, width)); });
     require_same(local->complete == peer->complete &&
                      local->processed_prompt_tokens == peer->processed_prompt_tokens &&
                      local->pending.has_value() == peer->pending.has_value() &&

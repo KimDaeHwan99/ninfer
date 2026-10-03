@@ -89,8 +89,13 @@ may preserve an already encoded source or quantize floating-point values.
 The built-in `grouped_absmax` method implements the reference encoder in Section 7 for all four
 grouped integer formats. `fp8_row_maxabs` rounds source values to BF16 and quantizes each row to
 E4M3FN codes with a BF16 multiplier. `import_encoded` preserves compatible FP8 or NVFP4 codes,
-scales, and, for NVFP4, the matrix weight divisor. NInfer currently provides no built-in
-floating-point-to-NVFP4 quantizer.
+scales, and, for NVFP4, the matrix weight divisor. `nvfp4_absmax` and `nvfp4_mse` quantize
+floating-point weights to `nvfp4` with one divisor per parent. `nvfp4_absmax` maps each 16-value
+group's largest magnitude to the largest E2M1 code (6), with a divisor that puts the parent's
+largest group at the largest E4M3FN scale. `nvfp4_mse` gives each group the E4M3FN scale, among all
+126 positive finite ones, with the least squared reconstruction error (ties keep the smaller
+scale), with a divisor that puts the parent's largest magnitude at 4 on the largest scale so its
+largest group may still take a larger one. Codes round to nearest with ties to even.
 
 A recipe can supply a Python callable as its method. Different methods can produce different
 valid codes and scales for the same format; they share the format's decoding contract. Method
