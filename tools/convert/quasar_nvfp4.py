@@ -30,7 +30,8 @@ from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorSpec
 from tools.artifact.tensor_output import TensorOutput
 from tools.artifact.writer import ArtifactWriter, DEFAULT_MAX_FILE_BYTES
-from tools.convert.methods import cast_direct, grouped_absmax, import_encoded
+from tools.convert.methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
+from tools.convert.official_recipes import FP8, _optional
 from tools.convert.pipeline import _json_default
 from tools.convert.proposal import DEFAULT_RANKING, add_official_proposal
 from tools.convert.qwen3_5 import build_model
@@ -110,6 +111,28 @@ def apply_quasar_recipe(model, recipe, sources, q8_scope="full") -> None:
             # (unless a name above is Q8-assigned).
             recipe.assign(name, source=model.source(name, quantized))
         # dflash2 is grafted after preparation, so it is not assigned here.
+
+
+def apply_official_style_recipe(model, recipe, sources) -> None:
+    """The recipe of Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer (its quasar_recipe.py): every QUASAR
+    NVFP4 projection imported as encoded, GDN a/b and other non-projections as stored, the BF16
+    lm_head and the embedding as FP8 rows (the official method), Vision and MTP with the official
+    _optional choices (Q4-Q8). Sized for two 16 GB boards: no BF16 embedding or head is kept."""
+    quantized = sources["quantized"]
+    _optional(model, recipe)
+    recipe.assign("text/token_embedding", format=FP8, method=fp8_row_maxabs)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/") or name == "text/token_embedding":
+            continue
+        if not parameter.projection or name.endswith(_DEQUANTISE_TO_BF16):
+            recipe.assign(name, source=model.source(name, quantized))
+        elif name == "text/output_head":
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs,
+                          source=model.source(name, quantized), activation_policy="AllowA8")
+        else:
+            recipe.assign(name, format="nvfp4", method=import_encoded,
+                          source=model.source(name, quantized, "nvfp4"),
+                          activation_policy="AllowA4")
 
 
 def _collect_dflash2(official: Artifact) -> dict:
@@ -207,6 +230,16 @@ def main() -> None:
             "(default: full)"
         ),
     )
+    parser.add_argument(
+        "--recipe",
+        choices=("q8-heads", "official"),
+        default="q8-heads",
+        help=(
+            "text/MTP/vision recipe: 'q8-heads' keeps BF16 embedding/vision and Q8 head/MTP "
+            "(--q8-scope); 'official' is the Feyd89 all-NVFP4 artifact's recipe (FP8 embedding "
+            "and head, official Vision/MTP choices)"
+        ),
+    )
     parser.add_argument("--name", default="qwen3.8-27b-quasar")
     parser.add_argument(
         "--proposal",
@@ -231,7 +264,10 @@ def main() -> None:
     base = SafetensorsSource(args.model)
     model = build_model(base, components=("text", "vision", "mtp"))
     recipe = Recipe(model)
-    apply_quasar_recipe(model, recipe, {"quantized": base}, args.q8_scope)
+    if args.recipe == "official":
+        apply_official_style_recipe(model, recipe, {"quantized": base})
+    else:
+        apply_quasar_recipe(model, recipe, {"quantized": base}, args.q8_scope)
     if args.proposal:
         add_official_proposal(
             recipe, ranking=args.ranking, rows=args.proposal_rows)
@@ -266,7 +302,8 @@ def main() -> None:
         "model": "QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 (compressed-tensors nvfp4-pack-quantized)",
         "dflash2_source": str(args.dflash2),
         "dflash2_artifact_id": dflash2_artifact_id,
-        "q8_scope": args.q8_scope,
+        "recipe": args.recipe,
+        "q8_scope": args.q8_scope if args.recipe == "q8-heads" else None,
         "method": (
             "import_encoded (nvfp4, bit-exact) for quantised Linear projections; "
             "grouped_absmax q8_g32_fp16 for MTP head (scope=%s) + shared lm_head; "
