@@ -86,6 +86,12 @@ void validate_options(const EngineOptions& options) {
             !options.context_cache.hybrid.persistent_file.empty()) {
             throw std::invalid_argument("--prefix-cache-file is not supported at --tp 2");
         }
+        // Prompt chunks above 8192 columns deadlock the two ranks' sliced copy-channel all-reduce
+        // (both wait for the peer's first payload piece; RTX 5060 Ti, 16384 columns). 8192 is the
+        // widest chunk qualified at --tp 2.
+        if (options.prefill_chunk > 8192) {
+            throw std::invalid_argument("--prefill-chunk above 8192 is not supported at --tp 2");
+        }
     } else if (!options.devices.empty() &&
                (options.devices.size() != 1 || options.devices[0] != options.device)) {
         throw std::invalid_argument("Engine devices must name the primary device at width 1");

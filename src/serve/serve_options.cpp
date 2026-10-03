@@ -269,7 +269,7 @@ std::string serve_usage_text(const char* argv0) {
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
            "  server flags and request fields override individual values.\n"
            "  --greedy forces temperature 0 (exact argmax).\n"
-           "  --tp 2 does not support --prefix-cache-file.\n";
+           "  --tp 2 does not support --prefix-cache-file or --prefill-chunk above 8192.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
