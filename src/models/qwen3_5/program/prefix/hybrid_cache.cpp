@@ -451,20 +451,39 @@ void HybridPrefixCache::publish_write(PendingWrite& write) {
 void HybridPrefixCache::poll() {
     // Every write shares the transfer stream and every restore the restore stream, so each list
     // completes in submission order.
-    while (!pending_.empty()) {
+    while (!pending_.empty() && (!poll_limit_ || retired_writes_ < poll_limit_->writes)) {
         const cudaError_t status = cudaEventQuery(pending_.front().done);
         if (status == cudaErrorNotReady) { break; }
         CUDA_CHECK(status);
         publish_write(pending_.front());
         pending_.pop_front();
+        ++retired_writes_;
     }
-    while (!landing_.empty()) {
+    while (!landing_.empty() && (!poll_limit_ || retired_landings_ < poll_limit_->landings)) {
         const cudaError_t status = cudaEventQuery(landing_.front().layers.back());
         if (status == cudaErrorNotReady) { break; }
         CUDA_CHECK(status);
         finish_landing(landing_.front());
         landing_.pop_front();
+        ++retired_landings_;
     }
+}
+
+HybridPrefixCache::PollFrontier HybridPrefixCache::completed_frontier() const {
+    PollFrontier out{retired_writes_, retired_landings_};
+    for (const PendingWrite& write : pending_) {
+        const cudaError_t status = cudaEventQuery(write.done);
+        if (status == cudaErrorNotReady) { break; }
+        CUDA_CHECK(status);
+        ++out.writes;
+    }
+    for (const RestoreBatch& batch : landing_) {
+        const cudaError_t status = cudaEventQuery(batch.layers.back());
+        if (status == cudaErrorNotReady) { break; }
+        CUDA_CHECK(status);
+        ++out.landings;
+    }
+    return out;
 }
 
 void HybridPrefixCache::drain() {
@@ -472,11 +491,13 @@ void HybridPrefixCache::drain() {
         CUDA_CHECK(cudaEventSynchronize(pending_.front().done));
         publish_write(pending_.front());
         pending_.pop_front();
+        ++retired_writes_;
     }
     while (!landing_.empty()) {
         CUDA_CHECK(cudaEventSynchronize(landing_.front().layers.back()));
         finish_landing(landing_.front());
         landing_.pop_front();
+        ++retired_landings_;
     }
 }
 
@@ -650,11 +671,20 @@ bool HybridPrefixCache::prefetch_landing() const noexcept {
 void HybridPrefixCache::settle_prefetch() {
     // One restore stream completes batches in submission order: the last prefetch batch's final
     // event covers every batch submitted before it.
-    for (auto batch = landing_.rbegin(); batch != landing_.rend(); ++batch) {
-        if (batch->prefetch) {
-            CUDA_CHECK(cudaEventSynchronize(batch->layers.back()));
+    std::size_t settled = 0;
+    for (std::size_t index = landing_.size(); index-- > 0;) {
+        if (landing_[index].prefetch) {
+            CUDA_CHECK(cudaEventSynchronize(landing_[index].layers.back()));
+            settled = index + 1;
             break;
         }
+    }
+    // The batches through the last prefetch have landed on every rank: publish them whatever the
+    // poll limit, so the set is the same everywhere, then publish the rest as poll() allows.
+    for (; settled > 0; --settled) {
+        finish_landing(landing_.front());
+        landing_.pop_front();
+        ++retired_landings_;
     }
     poll();
 }
@@ -733,9 +763,11 @@ void HybridPrefixCache::clear() noexcept {
             spare_events_.push_back(write.done);
         }
     }
+    retired_writes_ += pending_.size();
     pending_.clear();
     // The index is rebuilt below, so landing batches only return their events.
     for (RestoreBatch& batch : landing_) { recycle_events(batch); }
+    retired_landings_ += landing_.size();
     landing_.clear();
     reset_restore();
     for (std::optional<HybridBlockPages>& pages : blocks_) {

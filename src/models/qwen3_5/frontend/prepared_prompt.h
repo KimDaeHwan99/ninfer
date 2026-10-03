@@ -178,30 +178,9 @@ struct PreparedPromptData {
 
     [[nodiscard]] bool has_media() const noexcept { return !vision_items.empty(); }
 
-    // The tensor-parallel peer rank's copy. The peer never drafts ngram copies (the split rejects
-    // ngram drafting), so the live ngram index, the only uncopyable member, stays with the primary.
-    [[nodiscard]] PreparedPromptData tensor_parallel_peer_copy() const {
-        PreparedPromptData out;
-        out.ngram_sources         = ngram_sources;
-        out.ngram_boundaries      = ngram_boundaries;
-        out.ngram_archive_sources = ngram_archive_sources;
-        out.ngram_snapshot        = ngram_snapshot;
-        out.block_hashes          = block_hashes;
-        out.block_extras          = block_extras;
-        out.token_ids             = token_ids;
-        out.token_types           = token_types;
-        out.positions             = positions;
-        out.rope_delta            = rope_delta;
-        out.media_payloads        = media_payloads;
-        out.vision_items          = vision_items;
-        out.identity              = identity;
-        out.context_cache         = context_cache;
-        out.tap_hints             = tap_hints;
-        out.tool_call_output      = tool_call_output;
-        out.starts_in_reasoning   = starts_in_reasoning;
-        out.prepare               = prepare;
-        return out;
-    }
+    // The tensor-parallel peer rank's copy, the live ngram index included: both ranks draft the
+    // same copies from the same committed history (frontend.cpp).
+    [[nodiscard]] PreparedPromptData tensor_parallel_peer_copy() const;
 
     // Payload slots remain indexed one-to-one with vision_items for the lifetime of the prompt.
     // Releasing host storage must not destroy that structural identity while a Vision prefill

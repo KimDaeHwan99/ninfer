@@ -681,6 +681,14 @@ public:
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
     [[nodiscard]] bool hybrid_prefix_cache() const noexcept { return hybrid_ != nullptr; }
+    // Tensor-parallel determinism of the hybrid cache's transfer publication (HybridPrefixCache::
+    // completed_frontier / set_poll_limit); the Program sets both ranks to the smaller frontier.
+    [[nodiscard]] HybridPrefixCache::PollFrontier hybrid_completed_frontier() const {
+        return hybrid_->completed_frontier();
+    }
+    void set_hybrid_poll_limit(HybridPrefixCache::PollFrontier limit) noexcept {
+        hybrid_->set_poll_limit(limit);
+    }
 
     [[nodiscard]] HybridAdmissionQuote hybrid_quote(const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base,

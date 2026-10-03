@@ -334,7 +334,20 @@ void Program::on_ranks(const std::function<void()>& peer, const std::function<vo
         local();
         return;
     }
+    synchronize_hybrid_poll();
     executor_->run(peer, local);
+}
+
+void Program::synchronize_hybrid_poll() {
+    // Both ranks submit the same Host writes and restores in the same order; publishing only what
+    // has completed on both keeps their prefix indexes identical without waiting for either.
+    if (!impl_->hybrid_prefix_cache()) { return; }
+    const auto local = impl_->hybrid_completed_frontier();
+    const auto peer  = peer_->hybrid_completed_frontier();
+    const detail::HybridPrefixCache::PollFrontier limit{std::min(local.writes, peer.writes),
+                                                        std::min(local.landings, peer.landings)};
+    impl_->set_hybrid_poll_limit(limit);
+    peer_->set_hybrid_poll_limit(limit);
 }
 
 void Program::on_ranks_noexcept(const std::function<void()>& peer,
@@ -855,7 +868,23 @@ bool Program::hybrid_prefix_cache() const noexcept { return impl_->hybrid_prefix
 HybridAdmissionQuote Program::hybrid_quote(const PreparedPrompt& prompt,
                                            const RequestBasePlan& base,
                                            runtime::LaneId destination) {
-    return impl_->hybrid_quote(PreparedPromptAccess::view(prompt), base, destination);
+    if (!peer_) { return impl_->hybrid_quote(PreparedPromptAccess::view(prompt), base, destination); }
+    // Quoting publishes completed transfers (poll), so both ranks quote; their identical prefix
+    // indexes must give the same answer. The base plan is rank-independent data.
+    HybridAdmissionQuote local, peer;
+    on_ranks(
+        [&] { peer = peer_->hybrid_quote(PreparedPromptAccess::view(prompt), base, destination); },
+        [&] { local = impl_->hybrid_quote(PreparedPromptAccess::view(prompt), base, destination); });
+    require_same(local.readiness == peer.readiness && (local.impl == nullptr) == (peer.impl == nullptr),
+                 "hybrid admission quote");
+    if (local.impl) {
+        require_same(local.impl->reuse_frontier == peer.impl->reuse_frontier &&
+                         local.impl->cached_prefix_tokens == peer.impl->cached_prefix_tokens &&
+                         local.impl->snapshot == peer.impl->snapshot &&
+                         local.impl->destination_epoch == peer.impl->destination_epoch,
+                     "hybrid admission quote");
+    }
+    return local;
 }
 
 runtime::ContextTransactionReserveStatus
@@ -866,19 +895,60 @@ Program::hybrid_reserve_materialization(HybridAdmissionQuote&& quote, PreparedPr
     if (!impl_->hybrid_reservable(quote, cancellation)) {
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
-    return impl_->hybrid_reserve_materialization(
-        std::move(quote), PreparedPromptAccess::view(prompt),
-        [&prompt]() { return PreparedPromptAccess::take(std::move(prompt)); }, cancellation);
+    if (!peer_) {
+        return impl_->hybrid_reserve_materialization(
+            std::move(quote), PreparedPromptAccess::view(prompt),
+            [&prompt]() { return PreparedPromptAccess::take(std::move(prompt)); }, cancellation);
+    }
+    const auto fixed = snapshot_cancellation(cancellation);
+    if (!peer_->hybrid_reservable(quote, fixed)) { ranks_diverged("hybrid admission reservability"); }
+    // Quotes are rank-independent data over identical indexes: the peer stages from a copy.
+    HybridAdmissionQuote peer_quote = quote;
+    peer_quote.impl = std::make_shared<detail::HybridQuoteImpl>(*quote.impl);
+    const PreparedPromptData& view = PreparedPromptAccess::view(prompt);
+    std::optional<PreparedPromptData> taken;
+    runtime::ContextTransactionReserveStatus local{}, peer{};
+    on_ranks(
+        [&] {
+            peer = peer_->hybrid_reserve_materialization(
+                std::move(peer_quote), view, [&view]() { return view.tensor_parallel_peer_copy(); },
+                fixed);
+        },
+        [&] {
+            local = impl_->hybrid_reserve_materialization(
+                std::move(quote), view,
+                [&]() {
+                    // The peer copies from `view` concurrently; take the prompt only after it has.
+                    return view.tensor_parallel_peer_copy();
+                },
+                fixed);
+        });
+    require_same(local == peer, "hybrid admission reservation");
+    if (local == runtime::ContextTransactionReserveStatus::Reserved) {
+        // Both ranks own copies now; the caller's prompt is consumed as on one device.
+        (void)PreparedPromptAccess::take(std::move(prompt));
+    }
+    return local;
 }
 
 std::uint32_t Program::hybrid_reclaim_device_kv(std::uint32_t main_pages,
                                                 std::uint32_t backend_pages) {
-    return impl_->hybrid_reclaim_device_kv(main_pages, backend_pages);
+    if (!peer_) { return impl_->hybrid_reclaim_device_kv(main_pages, backend_pages); }
+    std::uint32_t local = 0, peer = 0;
+    on_ranks([&] { peer = peer_->hybrid_reclaim_device_kv(main_pages, backend_pages); },
+             [&] { local = impl_->hybrid_reclaim_device_kv(main_pages, backend_pages); });
+    require_same(local == peer, "hybrid Device KV reclaim");
+    return local;
 }
 
 std::optional<std::uint32_t> Program::hybrid_prefetch(const PreparedPrompt& prompt,
                                                       const RequestBasePlan& base) {
-    return impl_->hybrid_prefetch(PreparedPromptAccess::view(prompt), base);
+    if (!peer_) { return impl_->hybrid_prefetch(PreparedPromptAccess::view(prompt), base); }
+    std::optional<std::uint32_t> local, peer;
+    on_ranks([&] { peer = peer_->hybrid_prefetch(PreparedPromptAccess::view(prompt), base); },
+             [&] { local = impl_->hybrid_prefetch(PreparedPromptAccess::view(prompt), base); });
+    require_same(local == peer, "hybrid prefetch");
+    return local;
 }
 
 std::uint32_t Program::hybrid_prefetch_room() const noexcept {
@@ -888,16 +958,22 @@ std::uint32_t Program::hybrid_prefetch_room() const noexcept {
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->hybrid_stats(); }
 
 void Program::set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost) {
-    impl_->set_hybrid_cost(cost);
+    on_ranks([&] { peer_->set_hybrid_cost(cost); }, [&] { impl_->set_hybrid_cost(cost); });
 }
 
 void Program::set_hybrid_coalesce_wait_limit(double seconds) {
-    impl_->set_hybrid_coalesce_wait_limit(seconds);
+    on_ranks([&] { peer_->set_hybrid_coalesce_wait_limit(seconds); },
+             [&] { impl_->set_hybrid_coalesce_wait_limit(seconds); });
 }
 
 HybridCachePersistence Program::attach_hybrid_cache_file(const std::filesystem::path& path,
                                                          std::string fingerprint,
                                                          const StartupObserver& observer) {
+    // A saved Host tier holds one rank's half of every block and snapshot; the split does not
+    // persist a pair of them yet.
+    if (peer_) {
+        throw std::invalid_argument("--prefix-cache-file is not supported at --tp 2");
+    }
     return impl_->attach_hybrid_cache_file(path, std::move(fingerprint), observer);
 }
 

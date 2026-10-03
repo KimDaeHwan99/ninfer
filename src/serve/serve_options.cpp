@@ -269,8 +269,7 @@ std::string serve_usage_text(const char* argv0) {
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
            "  server flags and request fields override individual values.\n"
            "  --greedy forces temperature 0 (exact argmax).\n"
-           "  --tp 2 uses the original prefix caching system and does not support ngram\n"
-           "  drafting.\n";
+           "  --tp 2 does not support --prefix-cache-file.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -621,17 +620,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
-    }
-    // The hybrid cache keeps per-rank state the tensor-parallel split does not mirror, so --tp 2
-    // runs the original system.
-    if (tensor_parallel == 2 && options.allow_prefix_reuse) {
-        if (hybrid_option_flag != nullptr) {
-            throw std::invalid_argument(std::string(hybrid_option_flag) +
-                                        " configures the hybrid prefix cache, which --tp 2 does "
-                                        "not support");
-        }
-        options.context_cache.mode = ContextCacheMode::Legacy;
-        original_cache_selected    = true;
     }
     if (!kv_capacity_explicit) {
         // The hybrid cache turns every Device page no active request holds into block cache, so

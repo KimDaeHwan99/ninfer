@@ -1158,6 +1158,8 @@ private:
     cleanup_ranks(detail::ProgramCleanup cleanup) noexcept;
     // Runs the peer rank's call alongside the primary's. Without a peer only `local` runs.
     void on_ranks(const std::function<void()>& peer, const std::function<void()>& local);
+    // Sets both ranks' hybrid poll limit to the transfers complete on both (on_ranks calls it).
+    void synchronize_hybrid_poll();
     void on_ranks_noexcept(const std::function<void()>& peer,
                            const std::function<void()>& local) noexcept;
     [[nodiscard]] SequenceHandle peer_sequence(const SequenceHandle& handle) const noexcept;

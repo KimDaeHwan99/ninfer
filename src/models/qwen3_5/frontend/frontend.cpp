@@ -768,6 +768,30 @@ public:
     std::uint32_t long_anchor_min_spacing_tokens = 0;
 };
 
+PreparedPromptData PreparedPromptData::tensor_parallel_peer_copy() const {
+    PreparedPromptData out;
+    out.ngram_sources         = ngram_sources;
+    out.ngram_boundaries      = ngram_boundaries;
+    out.ngram_archive_sources = ngram_archive_sources;
+    out.ngram_snapshot        = ngram_snapshot;
+    if (ngram_index) { out.ngram_index = std::make_unique<detail::NgramProposer>(*ngram_index); }
+    out.block_hashes        = block_hashes;
+    out.block_extras        = block_extras;
+    out.token_ids           = token_ids;
+    out.token_types         = token_types;
+    out.positions           = positions;
+    out.rope_delta          = rope_delta;
+    out.media_payloads      = media_payloads;
+    out.vision_items        = vision_items;
+    out.identity            = identity;
+    out.context_cache       = context_cache;
+    out.tap_hints           = tap_hints;
+    out.tool_call_output    = tool_call_output;
+    out.starts_in_reasoning = starts_in_reasoning;
+    out.prepare             = prepare;
+    return out;
+}
+
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
     if (axis < 0 || axis >= 3 || positions.size() != token_ids.size() * 3) {
         throw std::out_of_range("invalid prepared-prompt position axis");

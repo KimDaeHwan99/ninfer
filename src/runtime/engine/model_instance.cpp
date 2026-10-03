@@ -75,16 +75,10 @@ void validate_options(const EngineOptions& options) {
             options.speculative.backend != SpeculativeBackend::Mtp) {
             throw std::invalid_argument("tensor-parallel execution supports MTP speculation only");
         }
-        // Copy drafting and the hybrid prefix cache keep per-rank state the split does not mirror
-        // yet; refuse them rather than let the ranks diverge.
-        if (options.speculative.ngram_draft_tokens != 0) {
-            throw std::invalid_argument("tensor-parallel execution does not support ngram drafting");
-        }
         if (options.context_cache.enabled &&
-            options.context_cache.mode == ContextCacheMode::Hybrid) {
-            throw std::invalid_argument(
-                "tensor-parallel execution does not support the hybrid prefix cache; use the "
-                "original prefix cache (--use-original-prefix-caching)");
+            options.context_cache.mode == ContextCacheMode::Hybrid &&
+            !options.context_cache.hybrid.persistent_file.empty()) {
+            throw std::invalid_argument("--prefix-cache-file is not supported at --tp 2");
         }
     } else if (!options.devices.empty() &&
                (options.devices.size() != 1 || options.devices[0] != options.device)) {
@@ -103,11 +97,15 @@ void validate_options(const EngineOptions& options) {
 }
 
 
-// Per-rank planning options of a split. Each rank's Host KV pages are half the bytes, so half the
-// Host budget per rank keeps the token capacity and the total pinned bytes of the unsplit model.
+// Per-rank planning options of a split. Each rank's Host KV pages and state images are half the
+// bytes, so half the Host budget per rank keeps the capacity and the total pinned bytes of the
+// unsplit model.
 EngineOptions rank_options(const EngineOptions& options) {
     EngineOptions out = options;
     out.context_cache.host_kv_capacity_bytes /= options.tensor_parallel;
+    if (out.context_cache.host_cache_budget_bytes) {
+        *out.context_cache.host_cache_budget_bytes /= options.tensor_parallel;
+    }
     return out;
 }
 

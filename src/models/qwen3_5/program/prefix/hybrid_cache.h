@@ -153,8 +153,20 @@ public:
     // the copy completes. Stops early when the Host tier cannot free a slab.
     void start_block_host_writes(std::span<const runtime::prefix_cache::NodeRef> nodes,
                                  cudaStream_t producer, cudaStream_t transfer);
-    // Publishes every completed Host write. Non-blocking.
+    // Publishes every completed Host write and landed restore, up to the poll limit when one is
+    // set. Non-blocking.
     void poll();
+
+    // Retired-or-complete Host writes and landing restores, counted from the cache's start in
+    // submission order. Two tensor-parallel ranks submit the same transfers in the same order;
+    // limiting both to the smaller rank's frontier makes poll() publish the same set on each.
+    struct PollFrontier {
+        std::uint64_t writes   = 0;
+        std::uint64_t landings = 0;
+    };
+    [[nodiscard]] PollFrontier completed_frontier() const;
+    // Caps what poll() publishes; nullopt (single device) publishes whatever has completed.
+    void set_poll_limit(std::optional<PollFrontier> limit) noexcept { poll_limit_ = limit; }
 
     // Nodes and snapshots stay pinned while a Host write or a landing restore is in flight. When
     // those pins are all that stands between the pools and a request, waiting a few milliseconds
@@ -319,6 +331,10 @@ private:
     // Batches handed to their lanes whose copies may still be in flight, in submission order (one
     // restore stream).
     std::deque<RestoreBatch> landing_;
+    // Writes and landings popped from the queues since the cache started (published or cleared).
+    std::uint64_t retired_writes_   = 0;
+    std::uint64_t retired_landings_ = 0;
+    std::optional<PollFrontier> poll_limit_;
     std::uint64_t next_ticket_ = 1;
     std::vector<cudaEvent_t> spare_events_;
     PageCopies write_scratch_;
