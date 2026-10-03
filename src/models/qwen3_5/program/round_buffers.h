@@ -285,7 +285,12 @@ struct MtpDecodeState {
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
                    std::uint32_t batch_capacity, std::uint32_t draft_window);
-    [[nodiscard]] MtpDecodeState single_row_prefix(std::uint32_t k, std::uint32_t next_k) const;
+    // The frame at verify width k+1 and proposal depth next_k, both at most the allocated ones.
+    // Every width-dimensioned tensor is written and consumed within one round and every host
+    // index into ingress/egress uses the round's own width, so a dense [k+1, rows] view of the
+    // native storage is exact for any row count; the step-major proposal tensors keep their
+    // leading next_k steps.
+    [[nodiscard]] MtpDecodeState narrowed(std::uint32_t k, std::uint32_t next_k) const;
 };
 
 struct DFlashDecodeState {

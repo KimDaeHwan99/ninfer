@@ -951,13 +951,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                               graph_topology_classes(ordinary_graph_profiles(impl->capacity))) *
                           impl->max_concurrency;
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            // One MTP family captured at the frame's native width (the wider of the neural and
-            // ngram windows) with the frame's AR depth; an n-gram engine reuses it.
-            const std::uint32_t drafts   = impl->draft_window;
-            const std::uint32_t ar_depth = std::min(drafts, kMtpDecodeMaximumDrafts);
-            executables = static_cast<std::uint64_t>(graph_topology_classes(
-                              mtp_graph_profiles(impl->capacity, drafts, ar_depth))) *
-                          impl->max_concurrency;
+            // Each MTP family (mtp_graph_families) is captured at its own width for every batch
+            // size, on the one frame viewed at that width.
+            for (const MtpGraphFamily& family :
+                 mtp_graph_families(impl->neural_draft_window, impl->ngram_draft_window)) {
+                executables += static_cast<std::uint64_t>(graph_topology_classes(
+                                   mtp_graph_profiles(impl->capacity, family.verify_drafts,
+                                                      family.ar_depth))) *
+                               impl->max_concurrency;
+            }
         } else {
             // Each DFlash family's profiles are captured at the family's own window for every
             // batch size, on the one frame viewed at that width.

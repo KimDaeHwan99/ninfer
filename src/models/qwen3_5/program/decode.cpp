@@ -516,13 +516,16 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
     const auto started = Clock::now();
     const auto matches = propose_ngram(lanes, budgets);
-    // The decode frame is allocated once at plan.draft_window (the wider of the neural and ngram
-    // windows). Every round verifies at that native width so the frame is consumed in place; a
-    // width-narrowed view is only valid for a batch-1 frame. The body's AR depth (next_k) must
-    // equal the frame's next-drafts width for the same reason.
-    const std::uint32_t verify_drafts = draft_window;
-    const std::uint32_t mtp_ar_depth  = std::min(draft_window, kMtpDecodeMaximumDrafts);
-    auto& graph_family                = ngram_draft_window != 0 ? ngram_graphs : mtp_graphs;
+    // A round carrying a copy verifies at the ngram window, every other round at the neural
+    // window (mtp_graph_families); the frame is allocated at the wider one and viewed at the
+    // round's width.
+    const bool any_ngram = std::any_of(matches.begin(), matches.begin() + lanes.size(),
+                                       [](const auto& match) { return !match.tokens.empty(); });
+    const bool copy_family = any_ngram && ngram_draft_window != 0 &&
+                             ngram_draft_window != neural_draft_window;
+    const std::uint32_t verify_drafts = copy_family ? ngram_draft_window : neural_draft_window;
+    const std::uint32_t mtp_ar_depth  = std::min(neural_draft_window, kMtpDecodeMaximumDrafts);
+    auto& graph_family                = copy_family ? ngram_graphs : mtp_graphs;
     const std::uint32_t width         = verify_drafts + 1;
     std::uint32_t maximum_frontier    = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -608,7 +611,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
 
         execution::MtpBatchContext schedule_state{{device, tensor_parallel, parameters, work, state_images->linear(),
-                                                   replay_records ? &*replay_records : nullptr, io,
+                                                   round_replay_records(verify_drafts), io,
                                                    prefill_hidden, prefill_chunk, proposal_head,
                                                    fast_prefill_kernel},
                                                   decoder->text_kv,

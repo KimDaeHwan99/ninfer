@@ -157,8 +157,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
-        if (is_masked_draft_backend(speculative_backend) && ngram_draft_window != 0 &&
-            neural_draft_window != ngram_draft_window) {
+        // Copy-drafting engines verify neural rounds at the neural width and copy rounds at the
+        // ngram width, each recording through a view of its own width.
+        if ((is_masked_draft_backend(speculative_backend) ||
+             speculative_backend == SpeculativeBackend::Mtp) &&
+            ngram_draft_window != 0 && neural_draft_window != ngram_draft_window) {
             const std::uint32_t narrow = std::min(neural_draft_window, ngram_draft_window);
             narrow_replay_records.emplace(
                 replay_records->narrowed(static_cast<std::int32_t>(narrow + 1U)));

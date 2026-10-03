@@ -356,53 +356,59 @@ void ProgramImpl::prepare_graphs() {
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        // One family at the frame's native width. The frame is allocated once at plan.draft_window
-        // (the wider of the neural and ngram windows) and every round verifies at that width, so
-        // an ngram engine reuses this family for both copy and free-form rounds.
-        const std::uint32_t verify_drafts = draft_window;
-        const std::uint32_t ar_depth      = std::min(draft_window, kMtpDecodeMaximumDrafts);
-        const auto prepare_family         = [&, verify_drafts](std::uint32_t frontier,
-                                                       std::uint32_t batch_size) {
-            prepare_representative(frontier, batch_size, verify_drafts, verify_drafts);
-        };
-        auto& graph_family = ngram_draft_window != 0 ? ngram_graphs : mtp_graphs;
-        const auto planned_profiles = mtp_graph_profiles(capacity, verify_drafts, ar_depth);
-        validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
-        execution::MtpBatchContext mtp_state{execution_core(),
-                                             decoder->text_kv,
-                                             *decoder->mtp_cache(),
-                                             *io.mtp_decode,
-                                             *mtp_host_ingress,
-                                             *mtp_host_egress,
-                                             state_images->continuation_hidden_store()};
-        mtp_state.neural_proposal_drafts      = ar_depth;
-        const GraphExecutionProfile code_warm = planned_profiles.front();
-        prepare_family(code_warm.min, 1);
-        device.synchronize();
-        execution::mtp_decode_batch(
-            mtp_state, 1, verify_drafts,
-            mtp_causal_attention_envelopes(code_warm.max, verify_drafts, capacity, ar_depth),
-            nullptr);
-        device.synchronize();
+        // Neural rounds verify at the neural window; a copy-drafting engine with another window
+        // also captures a family at that window. Both run on the one frame viewed at their width
+        // (MtpDecodeState::narrowed) and record through a ReplaySSM view of the same width.
+        for (const MtpGraphFamily& family :
+             mtp_graph_families(neural_draft_window, ngram_draft_window)) {
+            const std::uint32_t verify_drafts = family.verify_drafts;
+            const std::uint32_t ar_depth      = family.ar_depth;
+            const auto prepare_family         = [&, verify_drafts](std::uint32_t frontier,
+                                                           std::uint32_t batch_size) {
+                prepare_representative(frontier, batch_size, verify_drafts, verify_drafts);
+            };
+            auto& graph_family          = family.ngram ? ngram_graphs : mtp_graphs;
+            const auto planned_profiles = mtp_graph_profiles(capacity, verify_drafts, ar_depth);
+            validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+            execution::ExecutionCore core = execution_core();
+            core.replay_records           = round_replay_records(verify_drafts);
+            execution::MtpBatchContext mtp_state{core,
+                                                 decoder->text_kv,
+                                                 *decoder->mtp_cache(),
+                                                 *io.mtp_decode,
+                                                 *mtp_host_ingress,
+                                                 *mtp_host_egress,
+                                                 state_images->continuation_hidden_store()};
+            mtp_state.neural_proposal_drafts      = ar_depth;
+            const GraphExecutionProfile code_warm = planned_profiles.front();
+            prepare_family(code_warm.min, 1);
+            device.synchronize();
+            execution::mtp_decode_batch(
+                mtp_state, 1, verify_drafts,
+                mtp_causal_attention_envelopes(code_warm.max, verify_drafts, capacity, ar_depth),
+                nullptr);
+            device.synchronize();
 
-        graph_family.profiles.reserve(planned_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                graph_family.profiles.emplace_back();
-                DecodeGraphProfile& profile    = graph_family.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
-                execution::capture_mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), verify_drafts,
-                    mtp_causal_attention_envelopes(planned.max, verify_drafts, capacity, ar_depth),
-                    profile.definition);
+            graph_family.profiles.reserve(planned_profiles.size() * max_concurrency);
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    graph_family.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = graph_family.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    execution::capture_mtp_decode_batch(
+                        mtp_state, static_cast<std::int32_t>(batch_size), verify_drafts,
+                        mtp_causal_attention_envelopes(planned.max, verify_drafts, capacity,
+                                                       ar_depth),
+                        profile.definition);
+                }
             }
+            instantiate_graph_family(graph_family, family.ngram ? "ngram MTP" : "MTP", device,
+                                     prepare_family);
         }
-        instantiate_graph_family(graph_family, ngram_draft_window != 0 ? "ngram MTP" : "MTP",
-                                 device, prepare_family);
     }
     if (is_masked_draft_backend(speculative_backend)) {
         for (const bool ngram : {false, true}) {

@@ -322,24 +322,24 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     }
 }
 
-MtpDecodeState MtpDecodeState::single_row_prefix(std::uint32_t k, std::uint32_t next_k) const {
-    if (current_drafts.ne[1] != 1 || k == 0 ||
-        k > static_cast<std::uint32_t>(current_drafts.ne[0]) || next_k == 0 ||
+MtpDecodeState MtpDecodeState::narrowed(std::uint32_t k, std::uint32_t next_k) const {
+    if (k == 0 || k > static_cast<std::uint32_t>(current_drafts.ne[0]) || next_k == 0 ||
         next_k > static_cast<std::uint32_t>(next_drafts.ne[1])) {
-        throw std::invalid_argument("MTP prefix requires C1 and allocated verify/proposal widths");
+        throw std::invalid_argument("MTP narrowed view requires allocated verify/proposal widths");
     }
     auto result      = *this;
+    const auto rows  = current_drafts.ne[1];
     const auto width = static_cast<std::int32_t>(k + 1);
     for (Tensor* tensor :
          {&result.target_rope_positions, &result.licensed_tokens, &result.verify_ids,
           &result.target_positions, &result.target_argmax, &result.alignment_ids}) {
-        *tensor = Tensor(tensor->data, tensor->dtype, {width, 1});
+        *tensor = Tensor(tensor->data, tensor->dtype, {width, rows});
     }
     result.current_drafts =
-        Tensor(current_drafts.data, DType::I32, {static_cast<std::int32_t>(k), 1});
+        Tensor(current_drafts.data, DType::I32, {static_cast<std::int32_t>(k), rows});
     for (Tensor* tensor :
          {&result.target_hidden, &result.target_logits, &result.alignment_hidden}) {
-        *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, 1});
+        *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, rows});
     }
     const auto steps = static_cast<std::int32_t>(std::max(1U, next_k - 1U));
     for (Tensor* tensor :

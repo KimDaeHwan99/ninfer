@@ -110,12 +110,13 @@ EngineOptions rank_options(const EngineOptions& options) {
 }
 
 // One collective stages at most a prefill chunk of hidden states or a speculative round of
-// vocabulary-half logits.
+// vocabulary-half logits at the widest verify window (neural or copy drafts).
 std::size_t tensor_parallel_slot_bytes(const EngineOptions& options,
                                        const models::qwen3_5::Config& config) {
     const std::size_t hidden  = config.text.hidden_size;
-    const std::size_t columns = std::size_t{options.max_concurrency} *
-                                (std::size_t{options.speculative.draft_tokens} + 1U);
+    const std::size_t drafts  = std::max(options.speculative.draft_tokens,
+                                         options.speculative.ngram_draft_tokens);
+    const std::size_t columns = std::size_t{options.max_concurrency} * (drafts + 1U);
     return std::max(std::size_t{options.prefill_chunk} * hidden,
                     std::size_t{config.output_head_rows()} * std::max<std::size_t>(columns, 1)) *
            sizeof(std::uint16_t);

@@ -256,7 +256,7 @@ void test_round_layout() {
             const auto frame       = base_frame.current_drafts.ne[0] == static_cast<int>(k) &&
                                        base_frame.next_drafts.ne[1] == static_cast<int>(next_k)
                                          ? base_frame
-                                         : base_frame.single_row_prefix(k, next_k);
+                                         : base_frame.narrowed(k, next_k);
             expect(frame.target_logits.ne[1] == static_cast<int>(k + 1) &&
                        frame.current_drafts.ne[0] == static_cast<int>(k) &&
                        frame.alignment_ids.ne[0] == static_cast<int>(k + 1) &&
@@ -273,10 +273,35 @@ void test_round_layout() {
          std::vector<std::pair<unsigned, unsigned>>{{0, 3}, {16, 3}, {15, 0}, {15, 6}}) {
         bool rejected = false;
         try {
-            (void)mtp_copy.mtp_decode->single_row_prefix(k, next_k);
+            (void)mtp_copy.mtp_decode->narrowed(k, next_k);
         } catch (const std::invalid_argument&) { rejected = true; }
         expect(rejected, "MTP invalid verify/proposal frame width rejected");
     }
+    // A batched frame narrows densely: an MTP round verifies at the neural width on a frame
+    // allocated at the ngram width, for every row count.
+    ninfer::LayoutBuilder batched_builder;
+    auto batched_layout = q36::begin_round_state_layout(
+        batched_builder, {.hidden         = 32,
+                          .output_rows    = 128,
+                          .batch_capacity = 4,
+                          .draft_window   = 15,
+                          .backend        = ninfer::SpeculativeBackend::Mtp});
+    q36::complete_round_state_layout(batched_builder, batched_layout);
+    const auto batched_bytes = batched_builder.finish(256);
+    std::vector<std::byte> batched_storage(batched_bytes + 255);
+    const auto batched_address =
+        (reinterpret_cast<std::uintptr_t>(batched_storage.data()) + 255) & ~std::uintptr_t(255);
+    q36::RoundState batched({reinterpret_cast<void*>(batched_address), batched_bytes},
+                            batched_layout);
+    const auto narrow = batched.mtp_decode->narrowed(3, 3);
+    expect(narrow.target_logits.ne[1] == 4 && narrow.target_logits.ne[2] == 4 &&
+               narrow.target_logits.is_contiguous() && narrow.verify_ids.ne[0] == 4 &&
+               narrow.verify_ids.ne[1] == 4 && narrow.current_drafts.ne[0] == 3 &&
+               narrow.current_drafts.ne[1] == 4 &&
+               narrow.target_logits.slice(2, 0, 2).is_contiguous() &&
+               narrow.next_drafts.ne[1] == 3 && narrow.next_drafts.slice(0, 0, 2).ne[0] == 2 &&
+               narrow.ar_positions.ne[1] == 2,
+           "MTP batched frame narrows to a dense neural-width view");
 }
 
 void test_mtp_alignment() {
