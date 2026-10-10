@@ -20,6 +20,19 @@ client, stages the NVFP4 artifact once in `/dev/shm`, stores raw/progress/Serve 
 JSON, and CSV summaries. The case catalog, exact profiles, TTFT boundary, and fixture qualification
 are documented in the dedicated README.
 
+## VRAM headroom
+
+`measure_vram_headroom.py` derives `--vram-headroom-mib` for an already-running Serve. It samples
+nvidia-smi on the serving GPUs while it sends concurrent copy edits and the TTFT runner's long,
+concurrent and media cases, then reports the minimum free memory per GPU and the headroom that
+keeps `--safety-mib` of it free. The procedure is in the
+[two-GPU guide](../../docs/tensor-parallel-rtx5060ti.md#tuning---vram-headroom-mib).
+
+```bash
+python3 tools/bench/measure_vram_headroom.py --base-url http://127.0.0.1:8080 \
+  --gpus 0,1 --headroom-mib 1024 --output profiles/bench/headroom
+```
+
 ## Corpus baker
 
 `ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a

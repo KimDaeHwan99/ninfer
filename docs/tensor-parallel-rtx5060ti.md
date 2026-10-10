@@ -124,6 +124,44 @@ the headroom; see the next section), and at the same headroom the auto KV pool i
 smaller than before (180 MiB at about 17.5 KB per token). At `--tp 2` the startup figures labelled
 "after weights" (the debug memory ledger and KV sizing errors) now include the link's 180 MiB.
 
+## Tuning `--vram-headroom-mib`
+
+`--kv-capacity auto` leaves 1 GiB per card unused by default. How much of it the server really
+needs depends on the build and the workload: CUDA loads kernel modules on first use, and Vision,
+long prompts and wide n-gram rounds touch more of them. Every 100 MiB moved from the headroom into
+the pool is about 6K KV tokens (17.5 KB per token per rank). Measure on the serving machine:
+
+1. Start the server with the production command and the default headroom.
+2. From the repository, run the measurement against it:
+
+   ```bash
+   python3 tools/bench/measure_vram_headroom.py --base-url http://127.0.0.1:8080 \
+     --gpus 0,1 --headroom-mib 1024 --output profiles/bench/headroom
+   ```
+
+   It samples nvidia-smi on both cards every 100 ms while it sends four concurrent copy edits
+   (wide n-gram verify rounds), a 64K-token prompt, four heterogeneous concurrent requests, a
+   28-image request and two heavy media requests, then the copy edits again. Without `--vision`,
+   pass `--no-media`, which also drops the heterogeneous set because it includes an image. It
+   prints the minimum free memory per card and the headroom that keeps 256 MiB (`--safety-mib`) of
+   it free, and writes `samples.csv`, `report.json` and the load cases under `cases/` (load only,
+   not TTFT evidence). It exits 2 when a load step failed or ran short, and gives no value when
+   more than the headroom stayed free, which means `--headroom-mib` or `--gpus` does not match the
+   server. Set `NINFER_API_KEY` for a server started with `--api-key`.
+3. Restart with `--vram-headroom-mib <recommended>`, run the tool again with
+   `--headroom-mib <recommended>`, and keep the value only if the minimum stays above the safety
+   margin. The startup line `capacity | KV ... | free ...` reports the smaller of the two cards'
+   free memory at `--tp 2`.
+
+Runtime buffers are allocated at startup, so a headroom that is too small shows up when a lazily
+loaded kernel module or a launch needs memory that is not there: `ninfer-serve` prints a
+`CUDA_CHECK(...) failed` line and aborts (SIGABRT), losing the in-flight requests and every cached
+prefix, Device and Host. Repeat the measurement after every rebuild or option change. Peaks shorter
+than the sample period are not seen; the safety margin covers them. To bound what lazy module
+loading can still take, start twice at the same headroom, once normally and once with
+`CUDA_MODULE_LOADING=EAGER` (every module loaded before the KV pool is sized): the drop in KV
+tokens times about 17.5 KB per token is the most that lazy loading adds after startup.
+
 ## Results
 
 Measured on one machine: Ryzen 5 9600X, DDR5-5600 2×32 GB, 2× RTX 5060 Ti 16 GB on PCIe 5.0 x8/x8,

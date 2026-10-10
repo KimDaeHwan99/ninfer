@@ -481,7 +481,14 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     }
     device.synchronize();
     program.complete();
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+    std::size_t free_after_startup = current_free_device_bytes();
+    if (instance->peer) {
+        // The headroom protects both cards, so report the one with less room left.
+        instance->peer->device.bind_to_current_thread();
+        free_after_startup = std::min(free_after_startup, current_free_device_bytes());
+        device.bind_to_current_thread();
+    }
+    instance->kv_capacity_resolution.available_after_startup_bytes = free_after_startup;
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
