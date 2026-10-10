@@ -17,6 +17,10 @@ operator set the goals, approved each production change and ran the server. Ever
 > 264 → 300 tok/s, KV 용량 114K → 223K 토큰. 품질은 GSM8K 100문항 98, MMLU-Pro 210문항 174(공식
 > 아티팩트 172)로 같은 수준입니다. 아래 "2026-10-03 update"에 측정과 근거가 있고, 그 아래 절들은
 > 공식 아티팩트 시절의 기록입니다.
+>
+> 그 뒤 `--tp 2`에서는 토큰 임베딩을 VRAM 대신 pinned 시스템 RAM에 두는 것이 기본값이 되었습니다
+> (`--embedding-offload`). 카드당 1.185 GiB를 비워 KV 풀이 약 7만 토큰 늘어날 것으로 계산되지만 아직
+> 실측 전입니다. 위 측정은 임베딩이 VRAM에 있던 상태이며 `--embedding-offload off`로 재현합니다.
 
 ## 2026-10-03 update
 
@@ -37,6 +41,14 @@ ninfer-serve models/qwen3_8_27b_quasar_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --prefill-chunk 8192 --spec mtp --draft-tokens 4 --lm-head-draft \
   --ngram-draft-tokens 15 --ngram-min-match 12 --vision
 ```
+
+This command was measured with the token embedding in VRAM; the build now keeps it in system RAM
+at `--tp 2` (see [Token embedding in system RAM](#token-embedding-in-system-ram)), and
+`--embedding-offload off` restores the measured placement. Agent clients that send bursts of
+requests may also want `--pending-timeout-ms 600000`: with the default of 30 s, a request that has
+not started within 30 s of arriving (while waiting for one of the four lanes, for example) is
+answered with HTTP 503 `request_queue_timeout`, or HTTP 504 `timeout_error` on the Anthropic
+Messages endpoint. That flag is not part of the measured configuration.
 
 What changed, each measured on the machine below against the previous production
 (official artifact, original prefix cache, image `dbd162d1`):
@@ -65,6 +77,33 @@ T=3..5 (on the RTX 5060 Ti 65.5 → 67.6 µs at T=3/4 and 67.6 → 71.7 µs at T
 sliced-K route kept here), shorter TP timeouts, and a second Wallawalla47 merge (39 commits; equal
 speed in an interleaved A/B, kept on branch `tp2-5060ti-walla2`). Benchmarks: `bench/gsm8k_eval.py`, `bench/multiturn.py`, `bench/copy_edit.py`
 in the operator's workspace; the commits list their own measurements.
+
+## Token embedding in system RAM
+
+`--tp 2` keeps the token embedding table in pinned system RAM by default (`--embedding-offload
+auto`, which is `on` at `--tp 2` and `off` on one GPU). Before, each rank held its own replicated
+copy in VRAM. The QUASAR artifact stores the table as FP8 rows: 248,320 × 5,120 bytes plus one BF16
+scale per row, 1.185 GiB per card. The embedding gather reads only the rows of the current tokens
+through the pinned block's mapped address, so the table never crosses PCIe as a whole.
+
+Expected effect, from arithmetic only; **not yet measured on the machine below**:
+
+| Item | Expected |
+|---|---|
+| KV pool (`--kv-capacity auto`) | about +70K tokens: 1.185 GiB at about 17.5 KB of FP8 KV per token per rank (16 attention layers plus the MTP layer, 2 KV heads each) |
+| Decode | each gather reads the current rows (5 KiB per token) over PCIe: a few microseconds per round of about 25-30 ms, under 0.1 % |
+| Prefill | an 8,192-token chunk gathers 42 MB twice with MTP (text and MTP inputs), a few milliseconds per chunk, well under 1 % of the first token |
+| System RAM | +1.185 GiB pinned per rank (2.37 GiB in total, since each rank pins its own copy); the loader reads the table straight into the pinned block |
+| Output | unchanged: the same kernel reads the same bytes |
+
+Measure before relying on the larger pool: the KV capacity printed at startup, greedy code and
+Korean tok/s, the 16K and 31K first token, and `ninfer-perplexity --quick` at `--tp 2`.
+`ninfer-perplexity` takes the same flag, so the PPL table above can be checked with either placement.
+`--embedding-offload off` restores the VRAM table. `--embedding-offload on` also works on one GPU,
+but not together with `--vision-offload on`, whose eviction ladder borrows the device-resident
+table. An artifact whose output head shares the embedding's stored object keeps the table in VRAM
+for the head, so offload leaves it there. Startup fails with a message if the pinned block is not
+mapped at the same address on the device (UVA), which the tensor-parallel link already requires.
 
 ## Results
 
@@ -108,15 +147,19 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer --local-dir Qwen3.8-27B-nvfp4-NInfe
 An older v2 download also works after `python3 tools/upgrade_ninfer_v2_to_v3.py <v2> <v3>`. The
 results below were first measured that way.
 
-Recommended serving configuration (what the measurements below use unless stated otherwise):
+Serving configuration of the measurements in this and the following sections. It predates the
+2026-10-03 command above, which supersedes it: it uses the original prefix cache, whose options
+`--device-state-slots`, `--host-kv-mib` and `--host-state-slots` are rejected unless
+`--use-original-prefix-caching` selects that cache, and three MTP drafts.
 
 ```bash
 ninfer-serve Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --tp 2 --devices 0,1 \
   --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
-  --max-concurrency 4 --device-state-slots 2 --host-kv-mib 16384 --host-state-slots 16 \
+  --max-concurrency 4 --use-original-prefix-caching \
+  --device-state-slots 2 --host-kv-mib 16384 --host-state-slots 16 \
   --default-thinking-budget 2048 \
-  --prefill-chunk 8192 --spec mtp --draft-tokens 3 --lm-head-draft
+  --prefill-chunk 8192 --spec mtp --draft-tokens 3 --lm-head-draft --embedding-offload off
 ```
 
 | Option | Why |
@@ -128,7 +171,7 @@ ninfer-serve Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --
 | `--host-kv-mib 16384 --host-state-slots 16` | Pinned host cache for conversations that leave the GPU, doubled from the 8 GiB / 8-slot default. The 64 GB host keeps 34 GB available with the server running. |
 | `--default-thinking-budget 2048` | Caps thinking so the answer fits the request's `max_tokens`. At the cap the engine closes thinking and the model answers (table below). Per-request overrides use Anthropic `thinking.budget_tokens`. |
 | `--prefill-chunk 8192` | Faster first token on long prompts than 4096 (31,306 tokens 6.2 → 6.0 s, 59,417 tokens 14.0 → 13.7 s, measured before the last attention change); short prompts are unaffected. Wider chunks are rejected at `--tp 2`: 16384 cost 20 % of the KV pool (223K → 177K tokens) and deadlocked the two ranks' copy-channel all-reduce on the first prompt longer than 8192 tokens. |
-| `--draft-tokens 3 --lm-head-draft` | Best measured MTP setting for single requests; 2 and 4 drafts were slower on average, and turning off the reduced draft head was about 10% slower. With four parallel requests 2, 3 and 4 drafts all reached about 200 tok/s. |
+| `--draft-tokens 3 --lm-head-draft` | Best measured MTP setting for single requests with the official artifact (with QUASAR and the two-width graph families four drafts are faster; see the 2026-10-03 update); 2 and 4 drafts were slower on average, and turning off the reduced draft head was about 10% slower. With four parallel requests 2, 3 and 4 drafts all reached about 200 tok/s. |
 
 `ninfer` (CLI) and `ninfer-perplexity` accept the same `--tp 2 --devices 0,1`.
 
@@ -169,7 +212,10 @@ small single-sample sets, so differences of one or two items are within sampling
 (+0.3 GiB each) and encode the same media, so each rank's replicated hidden state stays identical
 without a cross-GPU transfer. On 16 GB cards the copy and the Vision workspace leave room for
 `--max-context 98304` and an auto KV pool of 114,176 tokens, compared with 131,072 and 140,608 without
-Vision. With 131,072 the minimum runtime reservation no longer fits.
+Vision. With 131,072 the minimum runtime reservation no longer fits. These limits are for the official
+artifact; the all-NVFP4 QUASAR artifact (8.85 GiB of weights per card with the embedding in VRAM,
+about 7.67 GiB with the default `--embedding-offload`) runs `--vision` at `--max-context 131072`,
+as in the 2026-10-03 command.
 
 ```bash
 ninfer-serve ... --tp 2 --devices 0,1 --vision --max-context 98304 --kv-capacity auto ...
@@ -184,8 +230,9 @@ byte-identical, because the second run reuses cached media and prefix state.
 
 1. **TP2 runtime.** Each GPU runs a full program over its weight shard (SPMD). Attention q/gate/k/v,
    GDN q/k/v/z/a/b, MLP gate/up and both output heads are column-split. The attention, GDN and MLP
-   output projections are row-split and summed by a residual all-reduce. Norms, embeddings and the
-   MTP input projection are replicated.
+   output projections are row-split and summed by a residual all-reduce. Norms and the MTP input
+   projection are replicated in VRAM; the token embedding is replicated in pinned system RAM unless
+   `--embedding-offload off` keeps it in VRAM.
 2. **Collectives over host memory.** Without P2P, every byte crosses host DRAM. Small decode-size
    all-reduces use 8-byte lines that carry 4 payload bytes plus a sequence tag, so one PCIe round trip
    delivers both. They are CUDA Graph capturable (3.7 µs for one 5120-wide column).
@@ -209,7 +256,7 @@ against this machine (36-SM GPUs, 16 GB each, 64 GB host) instead of being copie
 | KV pool | fixed 65,536 tokens | `auto`, 140,608 tokens | ~2.6 GB per GPU was unused |
 | Request ceiling | 65,536 | 131,072 | pool unchanged |
 | Concurrency | 1 | 4 | 3.4x aggregate output, single request unchanged |
-| Host conversation cache | 8 GiB, 8 slots | 16 GiB, 16 slots | 34 GB host memory still free |
+| Host conversation cache | 8 GiB, 8 slots | 16 GiB (8 GiB pinned per rank), 16 slots | 34 GB host memory still free |
 | Thinking | unlimited | 2048-token budget | no cut-off answers, better scores |
 | FP8 attention/GDN input shards | split-K waves for 170 SMs | 36-SM waves through 1024 / 2048 tokens | 4-11% faster on those widths. Wider inputs keep the old plan, which measured as fast or faster. No change in 16K/31K first-token time. |
 
@@ -284,8 +331,10 @@ router can switch engines per request model in about 15-20 s.
 
 ## Limits
 
-- Two ranks only, for the Qwen3.5-family 27B dense package. MoE layers and DFlash drafts have no
-  tensor-parallel split; the Vision encoder is replicated rather than split.
+- Two ranks only, for the Qwen3.5-family 27B dense package. MoE layers have no tensor-parallel
+  split; the DFlash2 drafter and the Vision encoder are replicated rather than split.
+- Rejected at `--tp 2`: `--vision-offload on`, `--prefix-cache-file`, `--spec dflash` (DFlash2
+  works), DFlash2 without `--lm-head-draft`, and `--prefill-chunk` above 8192.
 - The full test suite passes except tests that need the whole model on one GPU (the `*_real` tests).
   TP1 versus TP2 could not be compared end to end on 16 GB cards. The checks used instead were
   bit-identical ranks and a perplexity match against bf16 KV.
