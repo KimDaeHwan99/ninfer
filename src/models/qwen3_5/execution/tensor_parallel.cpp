@@ -51,15 +51,38 @@ TensorParallelSlices tensor_parallel_slices(const TensorParallelDeviceView* tp,
     // efficiency; up to four slices leave one slice's all-reduce exposed.
     constexpr std::int32_t kMinColumns = 512;
     constexpr std::int32_t kAlign      = 16;
+    // The GDN input, SwiGLU gate/up and 5120x8704 down shards run 256-token TMA tiles from 512
+    // columns on: whole tiles leave every slice but the last without a partial tile.
+    constexpr std::int32_t kTileAlign = 256;
     TensorParallelSlices slices;
     if (tp == nullptr || tp->copy == nullptr || columns < kMinColumns) { return slices; }
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
     if (capture != cudaStreamCaptureStatusNone) { return slices; }
     const std::int32_t count = std::clamp(columns / kMinColumns, 2, kTensorParallelMaxSlices);
-    // Round the ceiling share up: a floored share can leave a remainder for an extra slice.
-    slices.width = ((columns + count - 1) / count + kAlign - 1) / kAlign * kAlign;
-    slices.count = (columns + slices.width - 1) / slices.width;
+    const auto split = [&](std::int32_t align) {
+        TensorParallelSlices out;
+        // Round the ceiling share up: a floored share can leave a remainder for an extra slice.
+        out.width = ((columns + count - 1) / count + align - 1) / align * align;
+        out.count = (columns + out.width - 1) / out.width;
+        return out;
+    };
+    const auto last = [&](const TensorParallelSlices& s) {
+        return columns - (s.count - 1) * s.width;
+    };
+    // Shard routes and plans change at these widths: the NVFP4 5120x3072 output shard moves from
+    // MMA to TMA at 1024, and the FP8 input shards' 36-SM split-K plans cover up to 1024 and
+    // 2048. A slice that crosses one rounds differently.
+    const auto plan = [](std::int32_t w) { return (w >= 1024) + (w > 1024) + (w > 2048); };
+
+    slices                           = split(kAlign);
+    const TensorParallelSlices tiled = split(kTileAlign);
+    if (slices.width >= kMinColumns && tiled.count == slices.count &&
+        last(slices) >= kMinColumns && last(tiled) >= kMinColumns &&
+        plan(tiled.width) == plan(slices.width) && plan(last(tiled)) == plan(last(slices))) {
+        // Whole tiles only where they keep the slice count and every slice's route and plan.
+        slices = tiled;
+    }
     if (slices.count < 1 || slices.count > kTensorParallelMaxSlices) {
         throw std::logic_error("tensor-parallel slicing produced an invalid slice count");
     }
