@@ -559,11 +559,12 @@ bool ProgramImpl::hybrid_reservable(const HybridAdmissionQuote& quote,
 }
 
 runtime::ContextTransactionReserveStatus
-ProgramImpl::hybrid_reserve_materialization(HybridAdmissionQuote&& quote,
-                                            const PreparedPromptData& prompt,
-                                            const std::function<PreparedPromptData()>& take_prompt,
-                                            runtime::CancellationFlagView cancellation) {
-    if (!hybrid_reservable(quote, cancellation)) {
+ProgramImpl::hybrid_reserve_materialization(
+    HybridAdmissionQuote&& quote, const PreparedPromptData& prompt,
+    const std::function<PreparedPromptData()>& take_prompt) {
+    // A structural check only: the caller already turned a cancellation into Aborted, and one
+    // landing since then is the next progress step's to abort, not an invariant violation.
+    if (!hybrid_reservable(quote, runtime::CancellationFlagView{})) {
         throw std::logic_error("hybrid admission quote is no longer reservable");
     }
     // Staging runs before the prompt is taken: a quote that went stale since it was computed

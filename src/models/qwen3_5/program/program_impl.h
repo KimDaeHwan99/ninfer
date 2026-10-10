@@ -697,8 +697,7 @@ public:
                                          runtime::CancellationFlagView cancellation) const noexcept;
     [[nodiscard]] runtime::ContextTransactionReserveStatus
     hybrid_reserve_materialization(HybridAdmissionQuote&& quote, const PreparedPromptData& prompt,
-                                   const std::function<PreparedPromptData()>& take_prompt,
-                                   runtime::CancellationFlagView cancellation);
+                                   const std::function<PreparedPromptData()>& take_prompt);
     [[nodiscard]] std::uint32_t hybrid_reclaim_device_kv(std::uint32_t main_pages,
                                                          std::uint32_t backend_pages);
     // Prefetch for a waiting request (spec §6.6): blocks whose copy started, absent while a

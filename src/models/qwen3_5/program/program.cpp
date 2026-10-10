@@ -892,16 +892,23 @@ Program::hybrid_reserve_materialization(HybridAdmissionQuote&& quote, PreparedPr
                                         runtime::CancellationFlagView cancellation) {
     // The prompt is taken only once the reservation will succeed: a rejected quote leaves the
     // waiting request intact for a later admission attempt.
-    if (!impl_->hybrid_reservable(quote, cancellation)) {
-        return runtime::ContextTransactionReserveStatus::Aborted;
-    }
     if (!peer_) {
+        if (!impl_->hybrid_reservable(quote, cancellation)) {
+            return runtime::ContextTransactionReserveStatus::Aborted;
+        }
         return impl_->hybrid_reserve_materialization(
             std::move(quote), PreparedPromptAccess::view(prompt),
-            [&prompt]() { return PreparedPromptAccess::take(std::move(prompt)); }, cancellation);
+            [&prompt]() { return PreparedPromptAccess::take(std::move(prompt)); });
     }
+    // Both ranks judge one snapshot of the flag: a cancellation landing between two live reads
+    // would reject on one rank, pass on the other and fail the Engine as diverged ranks.
     const auto fixed = snapshot_cancellation(cancellation);
-    if (!peer_->hybrid_reservable(quote, fixed)) { ranks_diverged("hybrid admission reservability"); }
+    if (!impl_->hybrid_reservable(quote, fixed)) {
+        return runtime::ContextTransactionReserveStatus::Aborted;
+    }
+    if (!peer_->hybrid_reservable(quote, fixed)) {
+        ranks_diverged("hybrid admission reservability");
+    }
     // Quotes are rank-independent data over identical indexes: the peer stages from a copy.
     HybridAdmissionQuote peer_quote = quote;
     peer_quote.impl = std::make_shared<detail::HybridQuoteImpl>(*quote.impl);
@@ -911,8 +918,8 @@ Program::hybrid_reserve_materialization(HybridAdmissionQuote&& quote, PreparedPr
     on_ranks(
         [&] {
             peer = peer_->hybrid_reserve_materialization(
-                std::move(peer_quote), view, [&view]() { return view.tensor_parallel_peer_copy(); },
-                fixed);
+                std::move(peer_quote), view,
+                [&view]() { return view.tensor_parallel_peer_copy(); });
         },
         [&] {
             local = impl_->hybrid_reserve_materialization(
@@ -920,8 +927,7 @@ Program::hybrid_reserve_materialization(HybridAdmissionQuote&& quote, PreparedPr
                 [&]() {
                     // The peer copies from `view` concurrently; take the prompt only after it has.
                     return view.tensor_parallel_peer_copy();
-                },
-                fixed);
+                });
         });
     require_same(local == peer, "hybrid admission reservation");
     if (local == runtime::ContextTransactionReserveStatus::Reserved) {
