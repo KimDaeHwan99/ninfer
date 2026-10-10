@@ -11,7 +11,6 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <string>
 #include <tuple>
@@ -228,14 +227,18 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (placement.bytes != object_bytes(object)) {
             throw ArtifactError("pinned placement size differs from object");
         }
-        auto data = reader.read_object(placement.object);
+        if (checked_add(placement.offset, placement.bytes, "pinned placement end") >
+            out.pinned_->size()) {
+            throw ArtifactError("pinned placement exceeds the pinned block");
+        }
+        // Read straight into the pinned block: a staging copy would double the host footprint
+        // of a large pinned table while it loads.
+        const std::span<std::byte> data(
+            static_cast<std::byte*>(out.pinned_->data()) + placement.offset,
+            static_cast<std::size_t>(placement.bytes));
+        reader.read_into(object_offset(object), data);
         out.stats_.read_bytes =
             checked_add(out.stats_.read_bytes, data.size(), "pinned read bytes");
-        if (data.size() != placement.bytes) {
-            throw ArtifactError("pinned read size differs from placement");
-        }
-        std::memcpy(static_cast<std::byte*>(out.pinned_->data()) + placement.offset,
-                    data.data(), data.size());
         const auto geometry = reader.geometry(placement.object);
         const auto divisor = read_divisor(reader, placement.object, geometry, data, out.stats_);
         storage.pinned = WeightParent{

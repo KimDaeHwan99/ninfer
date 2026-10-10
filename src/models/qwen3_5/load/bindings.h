@@ -50,8 +50,11 @@ private:
                                       bool draft = false);
 [[nodiscard]] BlockWeights bind_block(Bindings& bindings, const TextConfig& config,
                                       const std::string& prefix, MixerKind mixer);
+// `embedding_residency` places the token embedding table: Device, or HostPinned for a table the
+// embedding gather reads through mapped host memory.
 [[nodiscard]] TextWeights bind_text(Bindings& bindings, const TextConfig& config,
-                                    const LoadOptions& options);
+                                    const LoadOptions& options,
+                                    artifact::Residency embedding_residency);
 [[nodiscard]] VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,
                                         const TextConfig& target, const LoadOptions& options);
 [[nodiscard]] MtpWeights bind_mtp(Bindings& bindings, const TextConfig& config,

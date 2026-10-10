@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/types.h"
+
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -33,6 +35,13 @@ namespace ninfer::product {
     if (text == "1") { return 1; }
     if (text == "2") { return 2; }
     throw std::invalid_argument("--tp must be 1 or 2");
+}
+
+[[nodiscard]] inline EmbeddingOffload parse_embedding_offload(std::string_view text) {
+    if (text == "auto") { return EmbeddingOffload::Auto; }
+    if (text == "on") { return EmbeddingOffload::On; }
+    if (text == "off") { return EmbeddingOffload::Off; }
+    throw std::invalid_argument("--embedding-offload accepts auto, on or off");
 }
 
 // Resolves `--tp`, `--devices` and `--device` into the per-rank device list. `--tp 2` requires

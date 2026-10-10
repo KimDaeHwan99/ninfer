@@ -19,7 +19,10 @@ all-NVFP4 artifact, MTP with 4 drafts + ngram copy drafting, hybrid prefix cache
 requests, Vision on): greedy code 117-120 tok/s, Korean 76-78 tok/s, sampled essay 89 tok/s,
 rewriting a source file 379 tok/s, four parallel requests 300 tok/s aggregate, first token
 0.05-0.10 s for a short prompt, 2.4 / 5.2 s for 16K / 31K-token prompts and 0.055 s when a cached
-conversation resumes, 223K KV tokens; GSM8K 98/100 and MMLU-Pro 174/210.
+conversation resumes, 223K KV tokens; GSM8K 98/100 and MMLU-Pro 174/210. These numbers were
+measured with the token embedding in VRAM (`--embedding-offload off`); the build now keeps it in
+system RAM at `--tp 2`, which should enlarge the KV pool but has not been measured yet (see the
+guide).
 
 ---
 

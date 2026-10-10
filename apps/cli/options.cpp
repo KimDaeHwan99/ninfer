@@ -85,7 +85,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N] [--tp 1|2] [--devices N,N]\n"
+           "       [--device N] [--tp 1|2] [--devices N,N] [--embedding-offload auto|on|off]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
            "       [--lm-head-draft]\n"
@@ -125,6 +125,9 @@ std::string usage_text(const char* argv0) {
            ")\n"
            "  --tp 1|2                 split the model across two GPUs (requires --devices A,B)\n"
            "  --devices A,B            the two CUDA devices of --tp 2\n"
+           "  --embedding-offload auto|on|off\n"
+           "                           keep the token embedding in pinned system RAM (on) or\n"
+           "                           VRAM (off); auto (default) is on at --tp 2\n"
            "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4\n"
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
@@ -223,6 +226,8 @@ Options parse_options(int argc, char** argv) {
             tensor_parallel = product::parse_tensor_parallel(value(arg));
         } else if (arg == "--devices") {
             rank_devices = product::parse_device_list(value(arg));
+        } else if (arg == "--embedding-offload") {
+            options.embedding_offload = product::parse_embedding_offload(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
@@ -345,6 +350,11 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.embedding_offload == EmbeddingOffload::On && options.enable_vision &&
+        options.vision_offload) {
+        throw std::invalid_argument(
+            "--embedding-offload on is incompatible with --vision-offload on");
+    }
     if (options.enable_thinking == false && options.reasoning_effort &&
         *options.reasoning_effort != ReasoningEffort::None) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");

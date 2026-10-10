@@ -321,6 +321,7 @@ int main(int argc, char** argv) {
         engine_options.enable_vision            = cli.enable_vision;
         engine_options.vision_offload           = cli.vision_offload;
         engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;
+        engine_options.embedding_offload        = cli.embedding_offload;
         engine_options.use_cuda_graph           = cli.use_cuda_graph;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.

@@ -73,6 +73,16 @@ enum class ProposalHead : std::uint8_t {
     Optimized,
 };
 
+// Where the token embedding table lives. On keeps it in pinned system RAM, from which the
+// embedding gather reads only the selected rows through mapped host memory; Off keeps it in
+// device memory. Auto selects On at tensor-parallel width 2, where every rank otherwise holds a
+// full copy, and Off on one GPU. A table tied to the output head stays in device memory.
+enum class EmbeddingOffload : std::uint8_t {
+    Auto,
+    On,
+    Off,
+};
+
 enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
@@ -311,7 +321,10 @@ struct EngineOptions {
     bool vision_offload = false;
     // Upper bound on merged tokens per vision item; zero leaves the compiled limit.
     std::uint32_t vision_max_merged_tokens = 32768;
-    bool use_cuda_graph                    = true;
+    // On is incompatible with vision_offload, whose eviction ladder borrows the device-resident
+    // embedding.
+    EmbeddingOffload embedding_offload = EmbeddingOffload::Auto;
+    bool use_cuda_graph                = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

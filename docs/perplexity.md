@@ -43,6 +43,11 @@ seconds. `--log-level debug` exposes internal startup and stream-begin detail. T
 domain/overall table remains product output on stdout; the independent full-precision machine
 report is `report.json` under `profiles/perplexity/` unless `--output` supplies an empty directory.
 
+`--tp 2 --devices A,B` scores across two GPUs ([two-GPU guide](tensor-parallel-rtx5060ti.md)).
+`--embedding-offload auto|on|off` places the token embedding table as in `ninfer-serve`: `auto`
+(the default) keeps it in pinned system RAM at `--tp 2` and in VRAM on one GPU. The placement does
+not change the scores.
+
 For KV-format comparisons, the recommended long-context profile is the full corpus with
 `--context 65536 --stride 32768` and without `--quick`.
 

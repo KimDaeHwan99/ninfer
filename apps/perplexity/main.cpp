@@ -53,6 +53,7 @@ struct Options {
     std::uint32_t stride                = 2048;
     int device                          = 0;
     std::vector<int> devices{0};
+    ninfer::EmbeddingOffload embedding_offload{ninfer::EmbeddingOffload::Auto};
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
@@ -64,6 +65,7 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N] [--tp 1|2] [--devices N,N]\n"
+           "       [--embedding-offload auto|on|off] (default auto: on at --tp 2)\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] (default fp8)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
@@ -122,6 +124,9 @@ Options parse_options(int argc, char** argv) {
             tensor_parallel = ninfer::product::parse_tensor_parallel(value("--tp"));
         } else if (option == "--devices") {
             rank_devices = ninfer::product::parse_device_list(value("--devices"));
+        } else if (option == "--embedding-offload") {
+            out.embedding_offload =
+                ninfer::product::parse_embedding_offload(value("--embedding-offload"));
         } else if (option == "--use-original-int8-prefill-kernel") {
             out.original_int8_prefill_kernel = true;
         } else if (option == "--use-original-nvfp4-prefill-kernel") {
@@ -247,6 +252,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.device           = options.device;
     engine_options.tensor_parallel  = static_cast<std::uint32_t>(options.devices.size());
     engine_options.devices          = options.devices;
+    engine_options.embedding_offload = options.embedding_offload;
     engine_options.max_context      = options.context;
     engine_options.rope_yarn_factor  = options.rope_yarn_factor;
     engine_options.kv_cache         = options.kv;

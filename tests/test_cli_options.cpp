@@ -139,6 +139,31 @@ int run_tests() {
                                        "--vision-offload", "overlay"});
                       }),
                       "--vision-offload accepted a value other than on or off");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"})
+                              .embedding_offload == ninfer::EmbeddingOffload::Auto,
+                      "CLI embedding offload is not auto by default");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--embedding-offload", "on"})
+                              .embedding_offload == ninfer::EmbeddingOffload::On,
+                      "--embedding-offload on did not reach CLI options");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--embedding-offload", "off"})
+                              .embedding_offload == ninfer::EmbeddingOffload::Off,
+                      "--embedding-offload off did not reach CLI options");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").find("--embedding-offload") !=
+                          std::string::npos,
+                      "CLI help omits --embedding-offload");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--embedding-offload", "host"});
+                      }),
+                      "--embedding-offload accepted a value other than auto, on or off");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--vision", "--vision-offload", "on",
+                                       "--embedding-offload", "on"});
+                      }),
+                      "--embedding-offload on was accepted with --vision-offload on");
     failures += check(rejects([] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
                                        "--vision-max-merged", "33"});

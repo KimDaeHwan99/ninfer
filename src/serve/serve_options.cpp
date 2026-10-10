@@ -81,6 +81,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             across two GPUs\n"
            "  --devices A,B              one CUDA device per rank, required by --tp 2\n"
            "                             (--device, when also given, must name the first)\n"
+           "  --embedding-offload auto|on|off\n"
+           "                             keep the token embedding in pinned system RAM (on)\n"
+           "                             or VRAM (off); auto (default) is on at --tp 2\n"
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
            "                             (default 1024)\n"
            "  --use-original-int8-prefill-kernel\n"
@@ -262,6 +265,7 @@ std::string serve_usage_text(const char* argv0) {
            "  prefix caching system).\n"
            "  Options of the two prefix caching systems cannot be mixed.\n"
            "  --vision-offload on requires --vision.\n"
+           "  --embedding-offload on cannot be combined with --vision-offload on.\n"
            "  --ngram-draft-tokens above 15 requires --max-concurrency 1.\n"
            "  --ngram-native-sessions requires --ngram-archive-mib.\n"
            "  --rope-yarn-factor is startup-fixed, finite [1,4] (default 1); it extends the\n"
@@ -518,6 +522,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             tensor_parallel = product::parse_tensor_parallel(require_value("--tp"));
         } else if (arg == "--devices") {
             rank_devices = product::parse_device_list(require_value("--devices"));
+        } else if (arg == "--embedding-offload") {
+            options.embedding_offload =
+                product::parse_embedding_offload(require_value("--embedding-offload"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -719,6 +726,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_offload && !options.enable_vision) {
         throw std::invalid_argument("--vision-offload on requires --vision");
+    }
+    if (options.embedding_offload == EmbeddingOffload::On && options.vision_offload) {
+        throw std::invalid_argument(
+            "--embedding-offload on is incompatible with --vision-offload on");
     }
     // A speculative decode frame is allocated at the wider of the neural and ngram draft windows
     // and cannot be narrowed for a multi-request batch. The GDN conv-record workspace admits at

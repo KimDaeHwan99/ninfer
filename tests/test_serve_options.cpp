@@ -189,6 +189,8 @@ int main() {
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(!defaults.vision_offload, "Vision offload is not off by default");
+    failures += check(defaults.embedding_offload == ninfer::EmbeddingOffload::Auto,
+                      "embedding offload is not auto by default");
     failures += check(defaults.vision_max_merged_tokens == 32768,
                       "merged Vision token default mismatch");
     failures += check(defaults.request_log_jsonl.empty(),
@@ -336,6 +338,30 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--vision-max-merged", "40000"});
     } catch (const std::invalid_argument&) { high_merged_rejected = true; }
     failures += check(high_merged_rejected, "--vision-max-merged above 32768 was accepted");
+
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--embedding-offload", "on"})
+                              .embedding_offload == ninfer::EmbeddingOffload::On,
+                      "--embedding-offload on did not reach serving options");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--embedding-offload", "off"})
+                              .embedding_offload == ninfer::EmbeddingOffload::Off,
+                      "--embedding-offload off did not reach serving options");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--embedding-offload", "on",
+                             "--embedding-offload", "auto"})
+                              .embedding_offload == ninfer::EmbeddingOffload::Auto,
+                      "--embedding-offload auto did not reach serving options");
+    bool bad_embedding_offload_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--embedding-offload", "host"});
+    } catch (const std::invalid_argument&) { bad_embedding_offload_rejected = true; }
+    failures += check(bad_embedding_offload_rejected,
+                      "--embedding-offload accepted a value other than auto, on or off");
+    bool embedding_with_vision_offload_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-offload", "on",
+                     "--embedding-offload", "on"});
+    } catch (const std::invalid_argument&) { embedding_with_vision_offload_rejected = true; }
+    failures += check(embedding_with_vision_offload_rejected,
+                      "--embedding-offload on was accepted with --vision-offload on");
 
     bool implicit_backend_rejected = false;
     try {

@@ -4,8 +4,11 @@
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
@@ -27,6 +30,25 @@ std::uint32_t overlay_evict_rank(std::string_view name) {
     return 0;
 }
 
+namespace {
+
+// Whether two logical parameters read any stored object in common.
+bool shares_object(const artifact::Reader& reader, std::string_view first,
+                   std::string_view second) {
+    const auto& bindings = reader.directory().bindings;
+    const auto a         = bindings.find(first);
+    const auto b         = bindings.find(second);
+    if (a == bindings.end() || b == bindings.end()) { return false; }
+    for (const auto& x : a->second.parts) {
+        for (const auto& y : b->second.parts) {
+            if (x.object == y.object) { return true; }
+        }
+    }
+    return false;
+}
+
+} // namespace
+
 struct LoadPlan::Impl {
     Config config;
     LoadOptions options;
@@ -36,6 +58,8 @@ struct LoadPlan::Impl {
     std::optional<VisionOverlayLayout> vision_overlay;
     FrontendResources resources;
     InstanceInfo info;
+    // The token embedding is HostPinned and read by kernels through its host address.
+    bool host_embedding = false;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -69,14 +93,26 @@ std::span<const WeightUse> LoadPlan::uses(WeightId id) const {
 
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
                    TensorParallelPlacement placement) {
+    if (options.embedding_offload == EmbeddingOffload::On && options.overlay_vision()) {
+        // The overlay's eviction ladder borrows the device-resident embedding.
+        throw std::invalid_argument(
+            "--embedding-offload on is incompatible with --vision-offload on");
+    }
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+
+    // A table tied to the output head keeps its Device parent for the head, so pinning it as
+    // well would only add system RAM.
+    out->host_embedding = options.host_embedding(placement.split()) &&
+                          !shares_object(reader, "text/token_embedding", "text/output_head");
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
     loading::Bindings bindings(binder);
     const auto& text  = out->config.text;
-    out->weights.text = loading::bind_text(bindings, text, options);
+    out->weights.text = loading::bind_text(
+        bindings, text, options,
+        out->host_embedding ? artifact::Residency::HostPinned : artifact::Residency::Device);
     if (out->config.vision) {
         out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text, options);
     }
@@ -176,6 +212,23 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto backing = artifact::materialize(*data->materialization.source,
                                          std::move(data->materialization), device, observer,
                                          std::move(pool));
+    if (data->host_embedding) {
+        // The embedding gather dereferences the table's host address on the device, which is
+        // valid only where UVA maps the pinned block at the same address.
+        const auto pinned = backing.pinned_bytes_range();
+        void* mapped      = nullptr;
+
+        const cudaError_t status =
+            pinned.empty() ? cudaErrorInvalidValue
+                           : cudaHostGetDevicePointer(
+                                 &mapped, const_cast<std::byte*>(pinned.data()), 0);
+        if (status != cudaSuccess || mapped != pinned.data()) {
+            (void)cudaGetLastError();
+            throw std::runtime_error(
+                "--embedding-offload on requires pinned memory mapped at the same address on the "
+                "device; select off");
+        }
+    }
     std::optional<VisionOverlayAssets> overlay;
     if (data->options.overlay_vision()) {
         EvictableWeightPool* eviction = backing.eviction_pool();

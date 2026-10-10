@@ -196,6 +196,26 @@ void logical_data_and_instances() {
         require(plan.parameter(plan.weights().text.token_embedding).binding.parts[0].object ==
                     plan.parameter(plan.weights().text.output_head).binding.parts[0].object,
                 "explicit shared embedding/head did not bind the same parent");
+        require(plan.parameter(plan.weights().text.token_embedding).residency ==
+                        artifact::Residency::Device &&
+                    plan.materialization().pinned_objects.empty(),
+                "automatic embedding offload left Device memory on one GPU");
+        {
+            // A table tied to the output head keeps its Device parent for the head, so offload
+            // leaves it there instead of adding a pinned copy.
+            auto tied = qwen::plan_load(reader, {.embedding_offload = EmbeddingOffload::On});
+            require(tied.parameter(tied.weights().text.token_embedding).residency ==
+                            artifact::Residency::Device &&
+                        tied.materialization().pinned_objects.empty(),
+                    "embedding offload pinned a table tied to the output head");
+        }
+        rejects<std::invalid_argument>(
+            [&] {
+                (void)qwen::plan_load(reader, {.vision            = true,
+                                               .vision_offload    = true,
+                                               .embedding_offload = EmbeddingOffload::On});
+            },
+            "embedding offload was accepted with Vision offload");
         capacity = plan.materialization().device_capacity_bytes;
         require(!plan.weights().vision && plan.resources().preprocessor_config_json.empty(),
                 "unused Vision was required");
@@ -230,13 +250,37 @@ void logical_data_and_instances() {
         }
     }
     fixture.file.write();
-    artifact::Reader changed(fixture.file.entry);
-    auto expanded = qwen::plan_load(changed);
-    require(expanded.weights().text.layers.size() == 2 &&
-                expanded.config().text.compact_layer_indices == std::vector<std::uint32_t>{0, 1},
-            "config did not drive layer geometry and compact indices");
-    require(expanded.materialization().device_capacity_bytes == capacity,
-            "cross-layer sharing duplicated parent storage");
+    {
+        artifact::Reader changed(fixture.file.entry);
+        auto expanded = qwen::plan_load(changed);
+        require(expanded.weights().text.layers.size() == 2 &&
+                    expanded.config().text.compact_layer_indices ==
+                        std::vector<std::uint32_t>{0, 1},
+                "config did not drive layer geometry and compact indices");
+        require(expanded.materialization().device_capacity_bytes == capacity,
+                "cross-layer sharing duplicated parent storage");
+    }
+
+    // Untied, an offloaded embedding moves its whole parent from the Device arena to pinned
+    // system RAM.
+    fixture.tensor("head-storage", {272, 128});
+    fixture.file.root["bindings"]["text/output_head"] = {{"object", "head-storage"}};
+    fixture.file.write();
+    artifact::Reader untied(fixture.file.entry);
+    const auto resident  = qwen::plan_load(untied, {.embedding_offload = EmbeddingOffload::Off});
+    const auto offloaded = qwen::plan_load(untied, {.embedding_offload = EmbeddingOffload::On});
+    const auto& embedding = offloaded.parameter(offloaded.weights().text.token_embedding);
+    const auto& pinned    = offloaded.materialization().pinned_objects;
+    require(embedding.residency == artifact::Residency::HostPinned &&
+                offloaded.parameter(offloaded.weights().text.output_head).residency ==
+                    artifact::Residency::Device,
+            "embedding offload did not move exactly the embedding to pinned RAM");
+    require(pinned.size() == 1 && pinned[0].object == embedding.binding.parts[0].object,
+            "the offloaded embedding has no pinned placement");
+    require(resident.materialization().pinned_objects.empty() &&
+                offloaded.materialization().device_capacity_bytes <
+                    resident.materialization().device_capacity_bytes,
+            "embedding offload kept the embedding in the Device arena");
 }
 
 void native_uses() {

@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/embedding.h"
 #include "ops/op_tester.h"
+#include "core/arena.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
 
@@ -519,6 +520,24 @@ public:
         return failures;
     }
 
+    // Counts fixture rows whose codes or scale differ in `payload`, a host copy of this table.
+    int verify_host_copy(const char* label, const std::uint8_t* payload) const {
+        int failures = 0;
+        for (const Fp8Row& row : rows_) {
+            const std::uint8_t* codes = payload + static_cast<std::size_t>(row.id) * kFp8D;
+            failures += verify_exact(label, std::vector<std::uint8_t>(codes, codes + kFp8D),
+                                     row.codes);
+            const std::uint8_t* scale =
+                payload + scale_offset_ + static_cast<std::size_t>(row.id) * 2;
+            if ((static_cast<std::uint16_t>(scale[0]) |
+                 static_cast<std::uint16_t>(scale[1] << 8)) != row.scale) {
+                std::cerr << label << " scale changed for row " << row.id << '\n';
+                ++failures;
+            }
+        }
+        return failures;
+    }
+
 private:
     const Fp8Row* find(std::int32_t id) const {
         const auto it = std::find_if(rows_.begin(), rows_.end(),
@@ -552,6 +571,44 @@ private:
     std::size_t scale_offset_;
     GuardedDeviceBuffer payload_;
     std::vector<Fp8Row> rows_;
+};
+
+// The same table in pinned system RAM, as --embedding-offload places it: the gather dereferences
+// the host address, which UVA maps unchanged on the device.
+class PinnedFp8Table {
+public:
+    explicit PinnedFp8Table(Fp8Table& source)
+        : source_(source), device_(source.weight()),
+          host_(static_cast<std::size_t>(device_.payload_bytes)) {
+        CUDA_CHECK(cudaMemcpy(host_.data(), device_.payload, host_.size(),
+                              cudaMemcpyDeviceToHost));
+    }
+
+    Weight weight() const {
+        const auto* device_base = static_cast<const std::uint8_t*>(device_.payload);
+        const auto* host_base   = static_cast<const std::uint8_t*>(host_.data());
+        Weight result           = device_;
+        result.payload          = host_base;
+        const auto rebase       = [&](const void* plane) {
+            return host_base + (static_cast<const std::uint8_t*>(plane) - device_base);
+        };
+        result.qdata  = rebase(device_.qdata);
+        result.scales = rebase(device_.scales);
+        return result;
+    }
+
+    std::vector<double> oracle(const std::vector<std::int32_t>& ids) const {
+        return source_.oracle(ids);
+    }
+
+    int verify_unchanged(const char* label) const {
+        return source_.verify_host_copy(label, static_cast<const std::uint8_t*>(host_.data()));
+    }
+
+private:
+    const Fp8Table& source_;
+    Weight device_;
+    PinnedHostBuffer host_;
 };
 
 template <typename Table>
@@ -644,6 +701,15 @@ int test_fp8() {
     Fp8Table table;
     int failures = 0;
     failures += qualify_dflash2("FP8 [248320,5120]", table, 4);
+    {
+        PinnedFp8Table pinned(table);
+        for (int t : {1, 5, 20, 2048}) {
+            const std::string label = "embedding FP8 pinned T=" + std::to_string(t);
+            failures += run_quantized_case(label.c_str(), pinned, dflash2_ids(t), kFp8D);
+        }
+        failures += run_quantized_case("embedding FP8 pinned Graph T=5", pinned, dflash2_ids(5),
+                                       kFp8D, true);
+    }
     const std::vector<std::int32_t> ids = {0};
     GuardedDeviceBuffer device_ids(sizeof(std::int32_t));
     device_ids.copy_from_host(ids.data(), sizeof(std::int32_t));

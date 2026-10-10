@@ -55,6 +55,7 @@ struct ServeOptions {
     bool enable_vision                     = false;
     bool vision_offload                    = false;
     std::uint32_t vision_max_merged_tokens = 32768;
+    EmbeddingOffload embedding_offload     = EmbeddingOffload::Auto;
     bool use_cuda_graph                    = true;
     bool allow_prefix_reuse                = true;
     std::optional<bool> enable_thinking;

@@ -97,10 +97,12 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
     return out;
 }
 
-TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& options) {
+TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& options,
+                      artifact::Residency embedding_residency) {
     TextWeights out;
-    out.token_embedding =
-        b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
+    out.token_embedding = b.parameter("text/token_embedding",
+                                      {config.vocab_size, config.hidden_size}, {}, {},
+                                      embedding_residency);
     std::vector<std::string> head_inputs{"text/final_hidden"};
     if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");

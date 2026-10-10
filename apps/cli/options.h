@@ -36,6 +36,7 @@ struct Options {
     bool enable_vision                     = false;
     bool vision_offload                    = false;
     std::uint32_t vision_max_merged_tokens = 32768;
+    EmbeddingOffload embedding_offload     = EmbeddingOffload::Auto;
     bool use_cuda_graph                    = true;
 
     bool raw_output      = false;

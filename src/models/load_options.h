@@ -11,6 +11,7 @@ struct LoadOptions {
     bool vision                            = false;
     bool vision_offload                    = false;
     std::uint32_t vision_max_merged_tokens = 32768;
+    EmbeddingOffload embedding_offload     = EmbeddingOffload::Auto;
     SpeculativeBackend speculative         = SpeculativeBackend::None;
     ProposalHead proposal_head             = ProposalHead::Full;
     float rope_yarn_factor                 = 1.0F;
@@ -20,6 +21,13 @@ struct LoadOptions {
     // Vision offload keeps the vision tower in pinned system RAM and streams it through borrowed
     // device memory per encode window; requires vision plus an evictable weight ladder.
     [[nodiscard]] bool overlay_vision() const noexcept { return vision && vision_offload; }
+
+    // Whether the token embedding table stays in pinned system RAM for a placement split across
+    // `split` ranks or not.
+    [[nodiscard]] bool host_embedding(bool split) const noexcept {
+        return embedding_offload == EmbeddingOffload::On ||
+               (embedding_offload == EmbeddingOffload::Auto && split);
+    }
 
     [[nodiscard]] bool speculative_enabled() const noexcept {
         return speculative != SpeculativeBackend::None;
@@ -64,6 +72,7 @@ struct LoadOptions {
             .vision                   = options.enable_vision,
             .vision_offload           = options.vision_offload,
             .vision_max_merged_tokens = options.vision_max_merged_tokens,
+            .embedding_offload        = options.embedding_offload,
             .speculative              = options.speculative.backend,
             .proposal_head            = options.speculative.proposal_head,
             .rope_yarn_factor         = options.rope_yarn_factor};

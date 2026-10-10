@@ -163,7 +163,11 @@ int check(const artifact::Reader& reader, models::LoadOptions options) {
         for (std::size_t i = 0; i < shard.load.parameter_count(); ++i) {
             const auto& local  = shard.load.parameter(qwen::WeightId{i});
             const auto& global = full.load.parameter(qwen::WeightId{i});
-            if (local.residency != artifact::Residency::Device) { continue; }
+            // The default --embedding-offload pins the replicated embedding at --tp 2.
+            if (local.residency != artifact::Residency::Device &&
+                local.residency != artifact::Residency::HostPinned) {
+                continue;
+            }
             const auto lrows = local.shape.front();
             const auto lcols = local.shape.size() == 2 ? local.shape[1] : 1;
             const auto gcols = global.shape.size() == 2 ? global.shape[1] : 1;

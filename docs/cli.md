@@ -226,6 +226,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-offload on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; takes effect only with `--vision` | `off` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768`; larger media is downscaled during preprocessing | `32768` |
+| `--embedding-offload auto\|on\|off` | keep the token embedding table in pinned system RAM (`on`) or VRAM (`off`); `auto` is `on` at `--tp 2` ([two-GPU guide](tensor-parallel-rtx5060ti.md)) and `off` on one GPU; a table tied to the output head stays in VRAM; `on` cannot be combined with `--vision-offload on` | `auto` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
