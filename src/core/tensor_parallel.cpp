@@ -120,11 +120,15 @@ TensorParallelLink::TensorParallelLink(std::array<int, kTensorParallelRanks> dev
                 CUDA_CHECK(cudaEventCreateWithFlags(&channel.sent[t], cudaEventDisableTiming));
                 CUDA_CHECK(cudaEventCreateWithFlags(&channel.received[t], cudaEventDisableTiming));
             }
+            // One piece of receive scratch, then the slot-sized partials.
+            const std::size_t scratch_bytes =
+                align_up(tensor_parallel_copy_scratch_bytes(slot_bytes_), kStagingAlignment);
             void* scratch = nullptr;
-            CUDA_CHECK(cudaMalloc(&scratch, slot_bytes_ * (1 + kTensorParallelCopyPartials)));
+            CUDA_CHECK(
+                cudaMalloc(&scratch, scratch_bytes + slot_bytes_ * kTensorParallelCopyPartials));
             channel.scratch = static_cast<std::byte*>(scratch);
             for (std::size_t p = 0; p < kTensorParallelCopyPartials; ++p) {
-                channel.partials[p] = channel.scratch + (1 + p) * slot_bytes_;
+                channel.partials[p] = channel.scratch + scratch_bytes + p * slot_bytes_;
             }
             channel.self_staging = staging(rank);
             channel.peer_staging = staging(1 - rank);

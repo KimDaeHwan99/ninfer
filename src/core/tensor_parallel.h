@@ -25,6 +25,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +47,29 @@ struct TensorParallelMailbox {
 
 // Pieces one asynchronous collective is split into so each rank's send and receive overlap.
 inline constexpr int kTensorParallelCopyPieces = 4;
+
+// Pieces of an asynchronous collective of `bytes`: pieces of at least 1 MiB keep per-copy
+// overhead small while the send of piece i+1 overlaps the receive of piece i.
+[[nodiscard]] constexpr std::size_t tensor_parallel_copy_pieces(std::size_t bytes) noexcept {
+    return std::clamp<std::size_t>(bytes >> 20, 1, kTensorParallelCopyPieces);
+}
+
+// Bytes of each piece but the last, in whole BF16x8 packs.
+[[nodiscard]] constexpr std::size_t tensor_parallel_copy_piece_bytes(std::size_t bytes) noexcept {
+    return (bytes / tensor_parallel_copy_pieces(bytes) + 15) / 16 * 16;
+}
+
+// Receive scratch for the widest piece of any payload up to `slot_bytes`. The receive stream
+// combines each piece before the next one lands, so one piece of scratch serves them all. A
+// payload below 2 MiB travels as one piece, one of 2 to 4 MiB as two or three pieces of at most
+// 1.5 MiB, and a larger one as four pieces of at most a quarter of the slot, so the widest piece
+// is the larger of about 2 MiB and a quarter of the slot.
+[[nodiscard]] constexpr std::size_t
+tensor_parallel_copy_scratch_bytes(std::size_t slot_bytes) noexcept {
+    return std::max(tensor_parallel_copy_piece_bytes(slot_bytes),
+                    tensor_parallel_copy_piece_bytes(
+                        std::min(slot_bytes, (std::size_t{2} << 20) - 1)));
+}
 // Asynchronous collectives whose completion events stay distinct.
 inline constexpr int kTensorParallelCopyTickets = 16;
 // Rank-owned partial buffers callers may keep in flight across workspace scopes.
@@ -71,8 +95,9 @@ struct TensorParallelCopyChannel {
     const std::byte* peer_staging = nullptr;
     TensorParallelCopyMailbox* self_mailbox       = nullptr;
     const TensorParallelCopyMailbox* peer_mailbox = nullptr;
-    // Device memory of this rank: the peer's payload lands in `scratch`; `partials` are free for
-    // callers whose in-flight payload must outlive a workspace scope.
+    // Device memory of this rank: each piece of the peer's payload lands in `scratch` (one piece
+    // wide); `partials` are free for callers whose in-flight payload must outlive a workspace
+    // scope.
     std::byte* scratch = nullptr;
     std::array<std::byte*, kTensorParallelCopyPartials> partials{};
     std::uint64_t slot_bytes = 0;

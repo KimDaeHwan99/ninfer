@@ -387,6 +387,14 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     frontend.complete();
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
+    if (peer) {
+        // The link's device buffers are fixed allocations: made before free memory is measured,
+        // they come out of the KV plan instead of the headroom it leaves.
+        peer->link = std::make_unique<TensorParallelLink>(
+            std::array<int, 2>{device.device, peer->device.device},
+            tensor_parallel_slot_bytes(options, instance->model->config()));
+        peer->views = {peer->link->view(0), peer->link->view(1)};
+    }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =
@@ -431,10 +439,6 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
             peer_sequence.device_reservation_bytes() != sequence.device_reservation_bytes()) {
             throw std::logic_error("tensor-parallel ranks finalized different Program plans");
         }
-        peer->link = std::make_unique<TensorParallelLink>(
-            std::array<int, 2>{device.device, peer->device.device},
-            tensor_parallel_slot_bytes(options, instance->model->config()));
-        peer->views = {peer->link->view(0), peer->link->view(1)};
         instance->program = models::qwen3_5::create_tensor_parallel_program(
             {&instance->parameters, peer->parameters.get()},
             {std::move(sequence), std::move(peer_sequence)}, {&device, &peer->device},

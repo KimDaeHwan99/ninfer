@@ -384,6 +384,83 @@ int async_case(TensorParallelLink& link, const std::array<int, 2>& devices) {
     return failures;
 }
 
+// One piece of receive scratch must hold the widest piece of every payload a slot admits.
+int scratch_policy_case() {
+    for (const std::size_t slot : {std::size_t{1} << 20, std::size_t{3} << 20, kSlotBytes,
+                                   std::size_t{80} << 20}) {
+        const std::size_t scratch = tensor_parallel_copy_scratch_bytes(slot);
+        for (std::size_t bytes = 16; bytes <= slot; bytes += 16) {
+            if (tensor_parallel_copy_piece_bytes(bytes) > scratch) {
+                std::printf("FAIL copy scratch: slot %zu, payload %zu, piece %zu > scratch %zu\n",
+                            slot, bytes, tensor_parallel_copy_piece_bytes(bytes), scratch);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// The copy channel against the kernel collective at payloads of one, three and four pieces, the
+// last filling the slot: every piece reuses the one piece of receive scratch, and both paths
+// compute the same expression in the same rank order, so they agree bit for bit.
+int async_sizes_case(TensorParallelLink& link, std::array<RankBuffers, 2>& ranks,
+                     const std::array<int, 2>& devices) {
+    constexpr std::int32_t kRows = 5120;
+    int failures                 = 0;
+    for (const std::int32_t columns : {154, 358, 2457}) {
+        const std::size_t count = static_cast<std::size_t>(kRows) * columns;
+        std::vector<float> residual(count);
+        fill_uniform(residual, 700 + columns, -4.0f, 4.0f);
+        round_to_bf16(residual);
+        const auto residual_bits = bf16_bits(residual);
+        std::array<std::vector<std::uint16_t>, 2> partial_bits;
+        for (int r = 0; r < 2; ++r) {
+            std::vector<float> partial(count);
+            fill_uniform(partial, 800 + columns + 1000 * r, -2.0f, 2.0f);
+            round_to_bf16(partial);
+            partial_bits[r] = bf16_bits(partial);
+        }
+        // results[path][rank]; path 0 is the kernel collective, path 1 the copy channel.
+        std::array<std::array<std::vector<std::uint16_t>, 2>, 2> results;
+        std::array<bool, 2> copied{};
+        for (int path = 0; path < 2; ++path) {
+            on_ranks(devices, [&](int r) {
+                auto& b         = ranks[r];
+                const auto view = link.view(r);
+                check(cudaMemcpy(b.residual, residual_bits.data(), count * 2,
+                                 cudaMemcpyHostToDevice),
+                      "upload residual");
+                check(cudaMemcpy(b.partial, partial_bits[r].data(), count * 2,
+                                 cudaMemcpyHostToDevice),
+                      "upload partial");
+                Tensor p(b.partial, DType::BF16, {kRows, columns});
+                Tensor x(b.residual, DType::BF16, {kRows, columns});
+                if (path == 0) {
+                    ops::tp_residual_allreduce(p, x, view, b.stream);
+                } else {
+                    const auto ticket = ops::tp_residual_allreduce_async(p, x, view, b.stream);
+                    copied[r]         = ticket != 0;
+                    ops::tp_wait(view, ticket, b.stream);
+                }
+                check(cudaStreamSynchronize(b.stream), "all-reduce");
+                results[path][r].resize(count);
+                check(cudaMemcpy(results[path][r].data(), b.residual, count * 2,
+                                 cudaMemcpyDeviceToHost),
+                      "download residual");
+            });
+        }
+        char label[96];
+        std::snprintf(label, sizeof(label), "copy channel [%d,%d] vs kernel", kRows, columns);
+        if (!copied[0] || !copied[1]) {
+            std::printf("FAIL %s: copy channel not used\n", label);
+            ++failures;
+        }
+        failures += verify_exact(label, results[1][0], results[0][0]);
+        failures += verify_exact(label, results[1][1], results[0][1]);
+    }
+    return failures;
+}
+
 // Throughput of one 2048-column all-reduce, synchronous kernel versus copy channel.
 int async_timing_case(TensorParallelLink& link, std::array<RankBuffers, 2>& ranks,
                       const std::array<int, 2>& devices) {
@@ -424,6 +501,7 @@ int async_timing_case(TensorParallelLink& link, std::array<RankBuffers, 2>& rank
 } // namespace
 
 int main() {
+    if (scratch_policy_case() != 0) { return 1; }
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2) {
         std::printf("SKIP: tensor-parallel test needs two CUDA devices\n");
@@ -453,6 +531,7 @@ int main() {
     failures += mixed_chain_case(link, devices);
     failures += residual_case(link, ranks, devices, 5120, 3, 9, 16);
     failures += async_case(link, devices);
+    failures += async_sizes_case(link, ranks, devices);
     failures += async_timing_case(link, ranks, devices);
     failures += mixed_chain_case(link, devices);
     on_ranks(devices, [&](int r) {

@@ -21,6 +21,8 @@ operator set the goals, approved each production change and ran the server. Ever
 > 그 뒤 `--tp 2`에서는 토큰 임베딩을 VRAM 대신 pinned 시스템 RAM에 두는 것이 기본값이 되었습니다
 > (`--embedding-offload`). 카드당 1.185 GiB를 비워 KV 풀이 약 7만 토큰 늘어날 것으로 계산되지만 아직
 > 실측 전입니다. 위 측정은 임베딩이 VRAM에 있던 상태이며 `--embedding-offload off`로 재현합니다.
+> 또 TP 링크의 장치 버퍼(카드당 240 → 180 MiB)가 이제 KV 계획 안에 잡혀, 더 이상 1 GiB 헤드룸을
+> 차지하지 않습니다. 같은 헤드룸에서 KV 풀은 그만큼(약 1.1만 토큰) 작아집니다(미측정).
 
 ## 2026-10-03 update
 
@@ -104,6 +106,23 @@ but not together with `--vision-offload on`, whose eviction ladder borrows the d
 table. An artifact whose output head shares the embedding's stored object keeps the table in VRAM
 for the head, so offload leaves it there. Startup fails with a message if the pinned block is not
 mapped at the same address on the device (UVA), which the tensor-parallel link already requires.
+
+## Link buffers in the KV plan
+
+The two-GPU link keeps device buffers on each card: a receive scratch for the copy-channel
+all-reduce and two partial buffers of one slot each. A slot holds the widest exchange, here one
+8,192-column prefill chunk of BF16 hidden states (80 MiB). Before, the link was created after
+`--kv-capacity auto` had measured free memory, so its 240 MiB per card came out of the 1 GiB
+headroom (about 784 MiB was really left), and a small `--vram-headroom-mib` could fail startup.
+Now the link is created before that measurement, and the receive scratch is one piece wide (20 MiB)
+instead of a whole slot, since the receive stream combines each piece before the next one lands:
+180 MiB per card, inside the KV plan.
+
+Expected, not yet measured: the link no longer takes 240 MiB of the 1 GiB headroom, so lowering
+`--vram-headroom-mib` becomes safe to try (kernel modules CUDA loads on first use still come out of
+the headroom; see the next section), and at the same headroom the auto KV pool is about 11K tokens
+smaller than before (180 MiB at about 17.5 KB per token). At `--tp 2` the startup figures labelled
+"after weights" (the debug memory ledger and KV sizing errors) now include the link's 180 MiB.
 
 ## Results
 

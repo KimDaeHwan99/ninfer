@@ -40,10 +40,7 @@ std::uint64_t tp_residual_allreduce_copy_launch(const Tensor& partial, Tensor& r
     const std::size_t bytes   = partial.bytes();
     const std::uint64_t ticket = ++channel.sequence;
     const std::size_t slot    = (ticket % kTensorParallelSlots) * channel.slot_bytes;
-    // Pieces of at least 1 MiB keep per-copy overhead small while the send of piece i+1 overlaps
-    // the receive of piece i.
-    const std::size_t pieces = std::clamp<std::size_t>(bytes >> 20, 1, kTensorParallelCopyPieces);
-    const std::size_t piece  = (bytes / pieces + 15) / 16 * 16;
+    const std::size_t piece   = tensor_parallel_copy_piece_bytes(bytes);
     const auto& previous     = channel.received[(ticket - 1) % kTensorParallelCopyTickets];
 
     CUDA_CHECK(cudaEventRecord(channel.fork, stream));
@@ -68,15 +65,17 @@ std::uint64_t tp_residual_allreduce_copy_launch(const Tensor& partial, Tensor& r
         tp_copy_wait_kernel<<<1, 1, 0, channel.receive>>>(&channel.peer_mailbox->published[p],
                                                           ticket, channel.timeout_ns);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpyAsync(channel.scratch + offset, channel.peer_staging + slot + offset,
-                                   count, cudaMemcpyHostToDevice, channel.receive));
+        // Every piece lands at the start of the scratch: this stream combines it before the next
+        // piece's copy overwrites it.
+        CUDA_CHECK(cudaMemcpyAsync(channel.scratch, channel.peer_staging + slot + offset, count,
+                                   cudaMemcpyHostToDevice, channel.receive));
         const auto packs  = static_cast<std::int64_t>(count / 16);
         const auto blocks = static_cast<int>(
             std::min<std::int64_t>((packs + kTensorParallelThreads - 1) / kTensorParallelThreads,
                                    4 * tp.max_blocks));
         tp_copy_combine_kernel<<<blocks, kTensorParallelThreads, 0, channel.receive>>>(
             reinterpret_cast<const uint4*>(own + offset),
-            reinterpret_cast<const uint4*>(channel.scratch + offset),
+            reinterpret_cast<const uint4*>(channel.scratch),
             reinterpret_cast<uint4*>(out + offset), packs, channel.rank);
         CUDA_CHECK(cudaGetLastError());
     }
