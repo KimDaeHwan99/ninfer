@@ -116,6 +116,9 @@ TensorParallelLink::TensorParallelLink(std::array<int, kTensorParallelRanks> dev
             CUDA_CHECK(
                 cudaStreamCreateWithPriority(&channel.receive, cudaStreamNonBlocking, greatest));
             CUDA_CHECK(cudaEventCreateWithFlags(&channel.fork, cudaEventDisableTiming));
+            for (auto& event : channel.published) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            }
             for (std::size_t t = 0; t < kTensorParallelCopyTickets; ++t) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&channel.sent[t], cudaEventDisableTiming));
                 CUDA_CHECK(cudaEventCreateWithFlags(&channel.received[t], cudaEventDisableTiming));
@@ -151,6 +154,9 @@ TensorParallelLink::~TensorParallelLink() {
             for (std::size_t t = 0; t < kTensorParallelCopyTickets; ++t) {
                 if (channel.sent[t] != nullptr) { (void)cudaEventDestroy(channel.sent[t]); }
                 if (channel.received[t] != nullptr) { (void)cudaEventDestroy(channel.received[t]); }
+            }
+            for (auto event : channel.published) {
+                if (event != nullptr) { (void)cudaEventDestroy(event); }
             }
             if (channel.fork != nullptr) { (void)cudaEventDestroy(channel.fork); }
             if (channel.send != nullptr) { (void)cudaStreamDestroy(channel.send); }

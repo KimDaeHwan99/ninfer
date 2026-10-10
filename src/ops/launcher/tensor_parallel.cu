@@ -59,9 +59,14 @@ std::uint64_t tp_residual_allreduce_copy_launch(const Tensor& partial, Tensor& r
         tp_copy_publish_kernel<<<1, 1, 0, channel.send>>>(&channel.self_mailbox->published[p],
                                                           ticket);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(channel.published[p], channel.send));
     }
     for (std::size_t p = 0, offset = 0; offset < bytes; ++p, offset += piece) {
         const std::size_t count = std::min(piece, bytes - offset);
+        // Spin on the peer's piece only once this rank has published its own, so the peer's
+        // matching spin always finds it: a precaution against a suspected spin/publish interaction
+        // behind the --prefill-chunk 16384 hang, not a measured fix.
+        CUDA_CHECK(cudaStreamWaitEvent(channel.receive, channel.published[p], 0));
         tp_copy_wait_kernel<<<1, 1, 0, channel.receive>>>(&channel.peer_mailbox->published[p],
                                                           ticket, channel.timeout_ns);
         CUDA_CHECK(cudaGetLastError());

@@ -87,6 +87,10 @@ struct TensorParallelCopyChannel {
     cudaStream_t send    = nullptr; // device -> host staging, then publish
     cudaStream_t receive = nullptr; // wait for the peer, host staging -> scratch, combine
     cudaEvent_t fork     = nullptr;
+    // Recorded after this rank publishes each piece. The receive stream waits on it before
+    // spinning on the peer's same piece, so a spin never waits for a piece its own rank has yet
+    // to publish.
+    std::array<cudaEvent_t, kTensorParallelCopyPieces> published{};
     std::array<cudaEvent_t, kTensorParallelCopyTickets> sent{};
     std::array<cudaEvent_t, kTensorParallelCopyTickets> received{};
     std::uint64_t sequence = 0;
