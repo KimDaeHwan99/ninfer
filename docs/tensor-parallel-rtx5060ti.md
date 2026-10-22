@@ -386,6 +386,35 @@ machine with less RAM. Strata/Swift 1.5 for one Korean conversation at a time (a
 output) on a machine with 64 GB of RAM or more. The two cannot run side by side on these cards; a small
 router can switch engines per request model in about 15-20 s.
 
+### 2026-10-22: Strata v0.2.2, Basalt and ninfer on the same machine
+
+Same machine as above (Ryzen 5 9600X with PBO Auto and Curve Optimizer -40, DDR5 64 GB at
+6400 MT/s, 2x RTX 5060 Ti 16 GB on PCIe 5.0 x8/x8 without P2P), now on Ubuntu 26.04.1, NVIDIA
+595.91 and CUDA 13.4. Each engine ran alone on both GPUs with one request at a time and temperature 0.
+Speed is the second of two runs; each run changed the prompt's first line so no prompt cache was hit.
+The 40 verified items are generated arithmetic, date, sorting, counting and remainder questions with
+answers computed by the script (exact match on a final `ANSWER:` line), so they compare engines
+under one condition and are not a standard benchmark. No run read weights from the SSD.
+
+| | Strata v0.2.2 | [Basalt](https://github.com/jesdga95/basalt) 5790960 | ninfer, this branch 28843fb |
+|---|---|---|---|
+| Model | Qwen3.8-Flash-Next GSQ-RCO IQ3_S | Qwen3.8-Flash-Next GSQ-RCO IQ3_S | Qwen3.8-27B QUASAR-QAT NVFP4 |
+| Context / KV | 262,144 / int8 | 262,144 / int8 | 131,072 / fp8 |
+| Prompt, 10,214 tokens | 1,738 tok/s (first token 5.88 s) | 2,326 tok/s (4.39 s) | 6,969 tok/s (1.47 s) |
+| Code, 512 tokens | 100.0 tok/s | 116.6 tok/s | 141.5 tok/s |
+| Korean, 512 tokens | 74.3 tok/s | 91.7 tok/s | 77.5 tok/s |
+| Verified items | 40/40 | 40/40 | 38/40 |
+| Tool calls | 5/5 | 5/5 | 5/5 |
+
+ninfer ran the recommended configuration above (`--default-thinking-budget 2048`); Strata used its
+installed settings and Basalt its README settings with the same context, KV and image input as Strata,
+neither with a thinking budget. ninfer reads prompts 3-4x faster and writes code fastest. It is slower
+than Basalt in Korean, and its two misses were the same mistake: rounding a share up instead of down
+(126 for 125, 49 for 48). Basalt, a Blackwell-tuned Strata fork, beats Strata on every speed row with
+the same model and the same score. One deployment difference: ninfer serves `/health` and the
+OpenAI/Anthropic routes but has no load, unload or idle-unload control, while Strata and Basalt can
+release the GPUs when idle.
+
 ## Limits
 
 - Two ranks only, for the Qwen3.5-family 27B dense package. MoE layers have no tensor-parallel

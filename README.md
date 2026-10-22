@@ -119,6 +119,11 @@ cmake --preset release
 cmake --build build -j
 ```
 
+The build also needs the CUDA NVTX headers (`nvtx3/nvToolsExt.h`). The full `cuda-toolkit-13-4`
+package includes them; a toolkit installed component by component may not, and the build then stops
+at `src/core/nvtx.h`. Add `cuda-nvtx-13-4` (the same minor version as the toolkit) in that case. The
+`tp2-5060ti` branch also builds natively on Ubuntu 26.04.1 with GCC 15.2 and CUDA 13.4.
+
 The server is `build/apps/ninfer-serve` and takes the same options as on Windows, for example the
 launch line above with `./build/apps/ninfer-serve` in place of `ninfer-serve.exe`.
 
