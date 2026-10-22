@@ -415,6 +415,45 @@ the same model and the same score. One deployment difference: ninfer serves `/he
 OpenAI/Anthropic routes but has no load, unload or idle-unload control, while Strata and Basalt can
 release the GPUs when idle.
 
+## 2026-10-23 upstream review
+
+Wallawalla47/ninfer-custom was rebased onto a newer upstream after the 2026-10-03 merge, so merging
+its `master` again conflicts in 228 files. Its fixes were taken one by one instead (`cherry-pick -x`,
+so each commit names its source):
+
+| Commit | Source | What it fixes |
+|---|---|---|
+| `1513bc5d` | `21ef8232` | NVFP4 A4 epilogue: the scale is rounded before the residual add at every width |
+| `b732a674`, `8f614915` | `7a75da46`, `713f8028` | artifact direct reads: aligned staging slots, short `pread`s filled |
+| `10b22af7` | `521076f8` | n-gram copy proposals are sized without the output budget |
+| `f45ff361` | `3e8f1617` | verification attention partitions KV by the row window, so a round cut by `max_tokens` commits the same KV as a full one (conflict resolved: the RTX 5060 Ti SM-count helper stays; the new test runs without the newer `DeviceExecutionView`) |
+
+Measured with the recommended command on the machine above (DDR5 now at 6400 MT/s), before → after:
+
+| Check | Before (`a226c855`) | After (`f45ff361`) |
+|---|---:|---:|
+| `ninfer-perplexity --quick`, `--tp 2`, fp8 KV | 4.3865 | 4.3865 |
+| 40 generated tasks with computed answers | 38 | 38 |
+| Tool calls | 5/5 | 5/5 |
+| MTP round time (requests with MTP only) | 26.65 ms | 26.64 ms |
+| 10K-token prompt | 6,966 tok/s | 6,935 tok/s |
+
+Single-prompt decode tok/s moved between 95 and 152 from run to run of the same binary (the text and
+so the accepted drafts change), so the round time is the speed check here.
+
+Reviewed and not taken, with the reason:
+
+- `d5e6c8f1`, `473df201`, `7ac7c9b4` (split-KV merge as a dependent launch, balanced short decode-row
+  splits, TMA BF16 wide `linear_add`): applied cleanly, round time unchanged at 26.64 ms.
+- `a9937fc7` (16-bit FP8 residual activations for wide shared rows): aimed at FP8 projections, which
+  the all-NVFP4 QUASAR artifact barely has, and its own notes measure 5-6 % less n-gram copy throughput.
+- `b278ba57`, `813355b3`, `b2e1aaf6` and the prefill attention rework `d85ee622`: built on frontend and
+  attention code this branch does not have (1-52 conflicting files each).
+- ValerioDolci/ninfer-tp2 (capy-flash) v0.6.0 overlaps the prefill all-reduces in half-chunks for its
+  +60 %; this branch already slices each prefill chunk into up to four column slices whose all-reduce
+  overlaps the next slice's work. Its 2048-token chunks are slower here: 2048 and 4096 gave 6,416 and
+  6,792 tok/s on the 10K prompt against about 6,950 with 8192.
+
 ## Limits
 
 - Two ranks only, for the Qwen3.5-family 27B dense package. MoE layers have no tensor-parallel
