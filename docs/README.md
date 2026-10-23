@@ -9,6 +9,7 @@ run the CLI or HTTP server.
 |---|---|
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
+| [한국어 안내](../README.ko.md) | this fork's two-GPU setup in Korean: build, model download, recommended command, troubleshooting |
 | [Ngram copy proposals](ngram.md) | optional copy acceleration alongside MTP, DFlash or DFlash2 at any concurrency |
 | [Two-GPU tensor parallelism](tensor-parallel-rtx5060ti.md) | this fork's `--tp 2` on two RTX 5060 Ti: recommended configuration, what changes, measurements |
 | [Basalt vs Ninfer](basalt-vs-ninfer-2x5060ti.md) | speed, accuracy, power, temperatures and memory against Basalt on the same two-GPU machine (Korean) |

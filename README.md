@@ -1,5 +1,7 @@
 # NInfer — two-GPU fork for 2x RTX 5060 Ti (`tp2-5060ti`)
 
+한국어 안내: [README.ko.md](README.ko.md)
+
 This fork runs Qwen3.8-27B on **two 16 GB GeForce RTX 5060 Ti cards without P2P**, with two-GPU tensor
 parallelism (`--tp 2 --devices 0,1`). It combines:
 

@@ -20,6 +20,7 @@ operator set the goals, approved each production change and ran the server. Ever
 >
 > 같은 PC에서 Basalt와 비교한 결과(속도, 지능, 전력, 발열, 메모리)는
 > [Basalt vs Ninfer](basalt-vs-ninfer-2x5060ti.md)에 있습니다.
+> 빌드부터 실행, 문제 해결까지 한국어 안내는 [README.ko.md](../README.ko.md)에 있습니다.
 
 ## Recommended configuration
 
