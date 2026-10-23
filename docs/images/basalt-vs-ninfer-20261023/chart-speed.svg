@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 696 350" width="696" height="350" role="img" aria-label="속도 (높을수록 좋음, 3회 중앙값)">
+<style>
+.bg{fill:#fcfcfb}.t{fill:#0b0b0b}.m{fill:#52514e}.g{stroke:#e4e3df}.ax{stroke:#a9a8a2}
+.s0{fill:#2a78d6}.s1{fill:#eb6834}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t{fill:#f0efec}.m{fill:#c3c2b7}.g{stroke:#2e2e2c}
+.ax{stroke:#5f5e59}.s0{fill:#3987e5}.s1{fill:#d95926}}
+text{font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif}
+</style>
+<rect class="bg" width="696" height="350" rx="8"/>
+<text class="t" x="16" y="26" font-size="16" font-weight="600">속도 (높을수록 좋음, 3회 중앙값)</text>
+<rect class="s0" x="506" y="15" width="12" height="12" rx="3"/>
+<text class="t" x="524" y="26" font-size="13">Basalt</text>
+<rect class="s1" x="596" y="15" width="12" height="12" rx="3"/>
+<text class="t" x="614" y="26" font-size="13">Ninfer</text>
+<text class="t" x="48" y="46" font-size="13" font-weight="600">프리필<tspan class="m" font-weight="400"> (tok/s)</tspan></text>
+<line class="g" x1="48" x2="348" y1="294.0" y2="294.0"/>
+<text class="m" x="42" y="298.0" font-size="11" text-anchor="end">0</text>
+<line class="g" x1="48" x2="348" y1="236.5" y2="236.5"/>
+<text class="m" x="42" y="240.5" font-size="11" text-anchor="end">2000</text>
+<line class="g" x1="48" x2="348" y1="179.0" y2="179.0"/>
+<text class="m" x="42" y="183.0" font-size="11" text-anchor="end">4000</text>
+<line class="g" x1="48" x2="348" y1="121.5" y2="121.5"/>
+<text class="m" x="42" y="125.5" font-size="11" text-anchor="end">6000</text>
+<line class="g" x1="48" x2="348" y1="64.0" y2="64.0"/>
+<text class="m" x="42" y="68.0" font-size="11" text-anchor="end">8000</text>
+<path class="s0" d="M153.0,294 V228.56875 Q153.0,224.56875 157.0,224.56875 H193.0 Q197.0,224.56875 197.0,228.56875 V294 Z"><title>Basalt · 10K 토큰 입력: 2415 tok/s</title></path>
+<text class="t" x="175.0" y="219.6" font-size="11" text-anchor="middle">2415</text>
+<path class="s1" d="M199.0,294 V96.56025 Q199.0,92.56025 203.0,92.56025 H239.0 Q243.0,92.56025 243.0,96.56025 V294 Z"><title>Ninfer · 10K 토큰 입력: 7007 tok/s</title></path>
+<text class="t" x="221.0" y="87.6" font-size="11" text-anchor="middle">7007</text>
+<text class="m" x="198.0" y="312" font-size="12" text-anchor="middle">10K 토큰 입력</text>
+<line class="ax" x1="48" x2="348" y1="294" y2="294"/>
+<text class="t" x="372" y="46" font-size="13" font-weight="600">디코드<tspan class="m" font-weight="400"> (tok/s)</tspan></text>
+<line class="g" x1="372" x2="672" y1="294.0" y2="294.0"/>
+<text class="m" x="366" y="298.0" font-size="11" text-anchor="end">0</text>
+<line class="g" x1="372" x2="672" y1="236.5" y2="236.5"/>
+<text class="m" x="366" y="240.5" font-size="11" text-anchor="end">50</text>
+<line class="g" x1="372" x2="672" y1="179.0" y2="179.0"/>
+<text class="m" x="366" y="183.0" font-size="11" text-anchor="end">100</text>
+<line class="g" x1="372" x2="672" y1="121.5" y2="121.5"/>
+<text class="m" x="366" y="125.5" font-size="11" text-anchor="end">150</text>
+<line class="g" x1="372" x2="672" y1="64.0" y2="64.0"/>
+<text class="m" x="366" y="68.0" font-size="11" text-anchor="end">200</text>
+<path class="s0" d="M402.0,294 V163.565 Q402.0,159.565 406.0,159.565 H442.0 Q446.0,159.565 446.0,163.565 V294 Z"><title>Basalt · 코드: 117 tok/s</title></path>
+<text class="t" x="424.0" y="154.6" font-size="11" text-anchor="middle">117</text>
+<path class="s1" d="M448.0,294 V136.42499999999998 Q448.0,132.42499999999998 452.0,132.42499999999998 H488.0 Q492.0,132.42499999999998 492.0,136.42499999999998 V294 Z"><title>Ninfer · 코드: 140 tok/s</title></path>
+<text class="t" x="470.0" y="127.4" font-size="11" text-anchor="middle">140</text>
+<text class="m" x="447.0" y="312" font-size="12" text-anchor="middle">코드</text>
+<path class="s0" d="M552.0,294 V193.005 Q552.0,189.005 556.0,189.005 H592.0 Q596.0,189.005 596.0,193.005 V294 Z"><title>Basalt · 한국어: 91 tok/s</title></path>
+<text class="t" x="574.0" y="184.0" font-size="11" text-anchor="middle">91</text>
+<path class="s1" d="M598.0,294 V203.01 Q598.0,199.01 602.0,199.01 H638.0 Q642.0,199.01 642.0,203.01 V294 Z"><title>Ninfer · 한국어: 83 tok/s</title></path>
+<text class="t" x="620.0" y="194.0" font-size="11" text-anchor="middle">83</text>
+<text class="m" x="597.0" y="312" font-size="12" text-anchor="middle">한국어</text>
+<line class="ax" x1="372" x2="672" y1="294" y2="294"/>
+</svg>

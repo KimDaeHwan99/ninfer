@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 696 350" width="696" height="350" role="img" aria-label="발열과 메모리 (측정 구간 최대값)">
+<style>
+.bg{fill:#fcfcfb}.t{fill:#0b0b0b}.m{fill:#52514e}.g{stroke:#e4e3df}.ax{stroke:#a9a8a2}
+.s0{fill:#2a78d6}.s1{fill:#eb6834}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t{fill:#f0efec}.m{fill:#c3c2b7}.g{stroke:#2e2e2c}
+.ax{stroke:#5f5e59}.s0{fill:#3987e5}.s1{fill:#d95926}}
+text{font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif}
+</style>
+<rect class="bg" width="696" height="350" rx="8"/>
+<text class="t" x="16" y="26" font-size="16" font-weight="600">발열과 메모리 (측정 구간 최대값)</text>
+<rect class="s0" x="506" y="15" width="12" height="12" rx="3"/>
+<text class="t" x="524" y="26" font-size="13">Basalt</text>
+<rect class="s1" x="596" y="15" width="12" height="12" rx="3"/>
+<text class="t" x="614" y="26" font-size="13">Ninfer</text>
+<text class="t" x="48" y="46" font-size="13" font-weight="600">온도<tspan class="m" font-weight="400"> (°C)</tspan></text>
+<line class="g" x1="48" x2="348" y1="294.0" y2="294.0"/>
+<text class="m" x="42" y="298.0" font-size="11" text-anchor="end">0</text>
+<line class="g" x1="48" x2="348" y1="236.5" y2="236.5"/>
+<text class="m" x="42" y="240.5" font-size="11" text-anchor="end">25</text>
+<line class="g" x1="48" x2="348" y1="179.0" y2="179.0"/>
+<text class="m" x="42" y="183.0" font-size="11" text-anchor="end">50</text>
+<line class="g" x1="48" x2="348" y1="121.5" y2="121.5"/>
+<text class="m" x="42" y="125.5" font-size="11" text-anchor="end">75</text>
+<line class="g" x1="48" x2="348" y1="64.0" y2="64.0"/>
+<text class="m" x="42" y="68.0" font-size="11" text-anchor="end">100</text>
+<path class="s0" d="M60.5,294 V139.3 Q60.5,135.3 64.5,135.3 H80.5 Q84.5,135.3 84.5,139.3 V294 Z"><title>Basalt · GPU0: 69.0 °C</title></path>
+<text class="t" x="72.5" y="130.3" font-size="11" text-anchor="middle">69.0</text>
+<path class="s1" d="M86.5,294 V130.1 Q86.5,126.1 90.5,126.1 H106.5 Q110.5,126.1 110.5,130.1 V294 Z"><title>Ninfer · GPU0: 73.0 °C</title></path>
+<text class="t" x="98.5" y="121.1" font-size="11" text-anchor="middle">73.0</text>
+<text class="m" x="85.5" y="312" font-size="12" text-anchor="middle">GPU0</text>
+<path class="s0" d="M135.5,294 V153.1 Q135.5,149.1 139.5,149.1 H155.5 Q159.5,149.1 159.5,153.1 V294 Z"><title>Basalt · GPU1: 63.0 °C</title></path>
+<text class="t" x="147.5" y="144.1" font-size="11" text-anchor="middle">63.0</text>
+<path class="s1" d="M161.5,294 V146.2 Q161.5,142.2 165.5,142.2 H181.5 Q185.5,142.2 185.5,146.2 V294 Z"><title>Ninfer · GPU1: 66.0 °C</title></path>
+<text class="t" x="173.5" y="137.2" font-size="11" text-anchor="middle">66.0</text>
+<text class="m" x="160.5" y="312" font-size="12" text-anchor="middle">GPU1</text>
+<path class="s0" d="M210.5,294 V93.01250000000002 Q210.5,89.01250000000002 214.5,89.01250000000002 H230.5 Q234.5,89.01250000000002 234.5,93.01250000000002 V294 Z"><title>Basalt · CPU: 89.1 °C</title></path>
+<text class="t" x="222.5" y="84.0" font-size="11" text-anchor="middle">89.1</text>
+<path class="s1" d="M236.5,294 V137.575 Q236.5,133.575 240.5,133.575 H256.5 Q260.5,133.575 260.5,137.575 V294 Z"><title>Ninfer · CPU: 69.8 °C</title></path>
+<text class="t" x="248.5" y="128.6" font-size="11" text-anchor="middle">69.8</text>
+<text class="m" x="235.5" y="312" font-size="12" text-anchor="middle">CPU</text>
+<path class="s0" d="M285.5,294 V178.97500000000002 Q285.5,174.97500000000002 289.5,174.97500000000002 H305.5 Q309.5,174.97500000000002 309.5,178.97500000000002 V294 Z"><title>Basalt · DDR5: 51.8 °C</title></path>
+<text class="t" x="297.5" y="170.0" font-size="11" text-anchor="middle">51.8</text>
+<path class="s1" d="M311.5,294 V182.425 Q311.5,178.425 315.5,178.425 H331.5 Q335.5,178.425 335.5,182.425 V294 Z"><title>Ninfer · DDR5: 50.2 °C</title></path>
+<text class="t" x="323.5" y="173.4" font-size="11" text-anchor="middle">50.2</text>
+<text class="m" x="310.5" y="312" font-size="12" text-anchor="middle">DDR5</text>
+<line class="ax" x1="48" x2="348" y1="294" y2="294"/>
+<text class="t" x="372" y="46" font-size="13" font-weight="600">메모리<tspan class="m" font-weight="400"> (GiB)</tspan></text>
+<line class="g" x1="372" x2="672" y1="294.0" y2="294.0"/>
+<text class="m" x="366" y="298.0" font-size="11" text-anchor="end">0</text>
+<line class="g" x1="372" x2="672" y1="236.5" y2="236.5"/>
+<text class="m" x="366" y="240.5" font-size="11" text-anchor="end">20</text>
+<line class="g" x1="372" x2="672" y1="179.0" y2="179.0"/>
+<text class="m" x="366" y="183.0" font-size="11" text-anchor="end">40</text>
+<line class="g" x1="372" x2="672" y1="121.5" y2="121.5"/>
+<text class="m" x="366" y="125.5" font-size="11" text-anchor="end">60</text>
+<line class="g" x1="372" x2="672" y1="64.0" y2="64.0"/>
+<text class="m" x="366" y="68.0" font-size="11" text-anchor="end">80</text>
+<path class="s0" d="M402.0,294 V210.7139892578125 Q402.0,206.7139892578125 406.0,206.7139892578125 H442.0 Q446.0,206.7139892578125 446.0,210.7139892578125 V294 Z"><title>Basalt · VRAM 합계: 30.4 GiB</title></path>
+<text class="t" x="424.0" y="201.7" font-size="11" text-anchor="middle">30.4</text>
+<path class="s1" d="M448.0,294 V211.7724609375 Q448.0,207.7724609375 452.0,207.7724609375 H488.0 Q492.0,207.7724609375 492.0,211.7724609375 V294 Z"><title>Ninfer · VRAM 합계: 30.0 GiB</title></path>
+<text class="t" x="470.0" y="202.8" font-size="11" text-anchor="middle">30.0</text>
+<text class="m" x="447.0" y="312" font-size="12" text-anchor="middle">VRAM 합계</text>
+<path class="s0" d="M552.0,294 V178.22750000000002 Q552.0,174.22750000000002 556.0,174.22750000000002 H592.0 Q596.0,174.22750000000002 596.0,178.22750000000002 V294 Z"><title>Basalt · 시스템 RAM: 41.7 GiB</title></path>
+<text class="t" x="574.0" y="169.2" font-size="11" text-anchor="middle">41.7</text>
+<path class="s1" d="M598.0,294 V223.73875 Q598.0,219.73875 602.0,219.73875 H638.0 Q642.0,219.73875 642.0,223.73875 V294 Z"><title>Ninfer · 시스템 RAM: 25.8 GiB</title></path>
+<text class="t" x="620.0" y="214.7" font-size="11" text-anchor="middle">25.8</text>
+<text class="m" x="597.0" y="312" font-size="12" text-anchor="middle">시스템 RAM</text>
+<line class="ax" x1="372" x2="672" y1="294" y2="294"/>
+</svg>

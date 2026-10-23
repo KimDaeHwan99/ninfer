@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 696 350" width="696" height="350" role="img" aria-label="전력과 효율 (GPU 2장 합계)">
+<style>
+.bg{fill:#fcfcfb}.t{fill:#0b0b0b}.m{fill:#52514e}.g{stroke:#e4e3df}.ax{stroke:#a9a8a2}
+.s0{fill:#2a78d6}.s1{fill:#eb6834}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t{fill:#f0efec}.m{fill:#c3c2b7}.g{stroke:#2e2e2c}
+.ax{stroke:#5f5e59}.s0{fill:#3987e5}.s1{fill:#d95926}}
+text{font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif}
+</style>
+<rect class="bg" width="696" height="350" rx="8"/>
+<text class="t" x="16" y="26" font-size="16" font-weight="600">전력과 효율 (GPU 2장 합계)</text>
+<rect class="s0" x="506" y="15" width="12" height="12" rx="3"/>
+<text class="t" x="524" y="26" font-size="13">Basalt</text>
+<rect class="s1" x="596" y="15" width="12" height="12" rx="3"/>
+<text class="t" x="614" y="26" font-size="13">Ninfer</text>
+<text class="t" x="48" y="46" font-size="13" font-weight="600">평균 전력<tspan class="m" font-weight="400"> (W)</tspan></text>
+<line class="g" x1="48" x2="348" y1="294.0" y2="294.0"/>
+<text class="m" x="42" y="298.0" font-size="11" text-anchor="end">0</text>
+<line class="g" x1="48" x2="348" y1="236.5" y2="236.5"/>
+<text class="m" x="42" y="240.5" font-size="11" text-anchor="end">100</text>
+<line class="g" x1="48" x2="348" y1="179.0" y2="179.0"/>
+<text class="m" x="42" y="183.0" font-size="11" text-anchor="end">200</text>
+<line class="g" x1="48" x2="348" y1="121.5" y2="121.5"/>
+<text class="m" x="42" y="125.5" font-size="11" text-anchor="end">300</text>
+<line class="g" x1="48" x2="348" y1="64.0" y2="64.0"/>
+<text class="m" x="42" y="68.0" font-size="11" text-anchor="end">400</text>
+<path class="s0" d="M65.0,294 V292.11957083333334 Q65.0,288.11957083333334 69.0,288.11957083333334 H93.0 Q97.0,288.11957083333334 97.0,292.11957083333334 V294 Z"><title>Basalt · 대기: 10 W</title></path>
+<text class="t" x="81.0" y="283.1" font-size="11" text-anchor="middle">10</text>
+<path class="s1" d="M99.0,294 V285.89270416666665 Q99.0,281.89270416666665 103.0,281.89270416666665 H127.0 Q131.0,281.89270416666665 131.0,285.89270416666665 V294 Z"><title>Ninfer · 대기: 21 W</title></path>
+<text class="t" x="115.0" y="276.9" font-size="11" text-anchor="middle">21</text>
+<text class="m" x="98.0" y="312" font-size="12" text-anchor="middle">대기</text>
+<path class="s0" d="M165.0,294 V210.78116359060402 Q165.0,206.78116359060402 169.0,206.78116359060402 H193.0 Q197.0,206.78116359060402 197.0,210.78116359060402 V294 Z"><title>Basalt · 속도 측정: 152 W</title></path>
+<text class="t" x="181.0" y="201.8" font-size="11" text-anchor="middle">152</text>
+<path class="s1" d="M199.0,294 V159.82297508591066 Q199.0,155.82297508591066 203.0,155.82297508591066 H227.0 Q231.0,155.82297508591066 231.0,159.82297508591066 V294 Z"><title>Ninfer · 속도 측정: 240 W</title></path>
+<text class="t" x="215.0" y="150.8" font-size="11" text-anchor="middle">240</text>
+<text class="m" x="198.0" y="312" font-size="12" text-anchor="middle">속도 측정</text>
+<path class="s0" d="M265.0,294 V217.75462201751736 Q265.0,213.75462201751736 269.0,213.75462201751736 H293.0 Q297.0,213.75462201751736 297.0,217.75462201751736 V294 Z"><title>Basalt · 평가 4동시: 140 W</title></path>
+<text class="t" x="281.0" y="208.8" font-size="11" text-anchor="middle">140</text>
+<path class="s1" d="M299.0,294 V171.20122415254238 Q299.0,167.20122415254238 303.0,167.20122415254238 H327.0 Q331.0,167.20122415254238 331.0,171.20122415254238 V294 Z"><title>Ninfer · 평가 4동시: 221 W</title></path>
+<text class="t" x="315.0" y="162.2" font-size="11" text-anchor="middle">221</text>
+<text class="m" x="298.0" y="312" font-size="12" text-anchor="middle">평가 4동시</text>
+<line class="ax" x1="48" x2="348" y1="294" y2="294"/>
+<text class="t" x="372" y="46" font-size="13" font-weight="600">전력 효율<tspan class="m" font-weight="400"> (tok/Wh)</tspan></text>
+<line class="g" x1="372" x2="672" y1="294.0" y2="294.0"/>
+<text class="m" x="366" y="298.0" font-size="11" text-anchor="end">0</text>
+<line class="g" x1="372" x2="672" y1="236.5" y2="236.5"/>
+<text class="m" x="366" y="240.5" font-size="11" text-anchor="end">2000</text>
+<line class="g" x1="372" x2="672" y1="179.0" y2="179.0"/>
+<text class="m" x="366" y="183.0" font-size="11" text-anchor="end">4000</text>
+<line class="g" x1="372" x2="672" y1="121.5" y2="121.5"/>
+<text class="m" x="366" y="125.5" font-size="11" text-anchor="end">6000</text>
+<line class="g" x1="372" x2="672" y1="64.0" y2="64.0"/>
+<text class="m" x="366" y="68.0" font-size="11" text-anchor="end">8000</text>
+<path class="s0" d="M477.0,294 V222.74691381563233 Q477.0,218.74691381563233 481.0,218.74691381563233 H517.0 Q521.0,218.74691381563233 521.0,222.74691381563233 V294 Z"><title>Basalt · 평가 생성 토큰: 2617 tok/Wh</title></path>
+<text class="t" x="499.0" y="213.7" font-size="11" text-anchor="middle">2617</text>
+<path class="s1" d="M523.0,294 V139.81050580305055 Q523.0,135.81050580305055 527.0,135.81050580305055 H563.0 Q567.0,135.81050580305055 567.0,139.81050580305055 V294 Z"><title>Ninfer · 평가 생성 토큰: 5502 tok/Wh</title></path>
+<text class="t" x="545.0" y="130.8" font-size="11" text-anchor="middle">5502</text>
+<text class="m" x="522.0" y="312" font-size="12" text-anchor="middle">평가 생성 토큰</text>
+<line class="ax" x1="372" x2="672" y1="294" y2="294"/>
+</svg>

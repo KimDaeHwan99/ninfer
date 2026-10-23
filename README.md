@@ -6,26 +6,21 @@ parallelism (`--tp 2 --devices 0,1`). It combines:
 - [Neroued/ninfer](https://github.com/Neroued/ninfer) at `d44ab584` (the engine);
 - this fork's two-GPU layer: split weights and collectives over a pinned-host mailbox, NVFP4/FP8 rank
   shards, Vision, the hybrid prefix cache, ngram copy drafting and DFlash2 at `--tp 2`;
-- [Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom), merged whole, with five
-  additional fixes cherry-picked on 2026-10-23; its inherited notes below describe that fork's
-  single-GPU setup, not this branch's current TP2 recommendation;
+- [Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom), merged whole, with its later
+  fixes cherry-picked; its inherited notes below describe that fork's single-GPU setup, not this branch's
+  TP2 recommendation;
 - ideas and the shard-compilation technique of [ValerioDolci/ninfer-tp2](https://github.com/ValerioDolci/ninfer-tp2).
 
 Everything this fork adds was written by **Claude Opus 5.5** in Claude Code; a human operator set the
-goals, approved production changes and ran the server. Usage, the recommended configuration and every
-measurement: [Two-GPU tensor parallelism on RTX 5060 Ti](docs/tensor-parallel-rtx5060ti.md).
+goals, approved production changes and ran the server. Usage, the recommended configuration, what the
+branch changes and every measurement: [Two-GPU tensor parallelism on RTX 5060 Ti](docs/tensor-parallel-rtx5060ti.md).
 
-Historical production numbers on that machine (2026-10-03 measurement through the router; QUASAR-QAT
-all-NVFP4 artifact, MTP with 4 drafts + ngram copy drafting, hybrid prefix cache, 4 concurrent
-requests, Vision on): greedy code 117-120 tok/s, Korean 76-78 tok/s, sampled essay 89 tok/s,
-rewriting a source file 379 tok/s, four parallel requests 300 tok/s aggregate, first token
-0.05-0.10 s for a short prompt, 2.4 / 5.2 s for 16K / 31K-token prompts and 0.055 s when a cached
-conversation resumes, 223K KV tokens; GSM8K 98/100 and MMLU-Pro 174/210. These numbers were
-measured with the token embedding in VRAM (`--embedding-offload off`). At `--tp 2`, the build now
-keeps it in pinned system RAM by default. On 2026-10-23, the QUASAR configuration with fp8 KV and
-Vision held 284,416 KV tokens at the default 1 GiB headroom and 315,008 at the recommended
-`--vram-headroom-mib 512`. Offload speed was not separately A/B tested; see the guide for the
-2026-10-22/23 measurements and the current Basalt production deployment.
+Measured on 2026-10-23 with the recommended configuration (QUASAR-QAT all-NVFP4 artifact, MTP with four
+drafts and n-gram copy drafting, fp8 KV, Vision, four concurrent requests): a 10K-token prompt at
+7,007 tok/s (first token 1.46 s), code 128-144 tok/s and Korean 80-84 tok/s, 337 tok/s aggregate over
+four requests, 315,008 KV tokens; GSM8K 97/100, MMLU-Pro 121/140, HumanEval 78/82 and KMMLU 76/100.
+The same machine's comparison with [Basalt](https://github.com/jesdga95/basalt), including power,
+temperatures and memory: [Basalt vs Ninfer](docs/basalt-vs-ninfer-2x5060ti.md) (Korean).
 
 ---
 

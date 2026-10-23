@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 696 350" width="696" height="350" role="img" aria-label="지능 (정답률 %, 높을수록 좋음)">
+<style>
+.bg{fill:#fcfcfb}.t{fill:#0b0b0b}.m{fill:#52514e}.g{stroke:#e4e3df}.ax{stroke:#a9a8a2}
+.s0{fill:#2a78d6}.s1{fill:#eb6834}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t{fill:#f0efec}.m{fill:#c3c2b7}.g{stroke:#2e2e2c}
+.ax{stroke:#5f5e59}.s0{fill:#3987e5}.s1{fill:#d95926}}
+text{font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif}
+</style>
+<rect class="bg" width="696" height="350" rx="8"/>
+<text class="t" x="16" y="26" font-size="16" font-weight="600">지능 (정답률 %, 높을수록 좋음)</text>
+<rect class="s0" x="506" y="15" width="12" height="12" rx="3"/>
+<text class="t" x="524" y="26" font-size="13">Basalt</text>
+<rect class="s1" x="596" y="15" width="12" height="12" rx="3"/>
+<text class="t" x="614" y="26" font-size="13">Ninfer</text>
+<text class="t" x="48" y="46" font-size="13" font-weight="600">공개 벤치마크<tspan class="m" font-weight="400"> (%)</tspan></text>
+<line class="g" x1="48" x2="348" y1="294.0" y2="294.0"/>
+<text class="m" x="42" y="298.0" font-size="11" text-anchor="end">0</text>
+<line class="g" x1="48" x2="348" y1="236.5" y2="236.5"/>
+<text class="m" x="42" y="240.5" font-size="11" text-anchor="end">50</text>
+<line class="g" x1="48" x2="348" y1="179.0" y2="179.0"/>
+<text class="m" x="42" y="183.0" font-size="11" text-anchor="end">100</text>
+<line class="g" x1="48" x2="348" y1="121.5" y2="121.5"/>
+<text class="m" x="42" y="125.5" font-size="11" text-anchor="end">150</text>
+<line class="g" x1="48" x2="348" y1="64.0" y2="64.0"/>
+<text class="m" x="42" y="68.0" font-size="11" text-anchor="end">200</text>
+<path class="s0" d="M60.5,294 V187.60000000000002 Q60.5,183.60000000000002 64.5,183.60000000000002 H80.5 Q84.5,183.60000000000002 84.5,187.60000000000002 V294 Z"><title>Basalt · GSM8K: 96 %</title></path>
+<text class="t" x="72.5" y="178.6" font-size="11" text-anchor="middle">96</text>
+<path class="s1" d="M86.5,294 V186.45 Q86.5,182.45 90.5,182.45 H106.5 Q110.5,182.45 110.5,186.45 V294 Z"><title>Ninfer · GSM8K: 97 %</title></path>
+<text class="t" x="98.5" y="177.4" font-size="11" text-anchor="middle">97</text>
+<text class="m" x="85.5" y="312" font-size="12" text-anchor="middle">GSM8K</text>
+<path class="s0" d="M135.5,294 V201.07142857142856 Q135.5,197.07142857142856 139.5,197.07142857142856 H155.5 Q159.5,197.07142857142856 159.5,201.07142857142856 V294 Z"><title>Basalt · MMLU-Pro: 84 %</title></path>
+<text class="t" x="147.5" y="192.1" font-size="11" text-anchor="middle">84</text>
+<path class="s1" d="M161.5,294 V198.60714285714283 Q161.5,194.60714285714283 165.5,194.60714285714283 H181.5 Q185.5,194.60714285714283 185.5,198.60714285714283 V294 Z"><title>Ninfer · MMLU-Pro: 86 %</title></path>
+<text class="t" x="173.5" y="189.6" font-size="11" text-anchor="middle">86</text>
+<text class="m" x="160.5" y="312" font-size="12" text-anchor="middle">MMLU-Pro</text>
+<path class="s0" d="M210.5,294 V185.8048780487805 Q210.5,181.8048780487805 214.5,181.8048780487805 H230.5 Q234.5,181.8048780487805 234.5,185.8048780487805 V294 Z"><title>Basalt · HumanEval: 98 %</title></path>
+<text class="t" x="222.5" y="176.8" font-size="11" text-anchor="middle">98</text>
+<path class="s1" d="M236.5,294 V188.60975609756096 Q236.5,184.60975609756096 240.5,184.60975609756096 H256.5 Q260.5,184.60975609756096 260.5,188.60975609756096 V294 Z"><title>Ninfer · HumanEval: 95 %</title></path>
+<text class="t" x="248.5" y="179.6" font-size="11" text-anchor="middle">95</text>
+<text class="m" x="235.5" y="312" font-size="12" text-anchor="middle">HumanEval</text>
+<path class="s0" d="M285.5,294 V207.14999999999998 Q285.5,203.14999999999998 289.5,203.14999999999998 H305.5 Q309.5,203.14999999999998 309.5,207.14999999999998 V294 Z"><title>Basalt · KMMLU: 79 %</title></path>
+<text class="t" x="297.5" y="198.1" font-size="11" text-anchor="middle">79</text>
+<path class="s1" d="M311.5,294 V210.6 Q311.5,206.6 315.5,206.6 H331.5 Q335.5,206.6 335.5,210.6 V294 Z"><title>Ninfer · KMMLU: 76 %</title></path>
+<text class="t" x="323.5" y="201.6" font-size="11" text-anchor="middle">76</text>
+<text class="m" x="310.5" y="312" font-size="12" text-anchor="middle">KMMLU</text>
+<line class="ax" x1="48" x2="348" y1="294" y2="294"/>
+<text class="t" x="372" y="46" font-size="13" font-weight="600">자체 점검<tspan class="m" font-weight="400"> (%)</tspan></text>
+<line class="g" x1="372" x2="672" y1="294.0" y2="294.0"/>
+<text class="m" x="366" y="298.0" font-size="11" text-anchor="end">0</text>
+<line class="g" x1="372" x2="672" y1="236.5" y2="236.5"/>
+<text class="m" x="366" y="240.5" font-size="11" text-anchor="end">50</text>
+<line class="g" x1="372" x2="672" y1="179.0" y2="179.0"/>
+<text class="m" x="366" y="183.0" font-size="11" text-anchor="end">100</text>
+<line class="g" x1="372" x2="672" y1="121.5" y2="121.5"/>
+<text class="m" x="366" y="125.5" font-size="11" text-anchor="end">150</text>
+<line class="g" x1="372" x2="672" y1="64.0" y2="64.0"/>
+<text class="m" x="366" y="68.0" font-size="11" text-anchor="end">200</text>
+<path class="s0" d="M402.0,294 V183.0 Q402.0,179.0 406.0,179.0 H442.0 Q446.0,179.0 446.0,183.0 V294 Z"><title>Basalt · 40문항: 100 %</title></path>
+<text class="t" x="424.0" y="174.0" font-size="11" text-anchor="middle">100</text>
+<path class="s1" d="M448.0,294 V188.75 Q448.0,184.75 452.0,184.75 H488.0 Q492.0,184.75 492.0,188.75 V294 Z"><title>Ninfer · 40문항: 95 %</title></path>
+<text class="t" x="470.0" y="179.8" font-size="11" text-anchor="middle">95</text>
+<text class="m" x="447.0" y="312" font-size="12" text-anchor="middle">40문항</text>
+<path class="s0" d="M552.0,294 V183.0 Q552.0,179.0 556.0,179.0 H592.0 Q596.0,179.0 596.0,183.0 V294 Z"><title>Basalt · 도구 호출: 100 %</title></path>
+<text class="t" x="574.0" y="174.0" font-size="11" text-anchor="middle">100</text>
+<path class="s1" d="M598.0,294 V183.0 Q598.0,179.0 602.0,179.0 H638.0 Q642.0,179.0 642.0,183.0 V294 Z"><title>Ninfer · 도구 호출: 100 %</title></path>
+<text class="t" x="620.0" y="174.0" font-size="11" text-anchor="middle">100</text>
+<text class="m" x="597.0" y="312" font-size="12" text-anchor="middle">도구 호출</text>
+<line class="ax" x1="372" x2="672" y1="294" y2="294"/>
+</svg>
