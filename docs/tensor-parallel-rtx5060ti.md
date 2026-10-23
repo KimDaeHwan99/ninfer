@@ -18,12 +18,11 @@ operator set the goals, approved each production change and ran the server. Ever
 > 아티팩트 172)로 같은 수준입니다. 아래 "2026-10-03 update"에 측정과 근거가 있고, 그 아래 절들은
 > 공식 아티팩트 시절의 기록입니다.
 >
-> 그 뒤 `--tp 2`에서는 토큰 임베딩을 VRAM 대신 pinned 시스템 RAM에 두는 것이 기본값이 되었습니다
-> (`--embedding-offload`). 카드당 1.185 GiB를 비워 KV 풀이 약 7만 토큰 늘어날 것으로 계산되지만 아직
-> 실측 전입니다. 위 측정은 임베딩이 VRAM에 있던 상태이며 `--embedding-offload off`로 재현합니다.
-> 또 TP 링크의 장치 버퍼(카드당 240 → 180 MiB)가 이제 KV 계획 안에 잡혀, 더 이상 1 GiB 헤드룸을
-> 차지하지 않습니다. 같은 헤드룸에서 KV 풀은 그만큼(약 1.1만 토큰) 작아집니다(미측정).
-
+> 2026-10-23 갱신: `--tp 2`에서는 토큰 임베딩을 pinned 시스템 RAM에 두는 것이 기본값입니다
+> (`--embedding-offload`, `off`로 이전 배치). 현재 권장 명령(QUASAR, fp8 KV, Vision)의 KV 풀은 실측
+> 기본 여유 1 GiB에서 284,416 토큰, `--vram-headroom-mib 512`에서 315,008 토큰(+10.8 %)입니다
+> (아래 "Tuning `--vram-headroom-mib`"). 같은 날 Wallawalla47 수정 5개를 반영했고 속도·품질은
+> 그대로였습니다(아래 "2026-10-23 upstream review").
 ## 2026-10-03 update
 
 The branch now also carries
@@ -33,11 +32,11 @@ tool-call and serving fixes, CUDA Graph allowance from measurement) and two-GPU 
 features and more artifacts run at `--tp 2`. Ideas and one technique (compiling the parent kernels a
 second time for a shard) come from [ValerioDolci/ninfer-tp2](https://github.com/ValerioDolci/ninfer-tp2).
 
-Recommended serving configuration (production since 2026-10-03):
+Recommended NInfer serving configuration (updated 2026-10-23; production now uses Basalt):
 
 ```bash
 hf download Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer qwen3_8_27b_quasar_nvfp4.ninfer --local-dir models
-ninfer-serve models/qwen3_8_27b_quasar_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
+./build/apps/ninfer-serve models/qwen3_8_27b_quasar_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --tp 2 --devices 0,1 --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
   --max-concurrency 4 --host-cache-mib 16384 --default-thinking-budget 2048 \
   --prefill-chunk 8192 --spec mtp --draft-tokens 4 --lm-head-draft \
@@ -45,10 +44,11 @@ ninfer-serve models/qwen3_8_27b_quasar_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
 ```
 
 `--vram-headroom-mib 512` was measured on 2026-10-23 (see [Tuning](#tuning---vram-headroom-mib)); without it the
-server keeps the 1 GiB default. This command was measured with the token embedding in VRAM; the build now keeps it in system RAM
-at `--tp 2` (see [Token embedding in system RAM](#token-embedding-in-system-ram)), and
-`--embedding-offload off` restores the measured placement. Agent clients that send bursts of
-requests may also want `--pending-timeout-ms 600000`: with the default of 30 s, a request that has
+server keeps the 1 GiB default. The 2026-10-03 measurements below used the token embedding in VRAM
+and the default headroom. The 2026-10-22/23 measurements used the current default placement in
+pinned system RAM at `--tp 2` (see [Token embedding in system RAM](#token-embedding-in-system-ram)).
+`--embedding-offload off` restores the older placement, not the entire older configuration.
+Agent clients that send bursts of requests may also want `--pending-timeout-ms 600000`: with the default of 30 s, a request that has
 not started within 30 s of arriving (while waiting for one of the four lanes, for example) is
 answered with HTTP 503 `request_queue_timeout`, or HTTP 504 `timeout_error` on the Anthropic
 Messages endpoint. That flag is not part of the measured configuration.
@@ -89,19 +89,24 @@ copy in VRAM. The QUASAR artifact stores the table as FP8 rows: 248,320 × 5,120
 scale per row, 1.185 GiB per card. The embedding gather reads only the rows of the current tokens
 through the pinned block's mapped address, so the table never crosses PCIe as a whole.
 
-Expected effect, from arithmetic only; **not yet measured on the machine below**:
+Measured on 2026-10-23 with QUASAR, fp8 KV, Vision and the embedding offloaded: the KV pool holds
+284,416 tokens at the default 1 GiB headroom and 315,008 at `--vram-headroom-mib 512`
+(see [Tuning](#tuning---vram-headroom-mib)). These are current-build capacities, not an isolated
+A/B measurement of embedding offload; they also include the link-buffer accounting below.
+
+The following are estimates or implementation properties, not separately measured speed effects:
 
 | Item | Expected |
 |---|---|
-| KV pool (`--kv-capacity auto`) | about +70K tokens: 1.185 GiB at about 17.5 KB of FP8 KV per token per rank (16 attention layers plus the MTP layer, 2 KV heads each) |
+| KV pool (`--kv-capacity auto`) | about +70K tokens from freeing the embedding alone: 1.185 GiB at about 17.5 KB of FP8 KV per token per rank (16 attention layers plus the MTP layer, 2 KV heads each) |
 | Decode | each gather reads the current rows (5 KiB per token) over PCIe: a few microseconds per round of about 25-30 ms, under 0.1 % |
 | Prefill | an 8,192-token chunk gathers 42 MB twice with MTP (text and MTP inputs), a few milliseconds per chunk, well under 1 % of the first token |
 | System RAM | +1.185 GiB pinned per rank (2.37 GiB in total, since each rank pins its own copy); the loader reads the table straight into the pinned block |
 | Output | unchanged: the same kernel reads the same bytes |
 
-Measure before relying on the larger pool: the KV capacity printed at startup, greedy code and
-Korean tok/s, the 16K and 31K first token, and `ninfer-perplexity --quick` at `--tp 2`.
-`ninfer-perplexity` takes the same flag, so the PPL table above can be checked with either placement.
+Decode and prefill speed with offload on versus off were not separately A/B tested; the
+2026-10-22/23 measurements already used offload. `ninfer-perplexity` takes the same flag, so the
+PPL table in [Results](#results) can be checked with either placement.
 `--embedding-offload off` restores the VRAM table. `--embedding-offload on` also works on one GPU,
 but not together with `--vision-offload on`, whose eviction ladder borrows the device-resident
 table. An artifact whose output head shares the embedding's stored object keeps the table in VRAM
@@ -119,11 +124,13 @@ Now the link is created before that measurement, and the receive scratch is one 
 instead of a whole slot, since the receive stream combines each piece before the next one lands:
 180 MiB per card, inside the KV plan.
 
-Expected, not yet measured: the link no longer takes 240 MiB of the 1 GiB headroom, so lowering
-`--vram-headroom-mib` becomes safe to try (kernel modules CUDA loads on first use still come out of
-the headroom; see the next section), and at the same headroom the auto KV pool is about 11K tokens
-smaller than before (180 MiB at about 17.5 KB per token). At `--tp 2` the startup figures labelled
-"after weights" (the debug memory ledger and KV sizing errors) now include the link's 180 MiB.
+The link no longer takes 240 MiB of the 1 GiB headroom. Lower headroom settings were measured on
+2026-10-23; [Tuning](#tuning---vram-headroom-mib) recommends 512 MiB and reports the resulting KV
+capacities. Kernel modules CUDA loads on first use still come out of the headroom. Accounting for
+180 MiB inside the KV plan reduces capacity by an estimated 11K tokens at the same headroom
+(about 17.5 KB per token); that change was not isolated in an A/B measurement. At `--tp 2` the
+startup figures labelled "after weights" (the debug memory ledger and KV sizing errors) now
+include the link's 180 MiB.
 
 ## Tuning `--vram-headroom-mib`
 
@@ -132,7 +139,7 @@ needs depends on the build and the workload: CUDA loads kernel modules on first 
 long prompts and wide n-gram rounds touch more of them. Every 100 MiB moved from the headroom into
 the pool is about 6K KV tokens (17.5 KB per token per rank). Measure on the serving machine:
 
-1. Start the server with the production command and the default headroom.
+1. Start the server with the recommended NInfer command, replacing `--vram-headroom-mib 512` with `--vram-headroom-mib 1024` for the default-headroom baseline.
 2. From the repository, run the measurement against it:
 
    ```bash
@@ -173,16 +180,22 @@ Measured on the machine below (2026-10-23, the command above with `--vision`, bu
 | **512 (chosen)** | **315,008 tokens** | 497 MiB | - |
 
 Serving barely allocates after startup here (free memory moved by 2 MiB under the full load), so the tool recommends
-275. Eager module loading takes 10,880 tokens of KV (about 186 MiB at 17.5 KB per token): the most that lazily loaded
-kernels could still take. 275 + 186 rounded up is 512, which keeps the 256 MiB safety margin even if every kernel loads
-late, for +30,592 KV tokens (+10.8 %) over the default.
+275. Eager module loading takes 10,880 tokens of KV (about 182 MiB at 17.5 KB per token), an estimate of the memory
+that lazily loaded kernels could still take. Adding that allowance to 275 MiB and rounding up to 512 MiB is intended
+to preserve the 256 MiB safety margin, for +30,592 KV tokens (+10.8 %) over the default. The table records startup
+capacity at 512 MiB, but does not report a minimum-free-memory measurement under load at that setting.
 
 ## Results
 
-Measured on one machine: Ryzen 5 9600X, DDR5-5600 2×32 GB, 2× RTX 5060 Ti 16 GB on PCIe 5.0 x8/x8,
-driver 595.91.07, CUDA 13.1.2. The baseline is
+The historical measurements in this section used a Ryzen 5 9600X, DDR5-5600 2×32 GB,
+2× RTX 5060 Ti 16 GB on PCIe 5.0 x8/x8, driver 595.91.07 and CUDA 13.1.2. The baseline is
 [lynx-gt/ninfer-tp2-5060ti](https://github.com/lynx-gt/ninfer-tp2-5060ti) at `444558d` with the same
 model and options (int8 KV, which was its production setting).
+
+As of 2026-10-23, the same machine runs its 64 GB DDR5 at 6400 MT/s, with PBO Auto and Curve
+Optimizer -40 on the Ryzen 5 9600X, two 180 W RTX 5060 Ti 16 GB cards on PCIe 5.0 x8/x8 without
+P2P, Ubuntu 26.04.1, kernel 7.0, NVIDIA 595.91 and CUDA 13.4. The newer measurements elsewhere
+in this guide use that setup.
 
 | Metric | Baseline | This branch |
 |---|---:|---:|
@@ -194,7 +207,9 @@ model and options (int8 KV, which was its production setting).
 | First token, 59,417-token prompt | – | 12.7 s |
 
 Greedy tok/s depends on how many MTP drafts the text accepts, so the round time is the fairer
-hardware comparison. Quick-corpus perplexity at `--tp 2` (`ninfer-perplexity --quick`):
+hardware comparison. The 29.4 ms figure above is historical; the 2026-10-23 QUASAR configuration
+measured about 26.6 ms per MTP round (see [upstream review](#2026-10-23-upstream-review)).
+Quick-corpus perplexity for the historical official artifact at `--tp 2` (`ninfer-perplexity --quick`):
 
 | KV dtype | PPL |
 |---|---:|
@@ -209,15 +224,16 @@ hardware comparison. Quick-corpus perplexity at `--tp 2` (`ninfer-perplexity --q
 Requirements are those of upstream NInfer, but with two `sm_120a` GPUs (tested on RTX 5060 Ti 16 GB)
 instead of one RTX 5090. Build as usual.
 
-Use the official v3 artifact as published. No conversion is needed, and the branch was verified with
-it (SHA256 `74d2c571…bbb77d82`, same speed as the results below):
+For the historical official-artifact configuration, use the official v3 artifact as published.
+No conversion is needed, and the branch was verified with it (SHA256 `74d2c571…bbb77d82`, same speed
+as the historical [Results](#results) above):
 
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer --local-dir Qwen3.8-27B-nvfp4-NInfer
 ```
 
 An older v2 download also works after `python3 tools/upgrade_ninfer_v2_to_v3.py <v2> <v3>`. The
-results below were first measured that way.
+historical results above were first measured that way.
 
 Serving configuration of the measurements in this and the following sections. It predates the
 2026-10-03 command above, which supersedes it: it uses the original prefix cache, whose options
@@ -225,7 +241,7 @@ Serving configuration of the measurements in this and the following sections. It
 `--use-original-prefix-caching` selects that cache, and three MTP drafts.
 
 ```bash
-ninfer-serve Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
+./build/apps/ninfer-serve Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --tp 2 --devices 0,1 \
   --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
   --max-concurrency 4 --use-original-prefix-caching \
@@ -249,7 +265,7 @@ ninfer-serve Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --
 
 ### Concurrency
 
-Sampled 800-token essays sent in parallel to the recommended configuration:
+Sampled 800-token essays sent in parallel to the historical official-artifact configuration in [Usage](#usage):
 
 | Parallel requests | Aggregate output |
 |---:|---:|
@@ -282,10 +298,11 @@ small single-sample sets, so differences of one or two items are within sampling
 
 `--tp 2` accepts `--vision`. The Vision encoder is not split: both GPUs hold a full copy
 (+0.3 GiB each) and encode the same media, so each rank's replicated hidden state stays identical
-without a cross-GPU transfer. On 16 GB cards the copy and the Vision workspace leave room for
-`--max-context 98304` and an auto KV pool of 114,176 tokens, compared with 131,072 and 140,608 without
-Vision. With 131,072 the minimum runtime reservation no longer fits. These limits are for the official
-artifact; the all-NVFP4 QUASAR artifact (8.85 GiB of weights per card with the embedding in VRAM,
+without a cross-GPU transfer. In the historical official-artifact configuration with embeddings in
+VRAM, the copy and the Vision workspace left room for `--max-context 98304` and an auto KV pool of
+114,176 tokens, compared with 131,072 and 140,608 without Vision. With 131,072 the minimum runtime
+reservation did not fit. These are not current limits with embedding offload enabled. The
+all-NVFP4 QUASAR artifact (8.85 GiB of weights per card with the embedding in VRAM,
 about 7.67 GiB with the default `--embedding-offload`) runs `--vision` at `--max-context 131072`,
 as in the 2026-10-03 command.
 
@@ -320,8 +337,10 @@ byte-identical, because the second run reuses cached media and prefix state.
 
 ## Hardware fit audit
 
-The serving options started from the baseline project's production command. Each was rechecked
-against this machine (36-SM GPUs, 16 GB each, 64 GB host) instead of being copied:
+This historical audit used the official artifact with embeddings in VRAM and the original prefix
+cache. The serving options started from the baseline project's production command. Each was
+rechecked against this machine (36-SM GPUs, 16 GB each, 64 GB host) instead of being copied.
+"Now" in the table refers to that configuration, not the current QUASAR recommendation:
 
 | Item | Before | Now | Evidence |
 |---|---|---|---|
@@ -347,12 +366,13 @@ Checked and left as is:
 
 ## Comparison with Strata and Swift 1.5 Qwen3.8-Flash-Next
 
-Same machine and prompts. [Strata](https://github.com/Niko1221/Strata) v0.1.32 serves
+Historical comparison on the same machine and prompts. [Strata](https://github.com/Niko1221/Strata) v0.1.32 served
 [Swift 1.5 Qwen3.8-Flash-Next GSQ-RCO](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 (125B MoE, 6B active). It splits layers across both GPUs, keeps experts in RAM and uses int8 KV and
 MTP. It fills both GPUs (15.5 GB each) and 40-46 GB of RAM, so it cannot run beside ninfer. Strata
 was tuned with its own calibration (`tools/calibrate.py`). Both servers used a 2048-token thinking
-budget; ninfer used the recommended configuration above.
+budget; ninfer used the historical official-artifact configuration in [Usage](#usage), not the
+current QUASAR recommendation.
 
 | Test | ninfer, 27B NVFP4 | Strata IQ2_XS (2.4 bpw) | Strata IQ3_XXS (3.1 bpw) |
 |---|---:|---:|---:|
@@ -375,9 +395,9 @@ within noise for 42 single samples. It decoded 5-15% slower on most prompts and 
 of RAM free. Strata writes Korean faster; ninfer reads long prompts 2-3x faster and serves four
 requests at once, at equal quality.
 
-### With image input enabled (current serving setup)
+### With image input enabled (historical serving setup)
 
-Both servers now run with image input on (`--vision` for ninfer, Strata's GPU image encoder), which
+Both servers were tested with image input on (`--vision` for ninfer, Strata's GPU image encoder), which
 costs ninfer KV room and Strata some expert-cache VRAM. Same prompts and thinking budget as above.
 
 | Test | ninfer, 27B NVFP4 | Strata IQ2_XS |
@@ -396,10 +416,11 @@ The quality rows above were measured before image input was enabled. Without the
 ninfer cut off 16 of the 72 answers and Strata 10. ninfer's 264 tok/s is with four identical essay
 prompts; four different prompts give about 190-200 tok/s.
 
-Which one fits: ninfer for long documents (2-3x faster first token), several requests at once, or a
-machine with less RAM. Strata/Swift 1.5 for one Korean conversation at a time (about 35% faster Korean
-output) on a machine with 64 GB of RAM or more. The two cannot run side by side on these cards; a small
-router can switch engines per request model in about 15-20 s.
+For these historical versions and configurations: ninfer for long documents (2-3x faster first token),
+several requests at once, or a machine with less RAM; Strata/Swift 1.5 for one Korean conversation
+at a time (about 35% faster Korean output) on a machine with 64 GB of RAM or more. The two could not
+run side by side on these cards; the router switched engines per request model in about 15-20 s.
+The 2026-10-22 comparison below includes newer Strata and Basalt versions.
 
 ### 2026-10-22: Strata v0.2.2, Basalt and ninfer on the same machine
 
@@ -421,7 +442,8 @@ under one condition and are not a standard benchmark. No run read weights from t
 | Verified items | 40/40 | 40/40 | 38/40 |
 | Tool calls | 5/5 | 5/5 | 5/5 |
 
-ninfer ran the recommended configuration above (`--default-thinking-budget 2048`); Strata used its
+ninfer ran the QUASAR configuration above with `--default-thinking-budget 2048`, embedding offload
+and the default 1 GiB headroom, before the October 23 recommendation of 512 MiB. Strata used its
 installed settings and Basalt its README settings with the same context, KV and image input as Strata,
 neither with a thinking budget. ninfer reads prompts 3-4x faster and writes code fastest. It is slower
 than Basalt in Korean, and its two misses were the same mistake: rounding a share up instead of down
@@ -429,6 +451,8 @@ than Basalt in Korean, and its two misses were the same mistake: rounding a shar
 the same model and the same score. One deployment difference: ninfer serves `/health` and the
 OpenAI/Anthropic routes but has no load, unload or idle-unload control, while Strata and Basalt can
 release the GPUs when idle.
+
+As of 2026-10-23, this machine runs Basalt in production; Strata has been removed.
 
 ## 2026-10-23 upstream review
 
@@ -443,7 +467,9 @@ so each commit names its source):
 | `10b22af7` | `521076f8` | n-gram copy proposals are sized without the output budget |
 | `f45ff361` | `3e8f1617` | verification attention partitions KV by the row window, so a round cut by `max_tokens` commits the same KV as a full one (conflict resolved: the RTX 5060 Ti SM-count helper stays; the new test runs without the newer `DeviceExecutionView`) |
 
-Measured with the recommended command on the machine above (DDR5 now at 6400 MT/s), before → after:
+Measured with the QUASAR serving configuration, Vision, embedding offload and the default 1 GiB
+headroom on the machine above (DDR5 at 6400 MT/s), before → after. These runs preceded the
+512 MiB headroom recommendation:
 
 | Check | Before (`a226c855`) | After (`f45ff361`) |
 |---|---:|---:|
@@ -482,7 +508,8 @@ Reviewed and not taken, with the reason:
 
 ## License and attribution
 
-This fork stays under the upstream [Apache License 2.0](../LICENSE). Files changed relative to
-[Neroued/ninfer](https://github.com/Neroued/ninfer) are listed by `git diff master..tp2-5060ti`.
+This fork stays under the upstream [Apache License 2.0](../LICENSE). Files changed relative to the
+[Neroued/ninfer](https://github.com/Neroued/ninfer) base `d44ab584` are listed by
+`git diff --name-only d44ab584..tp2-5060ti`.
 The TP2 communication approach follows ideas from lynx-gt/ninfer-tp2-5060ti and was reimplemented
 here without copying its files.

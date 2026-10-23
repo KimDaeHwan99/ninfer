@@ -6,23 +6,26 @@ parallelism (`--tp 2 --devices 0,1`). It combines:
 - [Neroued/ninfer](https://github.com/Neroued/ninfer) at `d44ab584` (the engine);
 - this fork's two-GPU layer: split weights and collectives over a pinned-host mailbox, NVFP4/FP8 rank
   shards, Vision, the hybrid prefix cache, ngram copy drafting and DFlash2 at `--tp 2`;
-- [Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom), merged whole (its notes
-  follow below, unchanged);
+- [Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom), merged whole, with five
+  additional fixes cherry-picked on 2026-10-23; its inherited notes below describe that fork's
+  single-GPU setup, not this branch's current TP2 recommendation;
 - ideas and the shard-compilation technique of [ValerioDolci/ninfer-tp2](https://github.com/ValerioDolci/ninfer-tp2).
 
 Everything this fork adds was written by **Claude Opus 5.5** in Claude Code; a human operator set the
 goals, approved production changes and ran the server. Usage, the recommended configuration and every
 measurement: [Two-GPU tensor parallelism on RTX 5060 Ti](docs/tensor-parallel-rtx5060ti.md).
 
-Production numbers on that machine (2026-10-03 final measurement through the router; QUASAR-QAT
+Historical production numbers on that machine (2026-10-03 measurement through the router; QUASAR-QAT
 all-NVFP4 artifact, MTP with 4 drafts + ngram copy drafting, hybrid prefix cache, 4 concurrent
 requests, Vision on): greedy code 117-120 tok/s, Korean 76-78 tok/s, sampled essay 89 tok/s,
 rewriting a source file 379 tok/s, four parallel requests 300 tok/s aggregate, first token
 0.05-0.10 s for a short prompt, 2.4 / 5.2 s for 16K / 31K-token prompts and 0.055 s when a cached
 conversation resumes, 223K KV tokens; GSM8K 98/100 and MMLU-Pro 174/210. These numbers were
-measured with the token embedding in VRAM (`--embedding-offload off`); the build now keeps it in
-system RAM at `--tp 2`, which should enlarge the KV pool but has not been measured yet (see the
-guide).
+measured with the token embedding in VRAM (`--embedding-offload off`). At `--tp 2`, the build now
+keeps it in pinned system RAM by default. On 2026-10-23, the QUASAR configuration with fp8 KV and
+Vision held 284,416 KV tokens at the default 1 GiB headroom and 315,008 at the recommended
+`--vram-headroom-mib 512`. Offload speed was not separately A/B tested; see the guide for the
+2026-10-22/23 measurements and the current Basalt production deployment.
 
 ---
 
@@ -707,10 +710,12 @@ well, and for the work this branch builds on.
 
 ## Upstream README (direct copy)
 
-Everything below is a copy of the upstream
-[NInfer README](https://github.com/Neroued/ninfer/blob/master/README.md) as of the upstream
-commit this fork is rebased on (`d44ab584`), unchanged except for one added link to
-the fork's [ngram copy proposals](docs/ngram.md) guide.
+Everything below reproduces the upstream
+[NInfer README](https://github.com/Neroued/ninfer/blob/d44ab584/README.md) at `d44ab584`, with an added
+TP2 callout and a link to the fork's [ngram copy proposals](docs/ngram.md) guide. Its single-GPU
+requirements and limitations describe upstream, not this branch. Its original-cache serving
+examples require `--use-original-prefix-caching` when run with this fork; for current TP2 usage,
+follow the [two-GPU guide](docs/tensor-parallel-rtx5060ti.md).
 
 # NInfer
 
