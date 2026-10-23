@@ -41,10 +41,11 @@ ninfer-serve models/qwen3_8_27b_quasar_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --tp 2 --devices 0,1 --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
   --max-concurrency 4 --host-cache-mib 16384 --default-thinking-budget 2048 \
   --prefill-chunk 8192 --spec mtp --draft-tokens 4 --lm-head-draft \
-  --ngram-draft-tokens 15 --ngram-min-match 12 --vision
+  --ngram-draft-tokens 15 --ngram-min-match 12 --vision --vram-headroom-mib 512
 ```
 
-This command was measured with the token embedding in VRAM; the build now keeps it in system RAM
+`--vram-headroom-mib 512` was measured on 2026-10-23 (see [Tuning](#tuning---vram-headroom-mib)); without it the
+server keeps the 1 GiB default. This command was measured with the token embedding in VRAM; the build now keeps it in system RAM
 at `--tp 2` (see [Token embedding in system RAM](#token-embedding-in-system-ram)), and
 `--embedding-offload off` restores the measured placement. Agent clients that send bursts of
 requests may also want `--pending-timeout-ms 600000`: with the default of 30 s, a request that has
@@ -161,6 +162,20 @@ than the sample period are not seen; the safety margin covers them. To bound wha
 loading can still take, start twice at the same headroom, once normally and once with
 `CUDA_MODULE_LOADING=EAGER` (every module loaded before the KV pool is sized): the drop in KV
 tokens times about 17.5 KB per token is the most that lazy loading adds after startup.
+
+Measured on the machine below (2026-10-23, the command above with `--vision`, build `a9a28d97`):
+
+| `--vram-headroom-mib` | KV pool | Free after start | Minimum free under the tool's load |
+|---|---:|---:|---:|
+| 1024 (default) | 284,416 tokens | 1,007 MiB | 1,005 MiB |
+| 275 (the tool's value) | 329,152 tokens | 259 MiB | 257 MiB |
+| 275 with `CUDA_MODULE_LOADING=EAGER` | 318,272 tokens | 275 MiB | - |
+| **512 (chosen)** | **315,008 tokens** | 497 MiB | - |
+
+Serving barely allocates after startup here (free memory moved by 2 MiB under the full load), so the tool recommends
+275. Eager module loading takes 10,880 tokens of KV (about 186 MiB at 17.5 KB per token): the most that lazily loaded
+kernels could still take. 275 + 186 rounded up is 512, which keeps the 256 MiB safety margin even if every kernel loads
+late, for +30,592 KV tokens (+10.8 %) over the default.
 
 ## Results
 
